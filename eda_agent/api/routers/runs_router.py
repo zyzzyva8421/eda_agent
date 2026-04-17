@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -13,6 +15,7 @@ from eda_agent.api.auth import get_current_user
 from eda_agent.agent.tools import execute_tool
 from eda_agent.db.session import get_db_dependency
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/runs", tags=["runs"])
 
 
@@ -42,8 +45,14 @@ def trigger_run(
             "params": req.params,
         },
     )
-    import json
-    return json.loads(result_json)
+    data = json.loads(result_json)
+    if isinstance(data, dict) and "error" in data:
+        logger.error("run_eda_stage error: %s", data["error"])
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while running the EDA stage.",
+        )
+    return data
 
 
 @router.get("/")

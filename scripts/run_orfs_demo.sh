@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-ORFS_ROOT="${1:-/home/aliu/Desktop/OpenROAD-flow-scripts}"
+ORFS_ROOT="${1:-${ORFS_ROOT:-$HOME/OpenROAD-flow-scripts}}"
 PDK="${2:-sky130hd}"
 DESIGN="${3:-gcd}"
 FLOW_DIR="${ORFS_ROOT}/flow"

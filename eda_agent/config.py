@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     agent_max_iterations: int = Field(default=10)
 
     # ── ORFS backend ─────────────────────────────────────────────────────────
-    orfs_root: Path = Field(default=Path("/home/aliu/Desktop/OpenROAD-flow-scripts"))
+    orfs_root: Path = Field(default_factory=lambda: Path.home() / "OpenROAD-flow-scripts")
     orfs_make_jobs: int = Field(default=4)
 
     # ── Parquet archive ───────────────────────────────────────────────────────
