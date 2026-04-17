@@ -1,0 +1,93 @@
+"""Unified configuration via pydantic-settings.
+
+All values are read from environment variables (or a .env file in the working
+directory).  Import the singleton ``settings`` wherever configuration is
+needed.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import Field, PostgresDsn, computed_field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # ── PostgreSQL ────────────────────────────────────────────────────────────
+    postgres_user: str = Field(default="eda_agent")
+    postgres_password: str = Field(default="eda_secret")
+    postgres_host: str = Field(default="localhost")
+    postgres_port: int = Field(default=5432)
+    postgres_db: str = Field(default="eda_agent")
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def database_url(self) -> str:
+        return (
+            f"postgresql+psycopg2://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def async_database_url(self) -> str:
+        return (
+            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    # ── MiniMax LLM ───────────────────────────────────────────────────────────
+    minimax_api_key: str = Field(default="")
+    minimax_group_id: str = Field(default="")
+    minimax_base_url: str = Field(default="https://api.minimax.chat/v1")
+    minimax_model: str = Field(default="MiniMax-Text-01")
+    minimax_max_tokens: int = Field(default=4096)
+    minimax_temperature: float = Field(default=0.2)
+    # Maximum ReAct iterations per session
+    agent_max_iterations: int = Field(default=10)
+
+    # ── ORFS backend ─────────────────────────────────────────────────────────
+    orfs_root: Path = Field(default=Path("/home/aliu/Desktop/OpenROAD-flow-scripts"))
+    orfs_make_jobs: int = Field(default=4)
+
+    # ── Parquet archive ───────────────────────────────────────────────────────
+    parquet_archive_dir: Path = Field(default=Path("/data/archive"))
+
+    # ── FastAPI / JWT ─────────────────────────────────────────────────────────
+    api_secret_key: str = Field(default="insecure-change-me")
+    api_access_token_expire_minutes: int = Field(default=1440)
+    api_host: str = Field(default="0.0.0.0")
+    api_port: int = Field(default=8000)
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    log_level: str = Field(default="INFO")
+
+    @model_validator(mode="after")
+    def _warn_insecure_defaults(self) -> "Settings":
+        import warnings
+
+        if self.api_secret_key == "insecure-change-me":
+            warnings.warn(
+                "API_SECRET_KEY is using the insecure default value. "
+                "Set a strong random value in your .env file.",
+                stacklevel=2,
+            )
+        return self
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+
+
+# Module-level singleton for convenience
+settings: Settings = get_settings()

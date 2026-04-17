@@ -1,0 +1,259 @@
+"""SQLAlchemy ORM schema for EDA Agent.
+
+Tables
+------
+backends           – registered EDA tool backends
+designs            – RTL design metadata
+runs               – individual flow stage executions
+timing_summary     – per-run WNS / TNS / FEP summary
+timing_paths       – individual violated timing paths
+congestion_hotspots – spatial congestion hotspot polygons (PostGIS)
+artifacts          – file artefacts produced by a run
+
+All spatial columns use SRID 0 (unitless chip-coordinate space).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from geoalchemy2 import Geometry
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+# ── backends ──────────────────────────────────────────────────────────────────
+
+class Backend(Base):
+    """EDA tool backend registration (ORFS, Innovus, ICC2, custom, …)."""
+
+    __tablename__ = "backends"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    version: Mapped[str] = mapped_column(String(128), nullable=False, default="unknown")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    runs: Mapped[list["Run"]] = relationship("Run", back_populates="backend")
+
+
+# ── designs ───────────────────────────────────────────────────────────────────
+
+class Design(Base):
+    """Represents an RTL design (top-level module)."""
+
+    __tablename__ = "designs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    pdk: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    config_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    rtl_hash: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (UniqueConstraint("name", "pdk", name="uq_design_name_pdk"),)
+
+    runs: Mapped[list["Run"]] = relationship("Run", back_populates="design")
+
+
+# ── runs ──────────────────────────────────────────────────────────────────────
+
+class Run(Base):
+    """A single flow stage execution."""
+
+    __tablename__ = "runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_uuid: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+
+    backend_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("backends.id"), nullable=False
+    )
+    design_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("designs.id"), nullable=False
+    )
+
+    stage: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    git_hash: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    log_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    report_dir: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    backend: Mapped["Backend"] = relationship("Backend", back_populates="runs")
+    design: Mapped["Design"] = relationship("Design", back_populates="runs")
+    timing_summaries: Mapped[list["TimingSummary"]] = relationship(
+        "TimingSummary", back_populates="run", cascade="all, delete-orphan"
+    )
+    timing_paths: Mapped[list["TimingPath"]] = relationship(
+        "TimingPath", back_populates="run", cascade="all, delete-orphan"
+    )
+    congestion_hotspots: Mapped[list["CongestionHotspot"]] = relationship(
+        "CongestionHotspot", back_populates="run", cascade="all, delete-orphan"
+    )
+    artifacts: Mapped[list["Artifact"]] = relationship(
+        "Artifact", back_populates="run", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_runs_backend_design_stage", "backend_id", "design_id", "stage"),
+        Index("ix_runs_status", "status"),
+        Index("ix_runs_created_at", "created_at"),
+    )
+
+
+# ── timing_summary ────────────────────────────────────────────────────────────
+
+class TimingSummary(Base):
+    """WNS / TNS / failing-endpoint-count per run and analysis view."""
+
+    __tablename__ = "timing_summary"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    view: Mapped[str] = mapped_column(String(128), nullable=False, default="default")
+    wns_ns: Mapped[float | None] = mapped_column(Float)
+    tns_ns: Mapped[float | None] = mapped_column(Float)
+    failing_endpoints: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    run: Mapped["Run"] = relationship("Run", back_populates="timing_summaries")
+
+    __table_args__ = (
+        Index("ix_timing_summary_run_id", "run_id"),
+        Index("ix_timing_summary_wns", "wns_ns"),
+    )
+
+
+# ── timing_paths ──────────────────────────────────────────────────────────────
+
+class TimingPath(Base):
+    """Individual violated timing path extracted from a detailed path report."""
+
+    __tablename__ = "timing_paths"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    startpoint: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    path_group: Mapped[str | None] = mapped_column(String(256))
+    slack_ns: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    run: Mapped["Run"] = relationship("Run", back_populates="timing_paths")
+
+    __table_args__ = (
+        Index("ix_timing_paths_run_id", "run_id"),
+        Index("ix_timing_paths_slack", "slack_ns"),
+    )
+
+
+# ── congestion_hotspots ───────────────────────────────────────────────────────
+
+class CongestionHotspot(Base):
+    """Spatial congestion hotspot polygon (PostGIS, SRID=0)."""
+
+    __tablename__ = "congestion_hotspots"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    geom: Mapped[object] = mapped_column(
+        Geometry(geometry_type="POLYGON", srid=0), nullable=False
+    )
+    overflow: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    layer: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    run: Mapped["Run"] = relationship("Run", back_populates="congestion_hotspots")
+
+    __table_args__ = (
+        Index("ix_congestion_hotspots_run_id", "run_id"),
+        # PostGIS spatial index
+        Index(
+            "ix_congestion_hotspots_geom",
+            "geom",
+            postgresql_using="gist",
+        ),
+    )
+
+
+# ── artifacts ─────────────────────────────────────────────────────────────────
+
+class Artifact(Base):
+    """File artefact produced by a run (.rpt, .def, .odb, .png, …)."""
+
+    __tablename__ = "artifacts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    artifact_type: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    file_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    run: Mapped["Run"] = relationship("Run", back_populates="artifacts")
+
+    __table_args__ = (Index("ix_artifacts_run_id", "run_id"),)
+
+
+# ── users (for API auth) ──────────────────────────────────────────────────────
+
+class User(Base):
+    """API user for multi-user access control."""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
