@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eda_agent"
+version = "0.1.0"
+description = "LLM-driven EDA agent for PPA/parameter tuning (ORFS / custom PR tool / Innovus / ICC2)"
+requires-python = ">=3.10"
+dependencies = [
+    # Web framework
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    # Database
+    "sqlalchemy>=2.0.0",
+    "geoalchemy2>=0.14.0",
+    "psycopg2-binary>=2.9.9",
+    "alembic>=1.13.0",
+    # Data / archival
+    "pandas>=2.2.0",
+    "pyarrow>=16.0.0",
+    # LLM / HTTP
+    "httpx>=0.27.0",
+    "openai>=1.30.0",          # MiniMax uses OpenAI-compatible API
+    # Config / utilities
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "python-dotenv>=1.0.0",
+    "structlog>=24.1.0",
+    # Auth
+    "passlib[bcrypt]>=1.7.4",
+    "python-jose[cryptography]>=3.3.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "httpx>=0.27.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+eda-agent = "eda_agent.api.main:cli_main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["eda_agent*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
