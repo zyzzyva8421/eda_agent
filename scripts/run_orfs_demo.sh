@@ -7,7 +7,7 @@
 # Defaults:
 #   ORFS_ROOT = /home/aliu/Desktop/OpenROAD-flow-scripts
 #   PDK       = sky130hd
-#   DESIGN    = gcd
+#   DESIGN    = aes
 #
 # Prerequisites:
 #   - ORFS installed and its deps (openroad, yosys, klayout, etc.) on PATH
@@ -19,7 +19,7 @@ set -euo pipefail
 
 ORFS_ROOT="${1:-${ORFS_ROOT:-$HOME/OpenROAD-flow-scripts}}"
 PDK="${2:-sky130hd}"
-DESIGN="${3:-gcd}"
+DESIGN="${3:-aes}"
 FLOW_DIR="${ORFS_ROOT}/flow"
 DESIGN_CONFIG="${FLOW_DIR}/designs/${PDK}/${DESIGN}/config.mk"
 MAKE_JOBS="${ORFS_MAKE_JOBS:-4}"
@@ -46,7 +46,7 @@ fi
 # ── Apply PostGIS migration (idempotent) ──────────────────────────────────────
 echo ""
 echo ">>> Applying database migrations …"
-alembic upgrade head
+PATH="/home/aliu/ORAssistant/backend/.venv/bin:$PATH" alembic upgrade head
 
 # ── Run the full ORFS flow ────────────────────────────────────────────────────
 run_stage() {
@@ -70,8 +70,7 @@ run_stage finish
 # ── Ingest results via Python ─────────────────────────────────────────────────
 echo ""
 echo ">>> Ingesting reports into PostgreSQL …"
-
-python - <<PYEOF
+PATH="/home/aliu/ORAssistant/backend/.venv/bin:$PATH" python - <<PYEOF
 import sys
 from pathlib import Path
 from eda_agent.backends.orfs import ORFSBackend
@@ -91,7 +90,7 @@ be = ORFSBackend(orfs_root=orfs_root)
 design = DesignSpec(name=design_nm, config_path=config_p, pdk=pdk)
 
 for stage in be.get_supported_stages():
-    report_dir = orfs_root / "flow" / "reports" / pdk / design_nm / stage
+    report_dir = orfs_root / "flow" / "reports" / pdk / design_nm / "base"
     if not report_dir.is_dir():
         print(f"  [skip] No report_dir for stage {stage}")
         continue

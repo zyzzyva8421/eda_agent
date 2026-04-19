@@ -136,7 +136,7 @@ class ORFSBackend(AbstractEDABackend):
             / "reports"
             / design.pdk
             / design.name
-            / stage
+            / "base"  # ORFS default variant
         )
 
         cmd = self._build_make_cmd(target, design, params)
