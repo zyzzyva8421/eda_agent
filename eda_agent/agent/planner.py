@@ -77,18 +77,31 @@ class Planner:
             logger.debug("ReAct iteration %d", iteration + 1)
             response = self._call_llm(mem)
 
+            # Handle empty or None response
+            if not response or not response.get("choices"):
+                return mem.get("last_assistant_text", "Sorry, I couldn't process that request.")
+
             choice = response["choices"][0]
             finish_reason = choice.get("finish_reason", "stop")
-            message = choice["message"]
+            message = choice.get("message", {})
 
             # Persist assistant message
             assistant_text = message.get("content") or ""
-            mem.add_assistant(assistant_text)
-
             tool_calls = message.get("tool_calls") or []
+            
+            # Include reasoning_content if content is empty (MiniMax specific)
+            if not assistant_text and message.get("reasoning_content"):
+                assistant_text = message.get("reasoning_content", "")
+            
+            # Add assistant message with tool_calls so MiniMax can match tool results
+            if tool_calls:
+                mem.add_assistant(assistant_text, tool_calls=tool_calls)
+            elif assistant_text:
+                mem.add_assistant(assistant_text)
+
             if not tool_calls:
                 # LLM finished without calling more tools → done
-                return assistant_text
+                return assistant_text or "Tool executed. Here's your result:"
 
             # Execute every requested tool call
             for tc in tool_calls:
@@ -104,7 +117,6 @@ class Planner:
                 mem.add_tool_result(fn_name, tool_result, tool_call_id=tc_id)
 
             if finish_reason == "stop":
-                # Finished after tool execution (shouldn't normally happen here)
                 break
 
         # Safety net: return whatever is in the last assistant turn
@@ -139,7 +151,9 @@ class Planner:
         if group_id:
             url += f"?GroupId={group_id}"
 
-        with httpx.Client(timeout=120) as client:
+        # Create client without proxy settings
+        transport = httpx.HTTPTransport()
+        with httpx.Client(timeout=120, transport=transport) as client:
             resp = client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             return resp.json()

@@ -77,8 +77,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "query_timing",
             "description": (
-                "Query timing results (WNS, TNS, failing endpoints) from the "
-                "database for a specific design, stage, and optional run_id."
+                "Query timing results (WNS, TNS, failing endpoints) and worst slack paths "
+                "from the database for a specific design, stage, and optional run_id. "
+                "Returns both summary metrics and individual violating paths."
             ),
             "parameters": {
                 "type": "object",
@@ -201,7 +202,7 @@ def _query_timing(
     stage: str | None = None,
     run_id: int | None = None,
     limit: int = 10,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     with get_db() as db:
         conditions = ["d.name = :design_name"]
         params: dict[str, Any] = {"design_name": design_name, "limit": limit}
@@ -212,7 +213,7 @@ def _query_timing(
             conditions.append("r.id = :run_id")
             params["run_id"] = run_id
         where = " AND ".join(conditions)
-        rows = db.execute(
+        summary_rows = db.execute(
             text(
                 f"""
                 SELECT ts.id, r.id AS run_id, r.stage, b.name AS backend,
@@ -229,7 +230,28 @@ def _query_timing(
             ),
             params,
         ).mappings().fetchall()
-    return [dict(r) for r in rows]
+
+        # Query individual timing paths (worst slack paths)
+        path_rows = db.execute(
+            text(
+                f"""
+                SELECT tp.id, tp.run_id, tp.startpoint, tp.endpoint,
+                       tp.path_group, tp.slack_ns
+                FROM timing_paths tp
+                JOIN runs r ON r.id = tp.run_id
+                JOIN designs d ON d.id = r.design_id
+                WHERE {where}
+                ORDER BY tp.slack_ns ASC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings().fetchall()
+
+    return {
+        "summary": [dict(r) for r in summary_rows],
+        "paths": [dict(r) for r in path_rows],
+    }
 
 
 def _query_congestion(

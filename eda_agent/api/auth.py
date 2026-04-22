@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -16,16 +18,24 @@ from eda_agent.config import settings
 from eda_agent.db.session import get_db_dependency
 
 _ALGORITHM = "HS256"
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_context.verify(plain, hashed)
+    """Verify password using SHA256 (development-friendly)."""
+    # Simple SHA256 hash for development
+    # In production, use proper bcrypt or argon2
+    salt, stored_hash = hashed.split("$", 1) if "$" in hashed else ("", hashed)
+    computed = hashlib.sha256(f"{salt}{plain}".encode()).hexdigest()
+    return hmac.compare_digest(computed, stored_hash)
 
 
 def hash_password(plain: str) -> str:
-    return _pwd_context.hash(plain)
+    """Hash password using SHA256 (development-friendly)."""
+    # Simple SHA256 hash with random salt
+    salt = secrets.token_hex(16)
+    hashed = hashlib.sha256(f"{salt}{plain}".encode()).hexdigest()
+    return f"{salt}${hashed}"
 
 
 def create_access_token(data: dict[str, Any]) -> str:

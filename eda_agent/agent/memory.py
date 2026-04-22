@@ -18,6 +18,7 @@ class Message:
     content: str
     tool_name: str | None = None   # set when role == "tool"
     tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None  # set when role == "assistant" and using tools
 
 
 class AgentMemory:
@@ -37,8 +38,12 @@ class AgentMemory:
     def add_user(self, content: str) -> None:
         self.add(Message(role="user", content=content))
 
-    def add_assistant(self, content: str) -> None:
-        self.add(Message(role="assistant", content=content))
+    def add_assistant(
+        self,
+        content: str,
+        tool_calls: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.add(Message(role="assistant", content=content, tool_calls=tool_calls))
 
     def add_tool_result(
         self, tool_name: str, content: str, tool_call_id: str | None = None
@@ -52,18 +57,20 @@ class AgentMemory:
             )
         )
 
-    def get_messages(self, system_prompt: str = "") -> list[dict[str, str]]:
+    def get_messages(self, system_prompt: str = "") -> list[dict[str, Any]]:
         """Return message list in OpenAI-compatible chat format."""
-        msgs: list[dict[str, str]] = []
+        msgs: list[dict[str, Any]] = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
         for m in self._history:
-            entry: dict[str, str] = {"role": m.role, "content": m.content}
+            entry: dict[str, Any] = {"role": m.role, "content": m.content}
             if m.role == "tool":
                 if m.tool_name:
                     entry["name"] = m.tool_name
                 if m.tool_call_id:
                     entry["tool_call_id"] = m.tool_call_id
+            elif m.role == "assistant" and m.tool_calls:
+                entry["tool_calls"] = m.tool_calls
             msgs.append(entry)
         return msgs
 
