@@ -62,6 +62,31 @@ _UTIL_MAX = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+# ── ORFS violation format ─────────────────────────────────────────────────────
+# violation type: Horizontal/Vertical congestion
+#         srcs: net:net_foo ...
+#         comment: capacity:N usage:M overflow:K
+#         bbox = (x1, y1) - (x2, y2) on Layer LAYER
+_VIOLATION_TYPE = re.compile(
+    r"violation\s+type[:\s]+(horizontal|vertical)\s+congestion",
+    re.MULTILINE | re.IGNORECASE,
+)
+_VIOLATION_SRCS = re.compile(
+    r"srcs[:\s]+(.+?)(?=\n\s*(?:bbox|comment|violation|$))",
+    re.MULTILINE,
+)
+_VIOLATION_COMMENT = re.compile(
+    r"comment[:\s]+capacity:(\d+)\s+usage:(\d+)\s+overflow:(\d+)",
+    re.IGNORECASE,
+)
+_VIOLATION_BBOX = re.compile(
+    r"bbox\s*=\s*\(\s*([\d.]+)\s*,\s*([\d.]+)\s*\)\s*-\s*\(\s*([\d.]+)\s*,\s*([\d.]+)\s*\)",
+    re.IGNORECASE,
+)
+_VIOLATION_LAYER = re.compile(
+    r"on\s+Layer\s+(\S+)", re.IGNORECASE,
+)
+
 
 class CongestionParser(BaseParser):
     """Parse OpenROAD / ORFS congestion reports."""
@@ -80,6 +105,9 @@ class CongestionParser(BaseParser):
 
         layer_stats = self._parse_layers(text)
         records.extend(layer_stats)
+
+        orfs_violations = self._parse_orfs_violations(text)
+        records.extend(orfs_violations)
 
         if not records:
             raise ParseError("No congestion data found in report text.")
@@ -156,3 +184,52 @@ class CongestionParser(BaseParser):
                 }
             )
         return layers
+
+    def _parse_orfs_violations(self, text: str) -> list[dict[str, Any]]:
+        """Parse ORFS violation report format (congestion-*.rpt files)."""
+        violations = []
+        blocks = re.split(r"violation type:", text)
+        for block in blocks[1:]:  # skip first split (before any "violation type:")
+            block = "violation type:" + block  # re-add the header
+            type_m = _VIOLATION_TYPE.search(block)
+            srcs_m = _VIOLATION_SRCS.search(block)
+            comment_m = _VIOLATION_COMMENT.search(block)
+            bbox_m = _VIOLATION_BBOX.search(block)
+            layer_m = _VIOLATION_LAYER.search(block)
+
+            if not type_m:
+                continue
+
+            direction = type_m.group(1).upper()
+            capacity = int(comment_m.group(1)) if comment_m else None
+            usage = int(comment_m.group(2)) if comment_m else None
+            overflow = int(comment_m.group(3)) if comment_m else None
+            x1 = float(bbox_m.group(1)) if bbox_m else None
+            y1 = float(bbox_m.group(2)) if bbox_m else None
+            x2 = float(bbox_m.group(3)) if bbox_m else None
+            y2 = float(bbox_m.group(4)) if bbox_m else None
+            layer = layer_m.group(1) if layer_m else None
+
+            # Parse nets from srcs line
+            nets = []
+            if srcs_m:
+                # Format: "net:_02527_ net:_10757_ ..." or just names
+                nets = [n.strip() for n in srcs_m.group(1).split() if n.strip()]
+
+            violations.append(
+                {
+                    "kind": "orfs_violation",
+                    "direction": direction,
+                    "capacity": capacity,
+                    "usage": usage,
+                    "overflow": overflow,
+                    "nets": nets[:20],  # cap at 20 nets per violation
+                    "wkt": (
+                        f"POLYGON(({x1} {y1}, {x2} {y1}, {x2} {y2}, {x1} {y2}, {x1} {y1}))"
+                        if all([x1, y1, x2, y2])
+                        else None
+                    ),
+                    "layer": layer,
+                }
+            )
+        return violations

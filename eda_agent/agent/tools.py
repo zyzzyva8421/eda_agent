@@ -513,3 +513,21 @@ def _ingest_records(records: list[dict], run_id: int, stage: str) -> None:
                         "overflow": rec.get("overflow", 0),
                     },
                 )
+            elif kind == "orfs_violation":
+                # ORFS violation records from congestion-*.rpt files
+                wkt = rec.get("wkt")
+                if not wkt:
+                    continue  # Skip violations without bounding box
+                db.execute(
+                    text(
+                        "INSERT INTO congestion_hotspots "
+                        "(run_id, geom, overflow, layer) "
+                        "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow, :layer)"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "wkt": wkt,
+                        "overflow": rec.get("overflow", 0),
+                        "layer": rec.get("layer"),
+                    },
+                )

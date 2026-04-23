@@ -6,5 +6,5 @@ os.environ['ORFS_ROOT'] = '/home/aliu/Desktop/OpenROAD-flow-scripts'
 from eda_agent.agent.planner import Planner
 
 planner = Planner()
-result = planner.run('show me timing for design aes at finish stage')
+result = planner.run('show me congestion for design aes at route stage')
 print(result)

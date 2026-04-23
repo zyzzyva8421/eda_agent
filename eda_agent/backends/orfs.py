@@ -51,26 +51,35 @@ _REPORT_PATTERNS: dict[str, list[tuple[str, str]]] = {
     "synth": [
         ("*.rpt", "timing"),
         ("*area*.rpt", "utilization"),
+        ("*stat*.txt", "utilization"),      # Yosys stat output
     ],
     "floorplan": [
         ("*floorplan*.rpt", "utilization"),
+        ("2_floorplan*.rpt", "utilization"),
     ],
     "place": [
         ("*place*.rpt", "timing"),
         ("*congestion*.rpt", "congestion"),
+        ("3_global_place.rpt", "timing"),
+        ("3_detailed_place.rpt", "timing"),
+        ("congestion-*.rpt", "congestion"),
     ],
     "cts": [
         ("*cts*.rpt", "timing"),
+        ("4_cts_final.rpt", "timing"),
     ],
     "route": [
         ("*route*.rpt", "timing"),
         ("*congestion*.rpt", "congestion"),
         ("*drc*.rpt", "drc"),
+        ("congestion-*.rpt", "congestion"),
+        ("5_global_route.rpt", "timing"),
     ],
     "finish": [
         ("*timing*.rpt", "timing"),
         ("*power*.rpt", "power"),
         ("*area*.rpt", "utilization"),
+        ("6_finish.rpt", "timing"),
     ],
 }
 
