@@ -8,7 +8,11 @@ runs               – individual flow stage executions
 timing_summary     – per-run WNS / TNS / FEP summary
 timing_paths       – individual violated timing paths
 congestion_hotspots – spatial congestion hotspot polygons (PostGIS)
+utilization_summary – per-run design area and cell utilisation
+power_summary      – per-run power breakdown
+drc_violations     – per-run DRC violation records
 artifacts          – file artefacts produced by a run
+agent_sessions     – persistent multi-turn agent conversation history
 
 All spatial columns use SRID 0 (unitless chip-coordinate space).
 """
@@ -120,6 +124,15 @@ class Run(Base):
     )
     congestion_hotspots: Mapped[list["CongestionHotspot"]] = relationship(
         "CongestionHotspot", back_populates="run", cascade="all, delete-orphan"
+    )
+    utilization_summaries: Mapped[list["UtilizationSummary"]] = relationship(
+        "UtilizationSummary", back_populates="run", cascade="all, delete-orphan"
+    )
+    power_summaries: Mapped[list["PowerSummary"]] = relationship(
+        "PowerSummary", back_populates="run", cascade="all, delete-orphan"
+    )
+    drc_violations: Mapped[list["DRCViolation"]] = relationship(
+        "DRCViolation", back_populates="run", cascade="all, delete-orphan"
     )
     artifacts: Mapped[list["Artifact"]] = relationship(
         "Artifact", back_populates="run", cascade="all, delete-orphan"
@@ -240,6 +253,101 @@ class Artifact(Base):
     run: Mapped["Run"] = relationship("Run", back_populates="artifacts")
 
     __table_args__ = (Index("ix_artifacts_run_id", "run_id"),)
+
+
+# ── utilization_summary ───────────────────────────────────────────────────────
+
+class UtilizationSummary(Base):
+    """Per-run design area and cell utilisation metrics."""
+
+    __tablename__ = "utilization_summary"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    design_area_um2: Mapped[float | None] = mapped_column(Float)
+    utilization_pct: Mapped[float | None] = mapped_column(Float)
+    num_cells: Mapped[int | None] = mapped_column(Integer)
+    num_registers: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    run: Mapped["Run"] = relationship("Run", back_populates="utilization_summaries")
+
+    __table_args__ = (Index("ix_utilization_summary_run_id", "run_id"),)
+
+
+# ── power_summary ─────────────────────────────────────────────────────────────
+
+class PowerSummary(Base):
+    """Per-run power breakdown (internal / switching / leakage / total), in Watts."""
+
+    __tablename__ = "power_summary"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    internal_power_w: Mapped[float | None] = mapped_column(Float)
+    switching_power_w: Mapped[float | None] = mapped_column(Float)
+    leakage_power_w: Mapped[float | None] = mapped_column(Float)
+    total_power_w: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    run: Mapped["Run"] = relationship("Run", back_populates="power_summaries")
+
+    __table_args__ = (Index("ix_power_summary_run_id", "run_id"),)
+
+
+# ── drc_violations ────────────────────────────────────────────────────────────
+
+class DRCViolation(Base):
+    """Individual DRC violation records, one row per violation instance."""
+
+    __tablename__ = "drc_violations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    # For summary records (total count line) violation_type is 'SUMMARY'
+    violation_type: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    layer: Mapped[str | None] = mapped_column(String(64))
+    nets: Mapped[list | None] = mapped_column(JSONB)
+    bbox_wkt: Mapped[str | None] = mapped_column(Text)
+    total_violations: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    run: Mapped["Run"] = relationship("Run", back_populates="drc_violations")
+
+    __table_args__ = (Index("ix_drc_violations_run_id", "run_id"),)
+
+
+# ── agent_sessions ────────────────────────────────────────────────────────────
+
+class AgentSession(Base):
+    """Persistent multi-turn agent conversation history, keyed by session_id."""
+
+    __tablename__ = "agent_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(256), nullable=False, unique=True)
+    username: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    messages: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (Index("ix_agent_sessions_username", "username"),)
 
 
 # ── users (for API auth) ──────────────────────────────────────────────────────

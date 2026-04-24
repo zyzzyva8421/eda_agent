@@ -77,6 +77,35 @@ class AgentMemory:
     def clear(self) -> None:
         self._history.clear()
 
+    @classmethod
+    def from_messages(
+        cls,
+        messages: list[dict],
+        max_messages: int = 40,
+    ) -> "AgentMemory":
+        """Reconstruct an :class:`AgentMemory` from a serialised message list.
+
+        The format is the OpenAI-compatible list returned by
+        :meth:`get_messages` (without the system message).
+        """
+        mem = cls(max_messages=max_messages)
+        for m in messages:
+            role = m.get("role", "")
+            content = m.get("content") or ""
+            if role == "system":
+                continue
+            elif role == "user":
+                mem.add_user(content)
+            elif role == "assistant":
+                mem.add_assistant(content, tool_calls=m.get("tool_calls"))
+            elif role == "tool":
+                mem.add_tool_result(
+                    m.get("name", ""),
+                    content,
+                    tool_call_id=m.get("tool_call_id"),
+                )
+        return mem
+
     # ------------------------------------------------------------------
     # Scratchpad (per-session key-value store)
     # ------------------------------------------------------------------
