@@ -120,6 +120,21 @@ def archive_run(run_id: int, archive_dir: Path | None = None) -> dict[str, Path]
             """,
             {"run_id": run_id},
         )
+        written["utilization_summary"] = _write(
+            "utilization_summary",
+            "SELECT * FROM utilization_summary WHERE run_id = :run_id",
+            {"run_id": run_id},
+        )
+        written["power_summary"] = _write(
+            "power_summary",
+            "SELECT * FROM power_summary WHERE run_id = :run_id",
+            {"run_id": run_id},
+        )
+        written["drc_violations"] = _write(
+            "drc_violations",
+            "SELECT * FROM drc_violations WHERE run_id = :run_id",
+            {"run_id": run_id},
+        )
 
     return written
 

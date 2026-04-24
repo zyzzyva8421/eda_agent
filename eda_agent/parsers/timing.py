@@ -53,14 +53,19 @@ _PATH_ENDPOINT = re.compile(
 _PATH_GROUP = re.compile(
     r"^Path\s+Group:\s+(.+)$", re.MULTILINE | re.IGNORECASE
 )
-# Match slack line - format is "  -0.59   slack (VIOLATED)" with leading spaces
+# Match slack line – two formats produced by different OpenROAD versions:
+#   Format A (value before keyword):  "  -0.59   slack (VIOLATED)"
+#   Format B (value after keyword):   "slack (VIOLATED) -0.342"
 _PATH_SLACK = re.compile(
-    r"^\s*-?\d+\.\d+\s+slack\s+\((?:MET|VIOLATED)\)",
+    r"^\s*-?\d+\.\d+\s+slack\s+\((?:MET|VIOLATED)\)"
+    r"|slack\s+\((?:MET|VIOLATED)\)\s+-?\d+\.\d+",
     re.MULTILINE | re.IGNORECASE,
 )
-# Fallback: find any slack value in the block - look for negative number followed by slack
+# Fallback: extract the numeric slack value from whichever format matched
+_PATH_SLACK_VALUE = re.compile(r"-?\d+\.\d+")
+# Fallback: find any slack value in the block
 _PATH_SLACK_FALLBACK = re.compile(
-    r"(-?\d+\.\d+)\s+slack",
+    r"(-?\d+\.\d+)\s+slack|slack\s+\((?:MET|VIOLATED)\)\s+(-?\d+\.\d+)",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -117,7 +122,6 @@ class TimingParser(BaseParser):
         OpenROAD timing reports may have path definition and slack in different sections,
         so we search globally and pair them by proximity.
         """
-        import re
         paths = []
 
         # Find all startpoints
@@ -136,22 +140,29 @@ class TimingParser(BaseParser):
             gr_match = _PATH_GROUP.search(text_after)
             gr = gr_match.group(1).strip() if gr_match else None
 
-            # Find slack value - first try VIOLATED pattern
+            # Find slack value - first try primary VIOLATED/MET pattern
             sl_match = _PATH_SLACK.search(text_after)
-            if not sl_match:
-                sl_match = _PATH_SLACK_FALLBACK.search(text_after)
-
+            slack_val: float | None = None
             if sl_match:
-                match_line = sl_match.group(0)
-                val_match = re.search(r'-?\d+\.\d+', match_line)
-                if val_match:
-                    slack_val = float(val_match.group(0))
-                    paths.append({
-                        "kind": "path",
-                        "startpoint": sp,
-                        "endpoint": ep,
-                        "path_group": gr,
-                        "slack_ns": slack_val,
-                    })
+                # Extract numeric value from whichever format matched
+                vals = _PATH_SLACK_VALUE.findall(sl_match.group(0))
+                if vals:
+                    slack_val = float(vals[0])
+            else:
+                fb_match = _PATH_SLACK_FALLBACK.search(text_after)
+                if fb_match:
+                    # Group 1 = "value slack", group 2 = "slack (MET/VIOLATED) value"
+                    raw = fb_match.group(1) or fb_match.group(2)
+                    if raw:
+                        slack_val = float(raw)
+
+            if slack_val is not None:
+                paths.append({
+                    "kind": "path",
+                    "startpoint": sp,
+                    "endpoint": ep,
+                    "path_group": gr,
+                    "slack_ns": slack_val,
+                })
 
         return paths

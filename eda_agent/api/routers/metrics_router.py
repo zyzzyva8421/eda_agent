@@ -1,4 +1,4 @@
-"""Timing / congestion query router."""
+"""Timing / congestion / utilization / power query router."""
 
 from __future__ import annotations
 
@@ -61,6 +61,40 @@ def get_congestion(
     if all(v is not None for v in [x1, y1, x2, y2]):
         args.update({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
     return _safe_result(execute_tool("query_congestion", args))
+
+
+@router.get("/utilization")
+def get_utilization(
+    design_name: str,
+    stage: str | None = None,
+    run_id: int | None = None,
+    limit: int = 10,
+    _user: dict = Depends(get_current_user),
+):
+    """Query design-area and cell-utilisation metrics."""
+    return _safe_result(
+        execute_tool(
+            "query_utilization",
+            {"design_name": design_name, "stage": stage, "run_id": run_id, "limit": limit},
+        )
+    )
+
+
+@router.get("/power")
+def get_power(
+    design_name: str,
+    stage: str | None = None,
+    run_id: int | None = None,
+    limit: int = 10,
+    _user: dict = Depends(get_current_user),
+):
+    """Query power breakdown metrics."""
+    return _safe_result(
+        execute_tool(
+            "query_power",
+            {"design_name": design_name, "stage": stage, "run_id": run_id, "limit": limit},
+        )
+    )
 
 
 @router.get("/compare")
