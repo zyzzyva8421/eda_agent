@@ -658,8 +658,7 @@ def _llm_suggest_params(
         "Content-Type": "application/json",
     }
 
-    transport = httpx.HTTPTransport()
-    with httpx.Client(timeout=60, transport=transport) as client:
+    with httpx.Client(timeout=60) as client:
         resp = client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
@@ -751,12 +750,18 @@ def _tune_ppa(
             # Step 4 – get next params
             suggestion = _suggest_params(run_db_id, target_spec)
             raw_params = suggestion.get("suggested_params", {})
-            # Only keep concrete k=v pairs (skip "increase by …" strings)
-            current_params = {
-                k: v
-                for k, v in raw_params.items()
-                if not isinstance(v, str) or v.replace(".", "").isdigit()
-            }
+            # Only keep concrete k=v pairs (skip advisory strings like "increase by 0.5 ns")
+            filtered: dict[str, Any] = {}
+            for k, v in raw_params.items():
+                if not isinstance(v, str):
+                    filtered[k] = v
+                    continue
+                try:
+                    float(v)
+                    filtered[k] = v
+                except ValueError:
+                    pass
+            current_params = filtered
 
     return {
         "iterations_run": len(history),

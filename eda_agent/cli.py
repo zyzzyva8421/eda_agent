@@ -95,5 +95,5 @@ def cli_repl() -> None:
         try:
             reply = planner.run(user_input, memory=memory)
             print(f"\nAgent: {reply}\n")
-        except Exception as exc:  # noqa: BLE001
+        except (RuntimeError, ValueError, OSError, TimeoutError) as exc:
             print(f"Error: {exc}\n", file=sys.stderr)
