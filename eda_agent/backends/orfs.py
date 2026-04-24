@@ -80,6 +80,7 @@ _REPORT_PATTERNS: dict[str, list[tuple[str, str]]] = {
         ("*power*.rpt", "power"),
         ("*area*.rpt", "utilization"),
         ("6_finish.rpt", "timing"),
+        ("6_finish.rpt", "power"),
     ],
 }
 
@@ -197,22 +198,24 @@ class ORFSBackend(AbstractEDABackend):
             return []
 
         patterns = _REPORT_PATTERNS.get(result.stage, [("*.rpt", "generic")])
-        found: dict[Path, str] = {}  # path → report_type (dedup by path)
+        seen: set[tuple[Path, str]] = set()
+        files: list[ReportFile] = []
         for glob_pat, rtype in patterns:
             for p in result.report_dir.glob(glob_pat):
-                if p not in found:
-                    found[p] = rtype
+                key = (p, rtype)
+                if key not in seen:
+                    seen.add(key)
+                    files.append(
+                        ReportFile(
+                            path=p,
+                            report_type=rtype,
+                            stage=result.stage,
+                            run_id=result.run_id,
+                            backend_name=self.name,
+                        )
+                    )
 
-        return [
-            ReportFile(
-                path=p,
-                report_type=rtype,
-                stage=result.stage,
-                run_id=result.run_id,
-                backend_name=self.name,
-            )
-            for p, rtype in found.items()
-        ]
+        return files
 
     # ------------------------------------------------------------------
     # Internal helpers

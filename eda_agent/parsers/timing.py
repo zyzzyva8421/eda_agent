@@ -69,6 +69,45 @@ _PATH_SLACK_FALLBACK = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+# ── ORFS extended metrics patterns ──────────────────────────────────────────
+
+# Clock period / fmax: "clk period_min = 4.19 fmax = 238.86"
+_FMAX = re.compile(r"fmax\s*=\s*([\d.]+)", re.IGNORECASE)
+
+# Clock skew: "  -0.24 setup skew"
+_CLOCK_SKEW = re.compile(r"setup\s+skew\s*[-–]?\s*([\d.]+)", re.MULTILINE | re.IGNORECASE)
+
+# Violation counts: "max slew violation count 0"
+_SLEW_VIO = re.compile(
+    r"max\s+slew\s+violation\s+count\s+(\d+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+_FANOUT_VIO = re.compile(
+    r"max\s+fanout\s+violation\s+count\s+(\d+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+_CAP_VIO = re.compile(
+    r"max\s+cap(?:acitance)?\s+violation\s+count\s+(\d+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+_SETUP_VIO = re.compile(
+    r"setup\s+violation\s+count\s+(\d+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+_HOLD_VIO = re.compile(
+    r"hold\s+violation\s+count\s+(\d+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Critical path delay: "critical path delay" followed by value
+_CPD = re.compile(r"^critical\s+path\s+delay\s*\n\s*([\d.]+)", re.MULTILINE | re.IGNORECASE)
+
+# Slack / critical path ratio
+_SLACK_CPD_RATIO = re.compile(
+    r"slack\s+div\s+critical\s+path\s+delay\s*\n\s*([\d.]+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
 
 class TimingParser(BaseParser):
     """Parse OpenROAD timing reports into summary and path records."""
@@ -97,23 +136,53 @@ class TimingParser(BaseParser):
         tns_m = _SUMMARY_TNS.search(text)
         fep_m = _SUMMARY_FEP.search(text)
         worst_slack_m = _SUMMARY_WORST_SLACK.search(text)
-        if not any([wns_m, tns_m, fep_m, worst_slack_m]):
+        fmax_m = _FMAX.search(text)
+        skew_m = _CLOCK_SKEW.search(text)
+        slew_vio_m = _SLEW_VIO.search(text)
+        fanout_vio_m = _FANOUT_VIO.search(text)
+        cap_vio_m = _CAP_VIO.search(text)
+        setup_vio_m = _SETUP_VIO.search(text)
+        hold_vio_m = _HOLD_VIO.search(text)
+        cpd_m = _CPD.search(text)
+        ratio_m = _SLACK_CPD_RATIO.search(text)
+        view_m = _SUMMARY_VIEW.search(text)
+
+        if not any([
+            wns_m, tns_m, fep_m, worst_slack_m,
+            fmax_m, skew_m, slew_vio_m, fanout_vio_m,
+            cap_vio_m, setup_vio_m, hold_vio_m,
+            cpd_m, ratio_m,
+        ]):
             return None
 
-        view_m = _SUMMARY_VIEW.search(text)
-        # Use wns, or fall back to worst_slack if wns not found
         wns_value = None
         if wns_m:
             wns_value = float(wns_m.group(1))
         elif worst_slack_m:
             wns_value = float(worst_slack_m.group(1))
 
+        def _int(m: re.Match | None) -> int | None:
+            return int(m.group(1)) if m else None
+
+        def _float(m: re.Match | None) -> float | None:
+            return float(m.group(1)) if m else None
+
         return {
             "kind": "summary",
             "view": view_m.group(1) if view_m else "default",
             "wns_ns": wns_value,
-            "tns_ns": float(tns_m.group(1)) if tns_m else None,
-            "failing_endpoints": int(fep_m.group(1)) if fep_m else None,
+            "tns_ns": _float(tns_m),
+            "failing_endpoints": _int(fep_m),
+            # ORFS extended metrics
+            "fmax_mhz": _float(fmax_m),
+            "clock_skew_ns": _float(skew_m),
+            "max_slew_violations": _int(slew_vio_m),
+            "max_fanout_violations": _int(fanout_vio_m),
+            "max_cap_violations": _int(cap_vio_m),
+            "setup_violations": _int(setup_vio_m),
+            "hold_violations": _int(hold_vio_m),
+            "critical_path_delay_ns": _float(cpd_m),
+            "slack_cpd_ratio_pct": _float(ratio_m),
         }
 
     def _parse_paths(self, text: str) -> list[dict[str, Any]]:
