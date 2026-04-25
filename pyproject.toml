@@ -43,8 +43,9 @@ dev = [
 ]
 
 [project.scripts]
-eda-agent = "eda_agent.cli:cli_repl"
+eda-agent = "eda_agent.cli:main"
 eda-agent-server = "eda_agent.api.main:cli_main"
+eda-agent-worker = "eda_agent.queue.worker:worker_main"
 
 [tool.setuptools.packages.find]
 where = ["."]
