@@ -288,6 +288,7 @@ def _run_eda_stage(
         "stage": stage,
         "backend": backend,
         "error": result.error_message,
+        "log_path": str(result.log_path) if result.log_path else None,
     }
 
 
