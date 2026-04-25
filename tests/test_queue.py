@@ -428,9 +428,6 @@ class TestCLIReplBackwardCompat:
 
     def test_repl_exit_command(self):
         """Existing REPL test: exit command prints Goodbye."""
-        import io
-        from unittest.mock import patch
-
         from eda_agent.cli import cli_repl
 
         captured = io.StringIO()

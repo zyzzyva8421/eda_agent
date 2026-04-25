@@ -215,14 +215,14 @@ def _ensure_worker(no_worker: bool = False) -> None:
     import subprocess
 
     _WORKER_LOG.parent.mkdir(parents=True, exist_ok=True)
-    log_fh = open(_WORKER_LOG, "a")  # noqa: SIM115
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "eda_agent.queue.worker"],
-        stdout=log_fh,
-        stderr=log_fh,
-        close_fds=True,
-        start_new_session=True,
-    )
+    with open(_WORKER_LOG, "a") as log_fh:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "eda_agent.queue.worker"],
+            stdout=log_fh,
+            stderr=log_fh,
+            close_fds=True,
+            start_new_session=True,
+        )
     print(f"[worker] Started background worker (PID={proc.pid}), logs -> {_WORKER_LOG}")
 
 
