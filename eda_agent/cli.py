@@ -20,10 +20,19 @@ Commands inside the REPL
     clear    -- clear the current session memory
     history  -- print the current session message history
     exit / quit / Ctrl-D / Ctrl-C  -- exit
+
+Tab Completion:
+------------------------
+    Press Tab to autocomplete built-in commands (clear, history, help, exit).
+    Tab also completes directory paths.
+    Use up/down arrows to navigate command history (Vi mode).
+    The CLI maintains persistent history across sessions.
 """
 
 from __future__ import annotations
 
+import atexit
+import os
 import sys
 
 try:
@@ -35,6 +44,115 @@ except ImportError:
 
 from eda_agent.agent.memory import AgentMemory
 from eda_agent.agent.planner import Planner
+
+# Built-in commands for tab completion
+_BUILTIN_COMMANDS = ["clear", "exit", "help", "history", "quit"]
+
+# History file path for persistent readline history
+_HISTORY_FILE = os.path.expanduser("~/.eda_agent_history")
+
+
+def _setup_readline():
+    """Configure readline with tab completion and load persistent history."""
+    if not _HAS_READLINE:
+        return
+
+    # Configure tab completion for commands and paths
+    def completer(text, state):
+        results = []
+
+        # Get just the last word (after last space) to check if it's a path
+        if " " in text:
+            last_word = text.split()[-1]
+        else:
+            last_word = text
+
+        # Check if last word looks like a path
+        is_path = False
+        if last_word:
+            is_path = (
+                "~/" in last_word
+                or last_word.startswith("~")
+                or (last_word.startswith("/") and "/" in last_word)
+                or os.path.dirname(last_word) != "."
+            )
+
+        if is_path:
+            try:
+                # If last_word itself is a valid directory, list its contents
+                if os.path.isdir(last_word):
+                    path_dir = last_word
+                    prefix = ""
+                elif "~/" in last_word:
+                    idx = last_word.index("~/")
+                    prefix = last_word[idx + 2:]
+                    path_dir = os.path.expanduser("~")
+                elif last_word.startswith("~"):
+                    if len(last_word) == 1:
+                        path_dir = os.path.expanduser("~")
+                        prefix = ""
+                    else:
+                        rest = last_word[1:]
+                        if rest.startswith("/"):
+                            path_dir = os.path.expanduser("~")
+                            prefix = rest[1:] if len(rest) > 1 else ""
+                        else:
+                            path_dir = os.path.expanduser("~")
+                            prefix = last_word[1:]
+                elif last_word.startswith("/"):
+                    # Absolute path
+                    dir_part = os.path.dirname(last_word)
+                    if os.path.isdir(dir_part):
+                        path_dir = dir_part
+                        prefix = os.path.basename(last_word)
+                    else:
+                        path_dir = None
+                else:
+                    dir_part = os.path.dirname(last_word)
+                    if dir_part and os.path.isdir(dir_part):
+                        path_dir = dir_part
+                        prefix = os.path.basename(last_word)
+                    else:
+                        path_dir = os.getcwd()
+                        prefix = last_word
+
+                if path_dir and os.path.isdir(path_dir):
+                    for e in sorted(os.listdir(path_dir)):
+                        if e.startswith(prefix):
+                            full_path = os.path.join(path_dir, e)
+                            if os.path.isdir(full_path):
+                                results.append(e + "/")
+                            else:
+                                results.append(e)
+            except OSError:
+                pass
+
+        # If no path results, return commands
+        if not results:
+            results.extend(_BUILTIN_COMMANDS)
+
+        if state < len(results):
+            return results[state]
+        return None
+
+    _readline.set_completer(completer)
+    _readline.parse_and_bind("tab: complete")
+
+    # Enable Vi editing mode (allows up/down for history)
+    _readline.parse_and_bind("set editing-mode vi")
+
+    # Load persistent history
+    if os.path.exists(_HISTORY_FILE):
+        _readline.read_history_file(_HISTORY_FILE)
+
+    # Save history on exit
+    atexit.register(_save_history)
+
+
+def _save_history():
+    """Save readline history to file."""
+    if _HAS_READLINE:
+        _readline.write_history_file(_HISTORY_FILE)
 
 _BANNER = """\
 \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
@@ -68,6 +186,7 @@ def _print_history(memory: AgentMemory) -> None:
 def cli_repl() -> None:
     """Entry point for the interactive ``eda-agent`` REPL."""
     print(_BANNER)
+    _setup_readline()
     planner = Planner()
     memory = AgentMemory()
 
