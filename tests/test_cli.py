@@ -132,7 +132,7 @@ def test_cd_no_args(tmp_path, monkeypatch):
 def test_complete_cmd_name_returns_executables():
     results = _complete_cmd_name("ls")
     # 'ls' should be found on any POSIX system in PATH
-    assert any(r == "ls" or r.startswith("ls") for r in results)
+    assert any(r.startswith("ls") for r in results)
 
 
 def test_complete_cmd_name_empty_prefix_returns_list():

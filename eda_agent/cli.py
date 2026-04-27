@@ -107,6 +107,9 @@ def _setup_readline():
             # paths for subsequent tokens.
             inner = stripped[1:]
             parts = inner.split()
+            # Two cases for completing the first token:
+            #   (1) nothing typed after '!' yet — parts is empty
+            #   (2) exactly one word typed with no trailing space — still in progress
             completing_first_token = not parts or (len(parts) == 1 and not inner.endswith(" "))
             if completing_first_token:
                 results.extend(cmd for cmd in _complete_cmd_name(text) if cmd.startswith(text))
@@ -125,8 +128,9 @@ def _setup_readline():
         return None
 
     _readline.set_completer(completer)
-    # Keep standard readline word delimiters (space, tab, etc.) but *not*
-    # slashes, so that paths can be completed as a single token.
+    # Word delimiters: spaces and common shell separators split tokens.
+    # Forward slashes are intentionally *excluded* so that full paths like
+    # /usr/local/bin or ~/projects/chip are treated as a single completable token.
     _readline.set_completer_delims(" \t\n;|&")
     _readline.parse_and_bind("tab: complete")
 
