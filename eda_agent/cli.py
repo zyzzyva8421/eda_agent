@@ -17,22 +17,27 @@ Usage::
 
 Commands inside the REPL
 ------------------------
-    clear    -- clear the current session memory
-    history  -- print the current session message history
+    clear          -- clear the current session memory
+    history        -- print the current session message history
+    cd <dir>       -- change the working directory
+    !<shell_cmd>   -- run a shell command (e.g. ``!ls -la``, ``!pwd``)
     exit / quit / Ctrl-D / Ctrl-C  -- exit
 
 Tab Completion:
 ------------------------
-    Press Tab to autocomplete built-in commands (clear, history, help, exit).
-    Tab also completes directory paths.
-    Use up/down arrows to navigate command history (Vi mode).
+    Press Tab to autocomplete built-in commands (clear, history, help, exit, cd).
+    Tab also completes file/directory paths for any argument.
+    When using the ``!`` prefix, Tab completes executables from PATH and paths.
+    Use up/down arrow keys to navigate command history.
     The CLI maintains persistent history across sessions.
 """
 
 from __future__ import annotations
 
 import atexit
+import glob as _glob
 import os
+import subprocess
 import sys
 
 try:
@@ -46,10 +51,44 @@ from eda_agent.agent.memory import AgentMemory
 from eda_agent.agent.planner import Planner
 
 # Built-in commands for tab completion
-_BUILTIN_COMMANDS = ["clear", "exit", "help", "history", "quit"]
+_BUILTIN_COMMANDS = ["cd", "clear", "exit", "help", "history", "quit"]
 
 # History file path for persistent readline history
 _HISTORY_FILE = os.path.expanduser("~/.eda_agent_history")
+
+
+def _complete_cmd_name(prefix: str) -> list[str]:
+    """Return executables found in PATH whose names start with *prefix*."""
+    matches: list[str] = []
+    seen: set[str] = set()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            for name in os.listdir(directory):
+                if name.startswith(prefix) and name not in seen:
+                    full = os.path.join(directory, name)
+                    if os.access(full, os.X_OK):
+                        matches.append(name)
+                        seen.add(name)
+        except OSError:
+            pass
+    return sorted(matches)
+
+
+def _path_completions(text: str) -> list[str]:
+    """Return filesystem path completions for *text* using glob expansion."""
+    expanded = os.path.expanduser(text)
+    results: list[str] = []
+    for match in sorted(_glob.glob(expanded + "*")):
+        display = match
+        # Restore the tilde prefix if the user typed it
+        if text.startswith("~") and not expanded.startswith("~"):
+            home = os.path.expanduser("~")
+            if display.startswith(home):
+                display = "~" + display[len(home):]
+        if os.path.isdir(match) and not display.endswith("/"):
+            display += "/"
+        results.append(display)
+    return results
 
 
 def _setup_readline():
@@ -57,89 +96,46 @@ def _setup_readline():
     if not _HAS_READLINE:
         return
 
-    # Configure tab completion for commands and paths
     def completer(text, state):
-        results = []
+        line = _readline.get_line_buffer()
+        stripped = line.lstrip()
 
-        # Get just the last word (after last space) to check if it's a path
-        if " " in text:
-            last_word = text.split()[-1]
+        results: list[str] = []
+
+        if stripped.startswith("!"):
+            # Shell-command mode: complete executable names for first token,
+            # paths for subsequent tokens.
+            inner = stripped[1:]
+            parts = inner.split()
+            # Two cases for completing the first token:
+            #   (1) nothing typed after '!' yet — parts is empty
+            #   (2) exactly one word typed with no trailing space — still in progress
+            completing_first_token = not parts or (len(parts) == 1 and not inner.endswith(" "))
+            if completing_first_token:
+                results.extend(cmd for cmd in _complete_cmd_name(text) if cmd.startswith(text))
+            results.extend(_path_completions(text))
+        elif not stripped or (not line.endswith(" ") and " " not in stripped):
+            # Completing the first (and only so far) word on the line.
+            results.extend(cmd for cmd in _BUILTIN_COMMANDS if cmd.startswith(text))
         else:
-            last_word = text
-
-        # Check if last word looks like a path
-        is_path = False
-        if last_word:
-            is_path = (
-                "~/" in last_word
-                or last_word.startswith("~")
-                or (last_word.startswith("/") and "/" in last_word)
-                or os.path.dirname(last_word) != "."
-            )
-
-        if is_path:
-            try:
-                # If last_word itself is a valid directory, list its contents
-                if os.path.isdir(last_word):
-                    path_dir = last_word
-                    prefix = ""
-                elif "~/" in last_word:
-                    idx = last_word.index("~/")
-                    prefix = last_word[idx + 2:]
-                    path_dir = os.path.expanduser("~")
-                elif last_word.startswith("~"):
-                    if len(last_word) == 1:
-                        path_dir = os.path.expanduser("~")
-                        prefix = ""
-                    else:
-                        rest = last_word[1:]
-                        if rest.startswith("/"):
-                            path_dir = os.path.expanduser("~")
-                            prefix = rest[1:] if len(rest) > 1 else ""
-                        else:
-                            path_dir = os.path.expanduser("~")
-                            prefix = last_word[1:]
-                elif last_word.startswith("/"):
-                    # Absolute path
-                    dir_part = os.path.dirname(last_word)
-                    if os.path.isdir(dir_part):
-                        path_dir = dir_part
-                        prefix = os.path.basename(last_word)
-                    else:
-                        path_dir = None
-                else:
-                    dir_part = os.path.dirname(last_word)
-                    if dir_part and os.path.isdir(dir_part):
-                        path_dir = dir_part
-                        prefix = os.path.basename(last_word)
-                    else:
-                        path_dir = os.getcwd()
-                        prefix = last_word
-
-                if path_dir and os.path.isdir(path_dir):
-                    for e in sorted(os.listdir(path_dir)):
-                        if e.startswith(prefix):
-                            full_path = os.path.join(path_dir, e)
-                            if os.path.isdir(full_path):
-                                results.append(e + "/")
-                            else:
-                                results.append(e)
-            except OSError:
-                pass
-
-        # If no path results, return commands
-        if not results:
-            results.extend(_BUILTIN_COMMANDS)
+            # Completing a subsequent argument — offer path completions.
+            results.extend(_path_completions(text))
+            if not results:
+                results.extend(_path_completions("./" + text))
 
         if state < len(results):
             return results[state]
         return None
 
     _readline.set_completer(completer)
+    # Word delimiters: spaces and common shell separators split tokens.
+    # Forward slashes are intentionally *excluded* so that full paths like
+    # /usr/local/bin or ~/projects/chip are treated as a single completable token.
+    _readline.set_completer_delims(" \t\n;|&")
     _readline.parse_and_bind("tab: complete")
 
-    # Enable Vi editing mode (allows up/down for history)
-    _readline.parse_and_bind("set editing-mode vi")
+    # Emacs editing mode: arrow keys ↑/↓ navigate history out of the box.
+    _readline.parse_and_bind("set editing-mode emacs")
 
     # Load persistent history
     if os.path.exists(_HISTORY_FILE):
@@ -163,10 +159,18 @@ _BANNER = """\
 
 _HELP = """\
 Built-in commands:
-  clear    -- reset session memory
-  history  -- show message history
-  help     -- show this help
-  exit     -- quit (also: quit, Ctrl-D, Ctrl-C)
+  clear          -- reset session memory
+  history        -- show message history
+  cd <dir>       -- change working directory
+  help           -- show this help
+  exit           -- quit (also: quit, Ctrl-D, Ctrl-C)
+
+Shell commands:
+  !<cmd> [args]  -- run a shell command (e.g. !ls -la, !pwd, !cat file.txt)
+
+Keyboard shortcuts:
+  ↑ / ↓          -- navigate command history
+  Tab             -- autocomplete commands, executables, and paths
 
 Anything else is forwarded to the EDA ReAct agent.
 """
@@ -216,6 +220,30 @@ def cli_repl() -> None:
             continue
         if cmd == "help":
             print(_HELP)
+            continue
+
+        # cd: must be handled inside the process to affect the current CWD.
+        if cmd == "cd" or user_input.lower().startswith("cd "):
+            parts = user_input.split(None, 1)
+            target = parts[1] if len(parts) > 1 else os.path.expanduser("~")
+            target = os.path.expanduser(target.strip())
+            try:
+                os.chdir(target)
+                print(os.getcwd())
+            except OSError as exc:
+                print(f"cd: {exc}", file=sys.stderr)
+            continue
+
+        # !<shell_cmd>: execute directly in the shell.
+        if user_input.startswith("!"):
+            shell_cmd = user_input[1:].strip()
+            if not shell_cmd:
+                print("Usage: !<command>  (e.g. !ls -la)", file=sys.stderr)
+                continue
+            try:
+                subprocess.run(shell_cmd, shell=True)  # noqa: S602
+            except OSError as exc:
+                print(f"Error running command: {exc}", file=sys.stderr)
             continue
 
         try:
