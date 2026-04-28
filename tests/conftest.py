@@ -31,6 +31,36 @@ slack (VIOLATED) -0.128
 
 
 @pytest.fixture
+def timing_report_extended_text() -> str:
+    """Timing report that also contains ORFS extended metrics."""
+    sep = "-" * 90
+    return f"""\
+wns -0.342
+tns -12.451
+violating paths 7
+view setup_typical
+clk period_min = 4.19 fmax = 238.86
+setup skew 0.12
+max slew violation count 3
+max fanout violation count 1
+max cap violation count 0
+setup violation count 7
+hold violation count 2
+critical path delay
+  4.19
+slack div critical path delay
+  0.918
+
+{sep}
+Startpoint: u_core/u_rx/data_reg[0]
+Endpoint:   u_core/u_tx/out_reg[3]
+Path Group: clk
+slack (VIOLATED) -0.342
+{sep}
+"""
+
+
+@pytest.fixture
 def congestion_report_text() -> str:
     return """\
 Global Routing Congestion Report
