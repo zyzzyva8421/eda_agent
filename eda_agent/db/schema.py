@@ -35,7 +35,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -148,7 +148,12 @@ class Run(Base):
 # ── timing_summary ────────────────────────────────────────────────────────────
 
 class TimingSummary(Base):
-    """WNS / TNS / failing-endpoint-count per run and analysis view."""
+    """WNS / TNS / failing-endpoint-count per run and analysis view.
+
+    Extended fields (added in migration 0003) capture additional OpenROAD
+    metrics parsed by TimingParser: fmax, clock skew, violation counts, and
+    critical-path delay.
+    """
 
     __tablename__ = "timing_summary"
 
@@ -160,6 +165,16 @@ class TimingSummary(Base):
     wns_ns: Mapped[float | None] = mapped_column(Float)
     tns_ns: Mapped[float | None] = mapped_column(Float)
     failing_endpoints: Mapped[int | None] = mapped_column(Integer)
+    # Extended timing metrics (OpenROAD / ORFS)
+    fmax_mhz: Mapped[float | None] = mapped_column(Float)
+    clock_skew_ns: Mapped[float | None] = mapped_column(Float)
+    max_slew_violations: Mapped[int | None] = mapped_column(Integer)
+    max_fanout_violations: Mapped[int | None] = mapped_column(Integer)
+    max_cap_violations: Mapped[int | None] = mapped_column(Integer)
+    setup_violations: Mapped[int | None] = mapped_column(Integer)
+    hold_violations: Mapped[int | None] = mapped_column(Integer)
+    critical_path_delay_ns: Mapped[float | None] = mapped_column(Float)
+    slack_cpd_ratio_pct: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
