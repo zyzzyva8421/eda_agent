@@ -305,6 +305,53 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "tune_ppa_multistage",
+            "description": (
+                "Multi-stage autonomous PPA tuning loop. Unlike tune_ppa (which repeats a "
+                "single fixed stage), this tool analyses which stage is the bottleneck "
+                "(based on setup/hold violations, congestion, DRC counts) and re-runs "
+                "the flow from that stage with adjusted parameters. Returns the full "
+                "iteration history with per-stage metrics."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "backend": {
+                        "type": "string",
+                        "description": "Backend name (e.g. 'orfs').",
+                    },
+                    "design_name": {"type": "string"},
+                    "design_config": {
+                        "type": "string",
+                        "description": "Absolute path to design config.",
+                    },
+                    "pdk": {"type": "string"},
+                    "target_spec": {
+                        "type": "string",
+                        "description": "Natural language PPA target, e.g. 'WNS >= -0.1ns'.",
+                    },
+                    "start_stage": {
+                        "type": "string",
+                        "description": (
+                            "Earliest stage to run in the first pass "
+                            "(default 'place'). Upstream stages (synth/floorplan) "
+                            "are assumed already done."
+                        ),
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "description": "Maximum tuning iterations (default 5).",
+                    },
+                },
+                "required": [
+                    "backend", "design_name", "design_config", "pdk", "target_spec",
+                ],
+            },
+        },
+    },
 ]
 
 
@@ -469,6 +516,10 @@ def _query_timing(
                 f"""
                 SELECT ts.id, r.id AS run_id, r.stage, b.name AS backend,
                        ts.view, ts.wns_ns, ts.tns_ns, ts.failing_endpoints,
+                       ts.fmax_mhz, ts.clock_skew_ns,
+                       ts.max_slew_violations, ts.max_fanout_violations,
+                       ts.max_cap_violations, ts.setup_violations, ts.hold_violations,
+                       ts.critical_path_delay_ns, ts.slack_cpd_ratio_pct,
                        r.params, r.created_at
                 FROM timing_summary ts
                 JOIN runs r    ON r.id  = ts.run_id
@@ -693,7 +744,11 @@ def _suggest_params(run_id: int, target_spec: str) -> dict[str, Any]:
     with get_db() as db:
         ts_row = db.execute(
             text(
-                "SELECT wns_ns, tns_ns, failing_endpoints "
+                "SELECT wns_ns, tns_ns, failing_endpoints, "
+                "       fmax_mhz, clock_skew_ns, max_slew_violations, "
+                "       max_fanout_violations, max_cap_violations, "
+                "       setup_violations, hold_violations, "
+                "       critical_path_delay_ns, slack_cpd_ratio_pct "
                 "FROM timing_summary WHERE run_id = :rid "
                 "ORDER BY wns_ns ASC LIMIT 1"
             ),
@@ -715,6 +770,16 @@ def _suggest_params(run_id: int, target_spec: str) -> dict[str, Any]:
             ),
             {"rid": run_id},
         ).mappings().first()
+
+        # Worst timing paths (up to 5) to give LLM concrete path info
+        path_rows = db.execute(
+            text(
+                "SELECT startpoint, endpoint, path_group, slack_ns "
+                "FROM timing_paths WHERE run_id = :rid "
+                "ORDER BY slack_ns ASC LIMIT 5"
+            ),
+            {"rid": run_id},
+        ).mappings().fetchall()
 
         # Fetch the last 5 runs for the same design to provide history
         design_name = run_row["design_name"] if run_row else ""
@@ -743,6 +808,7 @@ def _suggest_params(run_id: int, target_spec: str) -> dict[str, Any]:
             run_row=dict(run_row) if run_row else {},
             us_row=dict(us_row) if us_row else {},
             history=[dict(r) for r in history_rows],
+            worst_paths=[dict(p) for p in path_rows],
         )
         return {**suggestions, "run_id": run_id, "target_spec": target_spec, "source": "llm"}
     except Exception:
@@ -754,15 +820,68 @@ def _suggest_params(run_id: int, target_spec: str) -> dict[str, Any]:
 
     if ts_row:
         wns = ts_row["wns_ns"] or 0.0
+        fep = ts_row["failing_endpoints"] or 0
+        hold_vio = ts_row.get("hold_violations") or 0
+        slew_vio = ts_row.get("max_slew_violations") or 0
+
+        # Resolve CLOCK_PERIOD from current run params if available
+        current_params: dict[str, Any] = {}
+        if run_row and run_row.get("params"):
+            p = run_row["params"]
+            current_params = p if isinstance(p, dict) else {}
+
+        current_period = None
+        try:
+            current_period = float(current_params.get("CLOCK_PERIOD", ""))
+        except (TypeError, ValueError):
+            pass
+
         if wns < -0.5:
-            suggestions_h["CLOCK_PERIOD"] = "increase by 0.5 ns"
-            reasoning.append(f"WNS={wns:.3f}ns is highly negative; relax clock period.")
+            if current_period is not None:
+                new_period = round(current_period + 0.5, 3)
+                suggestions_h["CLOCK_PERIOD"] = new_period
+                reasoning.append(
+                    f"WNS={wns:.3f}ns is highly negative; relaxing CLOCK_PERIOD "
+                    f"from {current_period} to {new_period} ns."
+                )
+            else:
+                reasoning.append(
+                    "WNS is highly negative; consider relaxing "
+                    f"CLOCK_PERIOD by ~0.5 ns (current WNS={wns:.3f} ns)."
+                )
         elif wns < -0.1:
             suggestions_h["TNS_END_PERCENT"] = 20
-            reasoning.append(f"WNS={wns:.3f}ns; tighten TNS endpoint coverage.")
-        if ts_row["failing_endpoints"] and ts_row["failing_endpoints"] > 10:
-            suggestions_h["CORE_UTILIZATION"] = "reduce by 5%"
-            reasoning.append("High FEP; consider reducing core utilization to ease placement.")
+            reasoning.append(f"WNS={wns:.3f}ns; tightening TNS endpoint coverage to 20%.")
+
+        if fep > 10:
+            current_util = None
+            try:
+                current_util = float(current_params.get("CORE_UTILIZATION", ""))
+            except (TypeError, ValueError):
+                pass
+            if current_util is not None:
+                new_util = max(10, round(current_util - 5, 1))
+                suggestions_h["CORE_UTILIZATION"] = new_util
+                reasoning.append(
+                    f"High FEP ({fep}); reducing CORE_UTILIZATION "
+                    f"from {current_util} to {new_util}%."
+                )
+            else:
+                reasoning.append(
+                    f"High FEP ({fep}); consider reducing CORE_UTILIZATION by ~5%."
+                )
+
+        if hold_vio > 0:
+            reasoning.append(
+                f"Hold violations detected ({hold_vio}); consider increasing "
+                "CTS_BUF_CELL hold margin or enabling hold-fixing in CTS."
+            )
+
+        if slew_vio > 5:
+            reasoning.append(
+                f"High slew violations ({slew_vio}); consider increasing "
+                "MAX_SLEW_REPORTING_THRESHOLD or adjusting driver sizing."
+            )
 
     return {
         "run_id": run_id,
@@ -780,10 +899,13 @@ def _llm_suggest_params(
     run_row: dict,
     us_row: dict,
     history: list[dict],
+    worst_paths: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Call the MiniMax LLM to produce parameter suggestions.
 
     Raises an exception if the LLM call fails so the caller can fall back.
+    The prompt explicitly instructs the LLM to return **concrete numeric
+    values** only – never relative adjustments like "increase by X".
     """
     context_parts = [
         f"Design: {run_row.get('design_name', 'unknown')}  PDK: {run_row.get('pdk', 'unknown')}",
@@ -798,12 +920,40 @@ def _llm_suggest_params(
             f"TNS: {ts_row.get('tns_ns')} ns, "
             f"Failing endpoints: {ts_row.get('failing_endpoints')}"
         )
+        # Extended timing metrics
+        extras = []
+        if ts_row.get("fmax_mhz") is not None:
+            extras.append(f"Fmax: {ts_row['fmax_mhz']} MHz")
+        if ts_row.get("clock_skew_ns") is not None:
+            extras.append(f"Clock skew: {ts_row['clock_skew_ns']} ns")
+        if ts_row.get("setup_violations") is not None:
+            extras.append(f"Setup violations: {ts_row['setup_violations']}")
+        if ts_row.get("hold_violations") is not None:
+            extras.append(f"Hold violations: {ts_row['hold_violations']}")
+        if ts_row.get("max_slew_violations") is not None:
+            extras.append(f"Slew violations: {ts_row['max_slew_violations']}")
+        if ts_row.get("max_fanout_violations") is not None:
+            extras.append(f"Fanout violations: {ts_row['max_fanout_violations']}")
+        if ts_row.get("max_cap_violations") is not None:
+            extras.append(f"Cap violations: {ts_row['max_cap_violations']}")
+        if ts_row.get("critical_path_delay_ns") is not None:
+            extras.append(f"Critical path delay: {ts_row['critical_path_delay_ns']} ns")
+        if extras:
+            context_parts.append("  Extended – " + ", ".join(extras))
     if us_row:
         context_parts.append(
             f"  Utilization – Area: {us_row.get('design_area_um2')} µm², "
             f"Util%: {us_row.get('utilization_pct')}, "
             f"Cells: {us_row.get('num_cells')}"
         )
+    if worst_paths:
+        context_parts.append("")
+        context_parts.append("## Worst timing paths (most negative slack first)")
+        for p in worst_paths:
+            context_parts.append(
+                f"  slack={p.get('slack_ns')} ns  group={p.get('path_group')}  "
+                f"{p.get('startpoint', '')} → {p.get('endpoint', '')}"
+            )
     if history:
         context_parts.append("")
         context_parts.append("## Recent run history (newest first)")
@@ -818,14 +968,18 @@ def _llm_suggest_params(
         "You are an expert EDA physical design engineer specialised in VLSI PPA optimisation "
         "with OpenROAD Flow Scripts (ORFS). "
         "Given current metrics and run history, output ONLY a JSON object with two keys:\n"
-        '  "suggested_params": an object mapping ORFS make variable names to values,\n'
+        '  "suggested_params": an object mapping ORFS make variable names to CONCRETE NUMERIC '
+        "values (integers or floats). "
+        "NEVER use relative adjustments like 'increase by X' or 'reduce by Y%'. "
+        "Always compute the absolute target value from the current params shown above.\n"
         '  "reasoning": an array of concise strings explaining each suggestion.\n'
         "Do NOT include any other text outside the JSON object."
     )
     user_msg = (
         f"PPA target: {target_spec}\n\n"
         + "\n".join(context_parts)
-        + "\n\nSuggest ORFS parameter changes to reach the PPA target."
+        + "\n\nSuggest ORFS parameter changes to reach the PPA target. "
+        "Return concrete numeric values only."
     )
 
     api_key = settings.minimax_api_key
@@ -882,17 +1036,24 @@ def _tune_ppa(
     target_spec: str,
     max_iterations: int = 5,
 ) -> dict[str, Any]:
-    """Autonomous PPA tuning loop.
+    """Autonomous PPA tuning loop with hill-climbing direction memory.
 
     For each iteration:
     1. Run the EDA stage with current parameters.
     2. Query timing metrics from the DB.
     3. Check whether the target spec is satisfied.
-    4. If not, call ``suggest_params`` to get the next set of parameters.
-    5. Repeat until the target is met or ``max_iterations`` is exhausted.
+    4. If WNS regressed vs the previous best, note this so the LLM can pick
+       a different direction.
+    5. Call ``suggest_params`` to get the next set of parameters.
+    6. Repeat until the target is met or ``max_iterations`` is exhausted.
+
+    Only concrete numeric parameter values (int / float / numeric-string)
+    are passed to the EDA tool; advisory strings are discarded to prevent
+    silently re-running with unchanged parameters.
     """
     history: list[dict[str, Any]] = []
     current_params: dict[str, Any] = {}
+    best_wns: float | None = None
 
     for iteration in range(1, max_iterations + 1):
         logger.info("tune_ppa iteration %d/%d params=%s", iteration, max_iterations, current_params)
@@ -916,6 +1077,7 @@ def _tune_ppa(
             "run_id": run_db_id,
             "status": status,
             "target_met": False,
+            "improved": False,
         }
 
         if status != "success" or run_db_id is None:
@@ -926,10 +1088,20 @@ def _tune_ppa(
         # Step 2 – query timing
         timing = _query_timing(design_name, stage=stage, run_id=run_db_id, limit=1)
         summary = timing.get("summary", [])
+        current_wns: float | None = None
         if summary:
-            iteration_record["wns_ns"] = summary[0].get("wns_ns")
+            current_wns = summary[0].get("wns_ns")
+            iteration_record["wns_ns"] = current_wns
             iteration_record["tns_ns"] = summary[0].get("tns_ns")
             iteration_record["failing_endpoints"] = summary[0].get("failing_endpoints")
+
+        # Hill-climbing: track whether WNS improved
+        if current_wns is not None:
+            if best_wns is None or current_wns > best_wns:
+                best_wns = current_wns
+                iteration_record["improved"] = True
+            else:
+                iteration_record["improved"] = False
 
         # Step 3 – check target
         target_met = _check_ppa_target(timing, target_spec)
@@ -941,35 +1113,66 @@ def _tune_ppa(
             break
 
         if iteration < max_iterations:
+            # Annotate target_spec with regression info so LLM picks a new direction
+            augmented_spec = target_spec
+            if not iteration_record["improved"] and iteration > 1:
+                augmented_spec = (
+                    f"{target_spec} "
+                    f"[last params did NOT improve WNS; try a different direction]"
+                )
+
             # Step 4 – get next params
-            suggestion = _suggest_params(run_db_id, target_spec)
+            suggestion = _suggest_params(run_db_id, augmented_spec)
             raw_params = suggestion.get("suggested_params", {})
-            # Only keep concrete k=v pairs (skip advisory strings like "increase by 0.5 ns")
+
+            # Keep only concrete numeric values.
+            # Advisory strings like "increase by 0.5 ns" cannot be passed to make
+            # and would silently result in an unchanged run.
             filtered: dict[str, Any] = {}
             for k, v in raw_params.items():
-                if not isinstance(v, str):
+                if isinstance(v, (int, float)):
                     filtered[k] = v
                     continue
-                try:
-                    float(v)
-                    filtered[k] = v
-                except ValueError:
-                    pass
+                if isinstance(v, str):
+                    try:
+                        float(v)  # numeric string → safe to pass as-is
+                        filtered[k] = v
+                    except ValueError:
+                        logger.debug(
+                            "tune_ppa: dropping non-numeric suggestion %s=%r", k, v
+                        )
+
+            if not filtered and raw_params:
+                logger.warning(
+                    "tune_ppa: all suggested params were non-numeric and were dropped; "
+                    "re-running with same params (iteration %d)",
+                    iteration,
+                )
             current_params = filtered
 
     return {
         "iterations_run": len(history),
         "target_spec": target_spec,
         "target_met": any(r.get("target_met") for r in history),
+        "best_wns_ns": best_wns,
         "history": history,
     }
 
 
 def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
-    """Evaluate a simple natural-language PPA target against timing data.
+    """Evaluate a natural-language PPA target against timing data.
 
-    Supports patterns like 'WNS >= -0.1' (case-insensitive).
-    Returns True if the target is satisfied (or if it cannot be parsed).
+    Supports multi-metric patterns (case-insensitive):
+      - WNS >= -0.1
+      - TNS <= -5
+      - fmax >= 500
+      - fep == 0  /  failing_endpoints == 0
+      - setup_violations == 0
+      - hold_violations == 0
+
+    Multiple conditions joined by 'and' are all required to be true.
+    Returns True if all parsed conditions are satisfied, or if no
+    recognisable condition is found and there are 0 failing endpoints.
     """
     import re
 
@@ -980,26 +1183,244 @@ def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
     latest = summary[0]
     spec_lower = target_spec.lower()
 
-    wns_match = re.search(r"wns\s*(>=|<=|>|<|==)\s*(-?[\d.]+)", spec_lower)
-    if wns_match:
-        op, threshold = wns_match.group(1), float(wns_match.group(2))
-        wns = latest.get("wns_ns")
-        if wns is None:
-            return False
-        if op == ">=" and wns >= threshold:
-            return True
-        if op == "<=" and wns <= threshold:
-            return True
-        if op == ">" and wns > threshold:
-            return True
-        if op == "<" and wns < threshold:
-            return True
-        if op == "==" and wns == threshold:
-            return True
+    # Map metric aliases → data key in the summary dict
+    _METRIC_MAP = {
+        "wns": "wns_ns",
+        "tns": "tns_ns",
+        "fmax": "fmax_mhz",
+        "fep": "failing_endpoints",
+        "failing_endpoints": "failing_endpoints",
+        "failing endpoints": "failing_endpoints",
+        "setup_violations": "setup_violations",
+        "hold_violations": "hold_violations",
+    }
+
+    # Pattern: <metric> <op> <value>
+    _COND_RE = re.compile(
+        r"(wns|tns|fmax|fep|failing[_ ]endpoints|setup_violations|hold_violations)"
+        r"\s*(>=|<=|>|<|==)\s*(-?[\d.]+)",
+        re.IGNORECASE,
+    )
+
+    conditions = _COND_RE.findall(spec_lower)
+    if not conditions:
+        # No parseable spec → satisfied when FEP == 0
+        return (latest.get("failing_endpoints") or 0) == 0
+
+    def _apply(op: str, actual: float, threshold: float) -> bool:
+        if op == ">=":
+            return actual >= threshold
+        if op == "<=":
+            return actual <= threshold
+        if op == ">":
+            return actual > threshold
+        if op == "<":
+            return actual < threshold
+        if op == "==":
+            return actual == threshold
         return False
 
-    # No parseable spec → consider target met if there are 0 failing endpoints
-    return (latest.get("failing_endpoints") or 0) == 0
+    for metric_alias, op, raw_threshold in conditions:
+        data_key = _METRIC_MAP.get(metric_alias.replace(" ", "_"))
+        if data_key is None:
+            continue
+        actual = latest.get(data_key)
+        if actual is None:
+            return False
+        if not _apply(op, float(actual), float(raw_threshold)):
+            return False
+
+    return True
+
+
+# ── Multi-stage tuning ────────────────────────────────────────────────────────
+
+# Ordered ORFS stages used for multi-stage traversal
+_ORFS_STAGE_ORDER: list[str] = ["synth", "floorplan", "place", "cts", "route", "finish"]
+
+
+def _pick_bottleneck_stage(timing: dict[str, Any]) -> str:
+    """Choose which stage to re-run based on violation profile.
+
+    Decision rules (checked in priority order):
+    - Hold violations present → re-run CTS (clock skew / hold buffer insertion)
+    - DRC violations or route congestion → re-run route
+    - High congestion → re-run place
+    - Setup violations / negative WNS → re-run CTS (timing closure)
+    - Otherwise → re-run place (general timing improvement)
+    """
+    summary = timing.get("summary", [{}])[0] if timing.get("summary") else {}
+    hold_vio = summary.get("hold_violations") or 0
+    setup_vio = summary.get("setup_violations") or 0
+    wns = summary.get("wns_ns") or 0.0
+    fep = summary.get("failing_endpoints") or 0
+
+    if hold_vio > 0:
+        return "cts"
+    if wns < -0.3 or setup_vio > 10 or fep > 20:
+        return "cts"
+    if fep > 0 or wns < 0:
+        return "route"
+    return "place"
+
+
+def _tune_ppa_multistage(
+    backend: str,
+    design_name: str,
+    design_config: str,
+    pdk: str,
+    target_spec: str,
+    start_stage: str = "place",
+    max_iterations: int = 5,
+) -> dict[str, Any]:
+    """Multi-stage autonomous PPA tuning loop.
+
+    Each iteration:
+    1. Run all stages from ``rerun_from`` through ``finish``.
+    2. Collect PPA metrics (timing, congestion, utilization).
+    3. Check whether the target is met.
+    4. Identify the bottleneck stage from the violation profile.
+    5. Suggest parameters for that stage via ``suggest_params``.
+    6. Re-run from the bottleneck stage in the next iteration.
+    """
+    history: list[dict[str, Any]] = []
+    stage_params: dict[str, dict[str, Any]] = {}  # per-stage param overrides
+    rerun_from: str = start_stage
+    best_wns: float | None = None
+
+    # Determine the terminal stage index
+    try:
+        start_idx = _ORFS_STAGE_ORDER.index(start_stage)
+    except ValueError:
+        start_idx = 0
+
+    for iteration in range(1, max_iterations + 1):
+        logger.info(
+            "tune_ppa_multistage iteration %d/%d  rerun_from=%s  stage_params=%s",
+            iteration, max_iterations, rerun_from, stage_params,
+        )
+
+        try:
+            rerun_idx = _ORFS_STAGE_ORDER.index(rerun_from)
+        except ValueError:
+            rerun_idx = start_idx
+
+        stages_to_run = _ORFS_STAGE_ORDER[rerun_idx:]
+
+        iteration_record: dict[str, Any] = {
+            "iteration": iteration,
+            "rerun_from": rerun_from,
+            "stages_run": [],
+            "target_met": False,
+            "improved": False,
+        }
+
+        last_run_id: int | None = None
+        last_timing: dict[str, Any] = {}
+
+        for stage in stages_to_run:
+            params = stage_params.get(stage, {})
+            run_result = _run_eda_stage(
+                backend=backend,
+                stage=stage,
+                design_name=design_name,
+                design_config=design_config,
+                pdk=pdk,
+                params=params,
+            )
+            stage_record: dict[str, Any] = {
+                "stage": stage,
+                "run_id": run_result.get("run_id"),
+                "status": run_result.get("status"),
+                "params": params,
+            }
+            if run_result.get("status") != "success":
+                stage_record["error"] = run_result.get("error")
+                iteration_record["stages_run"].append(stage_record)
+                break
+
+            last_run_id = run_result.get("run_id")
+            # Query timing after each stage for progress tracking
+            timing = _query_timing(design_name, stage=stage, run_id=last_run_id, limit=1)
+            ts = timing.get("summary", [{}])[0] if timing.get("summary") else {}
+            stage_record["wns_ns"] = ts.get("wns_ns")
+            stage_record["tns_ns"] = ts.get("tns_ns")
+            stage_record["failing_endpoints"] = ts.get("failing_endpoints")
+            iteration_record["stages_run"].append(stage_record)
+
+            if stage == "finish":
+                last_timing = timing
+
+        if not iteration_record["stages_run"]:
+            history.append(iteration_record)
+            break
+
+        # Use the finish-stage timing for target evaluation
+        if not last_timing and last_run_id:
+            last_timing = _query_timing(design_name, run_id=last_run_id, limit=1)
+
+        # Hill-climbing direction memory
+        fin_summary = last_timing.get("summary", [{}])[0] if last_timing.get("summary") else {}
+        current_wns = fin_summary.get("wns_ns")
+        if current_wns is not None:
+            iteration_record["wns_ns"] = current_wns
+            if best_wns is None or current_wns > best_wns:
+                best_wns = current_wns
+                iteration_record["improved"] = True
+
+        # Check target
+        target_met = _check_ppa_target(last_timing, target_spec)
+        iteration_record["target_met"] = target_met
+        history.append(iteration_record)
+
+        if target_met:
+            logger.info("tune_ppa_multistage: target met at iteration %d", iteration)
+            break
+
+        if iteration < max_iterations and last_run_id is not None:
+            # Pick bottleneck stage and suggest params for it
+            bottleneck = _pick_bottleneck_stage(last_timing)
+
+            augmented_spec = target_spec
+            if not iteration_record["improved"] and iteration > 1:
+                augmented_spec = (
+                    f"{target_spec} "
+                    f"[last params did NOT improve WNS; try a different direction]"
+                )
+
+            suggestion = _suggest_params(last_run_id, augmented_spec)
+            raw_params = suggestion.get("suggested_params", {})
+
+            # Validate: keep concrete numeric values only
+            filtered: dict[str, Any] = {}
+            for k, v in raw_params.items():
+                if isinstance(v, (int, float)):
+                    filtered[k] = v
+                elif isinstance(v, str):
+                    try:
+                        float(v)
+                        filtered[k] = v
+                    except ValueError:
+                        logger.debug(
+                            "tune_ppa_multistage: dropping non-numeric suggestion %s=%r", k, v
+                        )
+
+            if filtered:
+                stage_params[bottleneck] = filtered
+                rerun_from = bottleneck
+                iteration_record["next_bottleneck_stage"] = bottleneck
+                iteration_record["next_params"] = filtered
+            else:
+                # No actionable suggestions; retry from the same stage
+                rerun_from = bottleneck
+
+    return {
+        "iterations_run": len(history),
+        "target_spec": target_spec,
+        "target_met": any(r.get("target_met") for r in history),
+        "best_wns_ns": best_wns,
+        "history": history,
+    }
 
 
 # ── Dispatch table ────────────────────────────────────────────────────────────
@@ -1015,6 +1436,7 @@ _TOOL_DISPATCH = {
     "compare_runs": _compare_runs,
     "suggest_params": _suggest_params,
     "tune_ppa": _tune_ppa,
+    "tune_ppa_multistage": _tune_ppa_multistage,
 }
 
 
@@ -1113,8 +1535,14 @@ def _ingest_records(records: list[dict], run_id: int, stage: str) -> None:
                 db.execute(
                     text(
                         "INSERT INTO timing_summary "
-                        "(run_id, view, wns_ns, tns_ns, failing_endpoints) "
-                        "VALUES (:run_id, :view, :wns, :tns, :fep)"
+                        "(run_id, view, wns_ns, tns_ns, failing_endpoints, "
+                        " fmax_mhz, clock_skew_ns, max_slew_violations, "
+                        " max_fanout_violations, max_cap_violations, "
+                        " setup_violations, hold_violations, "
+                        " critical_path_delay_ns, slack_cpd_ratio_pct) "
+                        "VALUES (:run_id, :view, :wns, :tns, :fep, "
+                        " :fmax, :skew, :slew_vio, :fanout_vio, :cap_vio, "
+                        " :setup_vio, :hold_vio, :cpd, :ratio)"
                     ),
                     {
                         "run_id": run_id,
@@ -1122,6 +1550,15 @@ def _ingest_records(records: list[dict], run_id: int, stage: str) -> None:
                         "wns": rec.get("wns_ns"),
                         "tns": rec.get("tns_ns"),
                         "fep": rec.get("failing_endpoints"),
+                        "fmax": rec.get("fmax_mhz"),
+                        "skew": rec.get("clock_skew_ns"),
+                        "slew_vio": rec.get("max_slew_violations"),
+                        "fanout_vio": rec.get("max_fanout_violations"),
+                        "cap_vio": rec.get("max_cap_violations"),
+                        "setup_vio": rec.get("setup_violations"),
+                        "hold_vio": rec.get("hold_violations"),
+                        "cpd": rec.get("critical_path_delay_ns"),
+                        "ratio": rec.get("slack_cpd_ratio_pct"),
                     },
                 )
             elif kind == "path":

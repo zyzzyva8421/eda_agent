@@ -45,3 +45,37 @@ def test_empty_raises():
     parser = TimingParser()
     with pytest.raises(ParseError):
         parser.parse_text("no timing data here")
+
+
+# ── Extended ORFS metrics ─────────────────────────────────────────────────────
+
+
+def test_extended_metrics_extracted(timing_report_extended_text):
+    """Extended ORFS fields (fmax, skew, violation counts, CPD) are parsed."""
+    parser = TimingParser()
+    records = parser.parse_text(timing_report_extended_text)
+    summaries = [r for r in records if r["kind"] == "summary"]
+    assert len(summaries) == 1
+    s = summaries[0]
+    assert s["fmax_mhz"] == pytest.approx(238.86)
+    assert s["clock_skew_ns"] == pytest.approx(0.12)
+    assert s["max_slew_violations"] == 3
+    assert s["max_fanout_violations"] == 1
+    assert s["max_cap_violations"] == 0
+    assert s["setup_violations"] == 7
+    assert s["hold_violations"] == 2
+    assert s["critical_path_delay_ns"] == pytest.approx(4.19)
+    assert s["slack_cpd_ratio_pct"] == pytest.approx(0.918)
+
+
+def test_extended_metrics_absent_when_not_in_report(timing_report_text):
+    """Reports without extended fields yield None for those keys."""
+    parser = TimingParser()
+    records = parser.parse_text(timing_report_text)
+    summaries = [r for r in records if r["kind"] == "summary"]
+    s = summaries[0]
+    # Basic fields still present
+    assert s["wns_ns"] is not None
+    # Extended fields absent → None
+    assert s.get("fmax_mhz") is None
+    assert s.get("hold_violations") is None
