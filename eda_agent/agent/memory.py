@@ -116,5 +116,39 @@ class AgentMemory:
     def get(self, key: str, default: Any = None) -> Any:
         return self._scratchpad.get(key, default)
 
+    def extract_design_context(self) -> dict[str, str]:
+        """Extract design context from conversation history.
+        
+        Looks for design_name, pdk, and config_path from previous tool calls.
+        Returns a dict with available context.
+        """
+        context: dict[str, str] = {}
+        
+        # Look through tool results for design info
+        for msg in self._history:
+            if msg.role == "tool" and msg.tool_name in ("run_eda_stage", "run_eda_flow"):
+                try:
+                    import json
+                    # Parse the tool result to extract design info
+                    result = json.loads(msg.content)
+                    if isinstance(result, dict):
+                        # Try to extract from result
+                        if "design_name" not in context:
+                            context["design_name"] = result.get("design_name", "")
+                        if "pdk" not in context:
+                            context["pdk"] = result.get("pdk", "")
+                except Exception:
+                    pass
+        
+        # Also check scratchpad
+        for key in ("design_name", "pdk", "config_path"):
+            if key not in context:
+                val = self.get(key)
+                if val:
+                    context[key] = val
+        
+        # Remove empty values
+        return {k: v for k, v in context.items() if v}
+
     def __len__(self) -> int:
         return len(self._history)

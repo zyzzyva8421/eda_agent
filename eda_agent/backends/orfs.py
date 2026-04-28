@@ -167,7 +167,8 @@ class ORFSBackend(AbstractEDABackend):
             if proc.returncode == 0:
                 status = StageStatus.SUCCESS
             else:
-                error_message = f"make exited with code {proc.returncode}"
+                # Try to extract a more helpful error message from the log
+                error_message = self._parse_error_from_log(log_path) or f"make exited with code {proc.returncode}"
         except subprocess.TimeoutExpired:
             error_message = "Stage timed out after 2 hours"
         except FileNotFoundError:
@@ -238,3 +239,36 @@ class ORFSBackend(AbstractEDABackend):
         for key, value in params.items():
             cmd.append(f"{key}={value}")
         return cmd
+
+    def _parse_error_from_log(self, log_path: Path) -> str | None:
+        """Try to extract a meaningful error message from the log file."""
+        if not log_path.is_file():
+            return None
+        try:
+            content = log_path.read_text()
+            lines = content.splitlines()
+            # Look for common error patterns
+            error_patterns = [
+                "Error:",
+                "ERROR:",
+                "error:",
+                "No such file",
+                "cannot find",
+                "command not found",
+                "make: ***",
+                "failed",
+                "fatal:",
+            ]
+            # Find last occurrence of any error pattern
+            for i in range(len(lines) - 1, -1, -1):
+                line = lines[i]
+                for pattern in error_patterns:
+                    if pattern in line:
+                        # Return this line and up to 2 lines of context
+                        start = max(0, i - 1)
+                        end = min(len(lines), i + 2)
+                        return "\n".join(lines[start:end])
+            # If no error pattern found, return last few lines
+            return "\n".join(lines[-5:]) if lines else None
+        except Exception:
+            return None

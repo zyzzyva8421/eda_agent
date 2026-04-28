@@ -56,14 +56,16 @@ _PATH_GROUP = re.compile(
 # Match slack line – two formats produced by different OpenROAD versions:
 #   Format A (value before keyword):  "  -0.59   slack (VIOLATED)"
 #   Format B (value after keyword):   "slack (VIOLATED) -0.342"
+#   Also handle: "slack (MET) 0.35" with potential leading whitespace
 _PATH_SLACK = re.compile(
     r"^\s*-?\d+\.\d+\s+slack\s+\((?:MET|VIOLATED)\)"
-    r"|slack\s+\((?:MET|VIOLATED)\)\s+-?\d+\.\d+",
+    r"|slack\s+\((?:MET|VIOLATED)\)\s+-?\d+\.\d+"
+    r"|slack\s+\((?:MET|VIOLATED)\)\s+\n\s*-?\d+\.\d+",
     re.MULTILINE | re.IGNORECASE,
 )
 # Fallback: extract the numeric slack value from whichever format matched
 _PATH_SLACK_VALUE = re.compile(r"-?\d+\.\d+")
-# Fallback: find any slack value in the block
+# Fallback: find any slack value in the block (handles multiline format)
 _PATH_SLACK_FALLBACK = re.compile(
     r"(-?\d+\.\d+)\s+slack|slack\s+\((?:MET|VIOLATED)\)\s+(-?\d+\.\d+)",
     re.MULTILINE | re.IGNORECASE,
@@ -192,25 +194,35 @@ class TimingParser(BaseParser):
         so we search globally and pair them by proximity.
         """
         paths = []
-
-        # Find all startpoints
-        for sp_match in _PATH_STARTPOINT.finditer(text):
+        
+        # First, find all path section boundaries (separated by === or ----)
+        # This is more reliable than fixed character counts
+        section_starts = [m.start() for m in _PATH_STARTPOINT.finditer(text)]
+        
+        for i, sp_match in enumerate(_PATH_STARTPOINT.finditer(text)):
             sp = sp_match.group(1).strip()
             sp_start = sp_match.start()
 
-            # Find endpoint after this startpoint (within ~2000 chars)
-            ep_match = _PATH_ENDPOINT.search(text[sp_start:sp_start+2000])
+            # Find endpoint after this startpoint in the same section
+            # Use the next startpoint position as section boundary, or end of text
+            if i + 1 < len(section_starts):
+                section_end = section_starts[i + 1]
+            else:
+                section_end = len(text)
+            
+            # Search within this section for endpoint
+            section_text = text[sp_start:section_end]
+            ep_match = _PATH_ENDPOINT.search(section_text)
             if not ep_match:
                 continue
             ep = ep_match.group(1).strip()
 
             # Find path group
-            text_after = text[sp_start:sp_start+2000]
-            gr_match = _PATH_GROUP.search(text_after)
+            gr_match = _PATH_GROUP.search(section_text)
             gr = gr_match.group(1).strip() if gr_match else None
 
             # Find slack value - first try primary VIOLATED/MET pattern
-            sl_match = _PATH_SLACK.search(text_after)
+            sl_match = _PATH_SLACK.search(section_text)
             slack_val: float | None = None
             if sl_match:
                 # Extract numeric value from whichever format matched
@@ -218,7 +230,7 @@ class TimingParser(BaseParser):
                 if vals:
                     slack_val = float(vals[0])
             else:
-                fb_match = _PATH_SLACK_FALLBACK.search(text_after)
+                fb_match = _PATH_SLACK_FALLBACK.search(section_text)
                 if fb_match:
                     # Group 1 = "value slack", group 2 = "slack (MET/VIOLATED) value"
                     raw = fb_match.group(1) or fb_match.group(2)

@@ -80,6 +80,50 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "run_eda_flow",
+            "description": (
+                "Run a sequence of EDA flow stages (e.g. from synth to finish) for a "
+                "given design. Stages run sequentially in order. Returns status for each stage."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "backend": {
+                        "type": "string",
+                        "description": "Backend name: 'orfs', 'innovus', 'icc2', or custom.",
+                    },
+                    "stage_start": {
+                        "type": "string",
+                        "description": "Starting stage (e.g. 'synth') or 'all' to run all stages.",
+                    },
+                    "stage_end": {
+                        "type": "string",
+                        "description": "Ending stage (e.g. 'finish'). Ignored if stage_start='all'.",
+                    },
+                    "design_name": {
+                        "type": "string",
+                        "description": "Top-level design/module name (e.g. 'gcd').",
+                    },
+                    "design_config": {
+                        "type": "string",
+                        "description": "Absolute path to the design config file.",
+                    },
+                    "pdk": {
+                        "type": "string",
+                        "description": "PDK identifier (e.g. 'sky130hd').",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Key-value EDA parameters (e.g. CORE_UTILIZATION).",
+                    },
+                },
+                "required": ["backend", "stage_start", "design_name", "design_config", "pdk"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_timing",
             "description": (
                 "Query timing results (WNS, TNS, failing endpoints) and worst slack paths "
@@ -237,6 +281,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_run_log",
+            "description": (
+                "Read the log file from a failed or successful EDA run to diagnose issues. "
+                "Returns the last N lines of the log file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "integer",
+                        "description": "Run ID to read log from.",
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of last lines to return (default 50).",
+                    },
+                },
+                "required": ["run_id"],
+            },
+        },
+    },
 ]
 
 
@@ -287,8 +355,96 @@ def _run_eda_stage(
         "status": result.status.value,
         "stage": stage,
         "backend": backend,
+        "design_name": design_name,
+        "pdk": pdk,
         "error": result.error_message,
         "log_path": str(result.log_path) if result.log_path else None,
+    }
+
+
+def _run_eda_flow(
+    backend: str,
+    stage_start: str,
+    design_name: str,
+    design_config: str,
+    pdk: str,
+    stage_end: str | None = None,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run a sequence of EDA flow stages."""
+    be = get_backend(backend)
+    design = DesignSpec(
+        name=design_name,
+        config_path=Path(design_config),
+        pdk=pdk,
+    )
+
+    # Get supported stages and determine which to run
+    supported_stages = be.get_supported_stages()
+
+    # Handle "all" keyword or build stage range
+    if stage_start.lower() == "all":
+        stages_to_run = supported_stages
+    elif stage_end:
+        try:
+            start_idx = supported_stages.index(stage_start.lower())
+            end_idx = supported_stages.index(stage_end.lower())
+            if start_idx > end_idx:
+                return {"error": f"Stage '{stage_start}' comes after '{stage_end}'"}
+            stages_to_run = supported_stages[start_idx : end_idx + 1]
+        except ValueError as e:
+            return {"error": f"Invalid stage name: {e}"}
+    else:
+        # Single stage - just run one
+        if stage_start.lower() not in supported_stages:
+            return {
+                "error": f"Stage '{stage_start}' not supported. Valid: {supported_stages}"
+            }
+        stages_to_run = [stage_start.lower()]
+
+    # Run stages sequentially
+    results = []
+    for stage in stages_to_run:
+        stage_result = be.run_stage(stage, design, params or {})
+        run_db_id = _upsert_run(stage_result, design)
+
+        # Parse reports if successful
+        if stage_result.status.value == "success":
+            reports = be.collect_reports(stage_result)
+            for rpt in reports:
+                try:
+                    parser = get_parser(rpt.report_type)
+                    records = parser.parse_file(rpt.path)
+                    _ingest_records(records, run_db_id, rpt.stage)
+                except Exception:
+                    logger.exception("Failed to parse %s", rpt.path)
+
+            # Archive to Parquet (best-effort)
+            try:
+                from eda_agent.db.archiver import archive_run
+                archive_run(run_db_id)
+            except Exception:
+                logger.warning("Parquet archival failed for run %d", run_db_id)
+
+        results.append({
+            "stage": stage,
+            "status": stage_result.status.value,
+            "run_id": run_db_id,
+            "run_uuid": stage_result.run_id,
+            "error": stage_result.error_message,
+            "log_path": str(stage_result.log_path) if stage_result.log_path else None,
+        })
+
+    # Determine overall status
+    all_success = all(r["status"] == "success" for r in results)
+    overall_status = "success" if all_success else "partial_failure"
+
+    return {
+        "overall_status": overall_status,
+        "stages_run": len(results),
+        "design_name": design_name,
+        "pdk": pdk,
+        "results": results,
     }
 
 
@@ -492,6 +648,43 @@ def _query_power(
             params,
         ).mappings().fetchall()
     return [dict(r) for r in rows]
+
+
+def _get_run_log(run_id: int, lines: int = 50) -> dict[str, Any]:
+    """Read the log file from a run and return the last N lines."""
+    with get_db() as db:
+        row = db.execute(
+            text(
+                "SELECT r.log_path, r.stage, r.status, d.name AS design_name "
+                "FROM runs r JOIN designs d ON d.id = r.design_id WHERE r.id = :rid"
+            ),
+            {"rid": run_id},
+        ).mappings().first()
+
+    if not row:
+        return {"error": f"Run {run_id} not found"}
+
+    log_path = row["log_path"]
+    if not log_path:
+        return {"error": f"No log_path for run {run_id}"}
+
+    log_file = Path(log_path)
+    if not log_file.is_file():
+        return {"error": f"Log file not found: {log_path}"}
+
+    try:
+        all_lines = log_file.read_text().splitlines()
+        last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+        return {
+            "run_id": run_id,
+            "stage": row["stage"],
+            "status": row["status"],
+            "design_name": row["design_name"],
+            "log_path": str(log_path),
+            "log_content": "\n".join(last_lines),
+        }
+    except Exception as e:
+        return {"error": f"Failed to read log: {e}"}
 
 
 def _suggest_params(run_id: int, target_spec: str) -> dict[str, Any]:
@@ -813,6 +1006,8 @@ def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
 
 _TOOL_DISPATCH = {
     "run_eda_stage": _run_eda_stage,
+    "run_eda_flow": _run_eda_flow,
+    "get_run_log": _get_run_log,
     "query_timing": _query_timing,
     "query_congestion": _query_congestion,
     "query_utilization": _query_utilization,
