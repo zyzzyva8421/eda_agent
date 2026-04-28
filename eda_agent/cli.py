@@ -328,8 +328,18 @@ def _build_parser():
     )
 
     # -- cancel ----------------------------------------------------------------
-    cp = sub.add_parser("cancel", help="Cancel a pending job.")
-    cp.add_argument("job_id", help="Job UUID.")
+    cp = sub.add_parser("cancel", help="Cancel pending job(s).")
+    cp.add_argument(
+        "job_id",
+        nargs="?",
+        default=None,
+        help="Job UUID. You can also pass 'all' to cancel all pending jobs.",
+    )
+    cp.add_argument(
+        "--all",
+        action="store_true",
+        help="Cancel all pending jobs.",
+    )
 
     return parser
 
@@ -354,12 +364,21 @@ def _ensure_worker(no_worker: bool = False) -> None:
     if no_worker:
         return
 
+    import subprocess
+    from eda_agent.config import settings
     from eda_agent.queue.worker import _WORKER_LOG, is_worker_running
 
     if is_worker_running():
         return
 
-    import subprocess
+    # Pass essential env vars to worker (ORFS_ROOT, DB credentials, etc.)
+    env = subprocess.os.environ.copy()
+    env["ORFS_ROOT"] = str(settings.orfs_root)
+    env["POSTGRES_HOST"] = settings.postgres_host
+    env["POSTGRES_PORT"] = str(settings.postgres_port)
+    env["POSTGRES_USER"] = settings.postgres_user
+    env["POSTGRES_PASSWORD"] = settings.postgres_password
+    env["POSTGRES_DB"] = settings.postgres_db
 
     _WORKER_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(_WORKER_LOG, "a") as log_fh:
@@ -369,6 +388,7 @@ def _ensure_worker(no_worker: bool = False) -> None:
             stderr=log_fh,
             close_fds=True,
             start_new_session=True,
+            env=env,
         )
     print(f"[worker] Started background worker (PID={proc.pid}), logs -> {_WORKER_LOG}")
 
@@ -526,23 +546,45 @@ def _cmd_logs(args) -> None:
 
 
 def _cmd_cancel(args) -> None:
-    from eda_agent.queue.store import JobStore
+    from eda_agent.queue.store import JobStatus, JobStore
 
     store = JobStore()
+
+    cancel_all = bool(args.all or (args.job_id and args.job_id.lower() == "all"))
+
+    if cancel_all:
+        pending_jobs = store.list_jobs(status=JobStatus.PENDING)
+        if not pending_jobs:
+            print("No pending jobs to cancel.")
+            return
+
+        cancelled = 0
+        for job in pending_jobs:
+            if store.cancel_job(job.job_id):
+                cancelled += 1
+
+        print(f"Cancelled {cancelled}/{len(pending_jobs)} pending job(s).")
+        return
+
+    if not args.job_id:
+        print("Error: job_id is required unless --all is used.", file=sys.stderr)
+        sys.exit(1)
+
     ok = store.cancel_job(args.job_id)
     if ok:
         print(f"Job {args.job_id} cancelled.")
+        return
+
+    job = store.get_job(args.job_id)
+    if job is None:
+        print(f"Error: job '{args.job_id}' not found.", file=sys.stderr)
     else:
-        job = store.get_job(args.job_id)
-        if job is None:
-            print(f"Error: job '{args.job_id}' not found.", file=sys.stderr)
-        else:
-            print(
-                f"Cannot cancel job with status '{job.status.value}'. "
-                "Only pending jobs can be cancelled.",
-                file=sys.stderr,
-            )
-        sys.exit(1)
+        print(
+            f"Cannot cancel job with status '{job.status.value}'. "
+            "Only pending jobs can be cancelled.",
+            file=sys.stderr,
+        )
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

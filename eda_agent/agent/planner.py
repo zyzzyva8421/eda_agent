@@ -41,9 +41,15 @@ OpenROAD Flow Scripts (ORFS), Cadence Innovus, and Synopsys IC Compiler 2.
 
 Your job is to help the user tune PPA (Power, Performance, Area) metrics
 for VLSI designs by:
-  1. Running EDA flow stages via the run_eda_stage or run_eda_flow tool.
+    1. Running EDA flow stages via tools.
   2. Querying timing and congestion results from the database.
   3. Comparing runs and suggesting parameter adjustments.
+
+## Execution Policy - IMPORTANT
+- For multi-stage or long-running requests (e.g. "run from synth to finish", "run full flow"),
+    prefer asynchronous submission via run_eda_flow (returns job_id) or submit_job with run_mode="flow".
+- Avoid long synchronous tool executions that block CLI interaction.
+- Use job_status/job_logs to monitor progress after submission.
 
 ## Context Tracking - IMPORTANT
 The system automatically tracks design context from your tool calls. After 
@@ -118,6 +124,7 @@ class Planner:
                 return assistant_text or "Tool executed. Here's your result:"
 
             # Execute every requested tool call
+            async_submission_job: dict[str, Any] | None = None
             for tc in tool_calls:
                 tc_id = tc.get("id", str(uuid.uuid4()))
                 fn_name = tc["function"]["name"]
@@ -130,14 +137,52 @@ class Planner:
                 tool_result = execute_tool(fn_name, arguments)
                 mem.add_tool_result(fn_name, tool_result, tool_call_id=tc_id)
 
+                # Async flow/stage submissions should return immediately with a
+                # job id so the CLI stays interactive. If we already have that,
+                # stop the ReAct loop early instead of consuming max iterations.
+                if fn_name in ("submit_job", "run_eda_flow"):
+                    maybe_job = self._extract_job_submission(tool_result)
+                    if maybe_job is not None:
+                        async_submission_job = maybe_job
+
                 # Extract and store design context from tool results
                 self._extract_and_store_context(fn_name, arguments, tool_result, mem)
+
+            if async_submission_job is not None:
+                return self._format_async_submission_reply(async_submission_job)
 
             if finish_reason == "stop":
                 break
 
         # Safety net: return whatever is in the last assistant turn
         return mem.get("last_assistant_text", "Agent reached max iterations.")
+
+    @staticmethod
+    def _extract_job_submission(tool_result: str) -> dict[str, Any] | None:
+        """Return parsed async job payload when tool_result contains a job_id."""
+        try:
+            payload = json.loads(tool_result)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("job_id"):
+            return payload
+        return None
+
+    @staticmethod
+    def _format_async_submission_reply(job_payload: dict[str, Any]) -> str:
+        """Human-friendly confirmation for async job submissions."""
+        job_id = job_payload.get("job_id")
+        status = job_payload.get("status", "pending")
+        message = job_payload.get("message") or "Job submitted successfully."
+        return (
+            f"任务已异步提交。\\n"
+            f"- job_id: {job_id}\\n"
+            f"- status: {status}\\n"
+            f"- next: 可用 job_status 查询进度，job_logs 查看日志。\\n"
+            f"- note: {message}"
+        )
 
     # ------------------------------------------------------------------
     # Internal

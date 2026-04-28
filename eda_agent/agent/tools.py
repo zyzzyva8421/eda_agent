@@ -7,19 +7,27 @@ The ``execute_tool`` dispatcher routes a function-call name → implementation.
 Tools
 -----
 run_eda_stage       – invoke a backend stage
+run_eda_flow        – run a sequence of EDA stages (synth → finish)
+submit_job          – submit an async job to the background queue
+job_status         – check async job status
+job_logs           – fetch logs from an async job
+cancel_job         – cancel a pending async job
 query_timing        – query timing metrics from the DB
 query_congestion    – spatial congestion query via PostGIS
 query_utilization   – query cell area / utilization metrics from the DB
-query_power         – query power breakdown metrics from the DB
-compare_runs        – diff PPA between two runs
-suggest_params      – LLM-assisted parameter suggestion based on history
-tune_ppa            – autonomous PPA tuning loop (suggest → run → repeat)
+query_power        – query power breakdown metrics from the DB
+compare_runs       – diff PPA between two runs
+suggest_params     – LLM-assisted parameter suggestion based on history
+tune_ppa          – autonomous PPA tuning loop (suggest → run → repeat)
+tune_ppa_multistage – multi-stage autonomous PPA tuning
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +41,37 @@ from eda_agent.db.session import get_db
 from eda_agent.parsers import get_parser
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_worker_running() -> None:
+    """Start queue worker if not already running.
+
+    Natural-language flow uses tool calls directly (not CLI subcommands), so we
+    need to ensure the worker exists here as well.
+    """
+    from eda_agent.queue.worker import _WORKER_LOG, is_worker_running
+
+    if is_worker_running():
+        return
+
+    env = os.environ.copy()
+    env["ORFS_ROOT"] = str(settings.orfs_root)
+    env["POSTGRES_HOST"] = settings.postgres_host
+    env["POSTGRES_PORT"] = str(settings.postgres_port)
+    env["POSTGRES_USER"] = settings.postgres_user
+    env["POSTGRES_PASSWORD"] = settings.postgres_password
+    env["POSTGRES_DB"] = settings.postgres_db
+
+    _WORKER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(_WORKER_LOG, "a") as log_fh:
+        subprocess.Popen(
+            ["eda-agent-worker"],
+            stdout=log_fh,
+            stderr=log_fh,
+            close_fds=True,
+            start_new_session=True,
+            env=env,
+        )
 
 # ── JSON schemas (OpenAI function-call format) ────────────────────────────────
 
@@ -352,6 +391,124 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_job",
+            "description": (
+                "Submit an EDA job to the asynchronous queue for background execution. "
+                "Returns a job_id immediately while the job runs in the background worker. "
+                "Use 'job_status' to poll for completion. "
+                "Set run_mode='flow' to run a sequence of stages (e.g. 'all' from synth to finish)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "backend": {
+                        "type": "string",
+                        "description": "Backend name: 'orfs', 'innovus', 'icc2', or custom.",
+                    },
+                    "stage": {
+                        "type": "string",
+                        "description": "Flow stage to execute (e.g. 'synth', 'place', 'route'). Ignored if run_mode='flow'.",
+                    },
+                    "design_name": {
+                        "type": "string",
+                        "description": "Top-level design/module name (e.g. 'gcd').",
+                    },
+                    "design_config": {
+                        "type": "string",
+                        "description": "Absolute path to the design config file.",
+                    },
+                    "pdk": {
+                        "type": "string",
+                        "description": "PDK identifier (e.g. 'sky130hd').",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Key-value EDA parameters (optional).",
+                    },
+                    "stage_start": {
+                        "type": "string",
+                        "description": "Starting stage for flow mode (e.g. 'synth', 'all').",
+                    },
+                    "stage_end": {
+                        "type": "string",
+                        "description": "Ending stage for flow mode (e.g. 'finish').",
+                    },
+                    "run_mode": {
+                        "type": "string",
+                        "description": "Execution mode: 'stage' (single stage) or 'flow' (sequence of stages). Default: 'stage'.",
+                    },
+                },
+                "required": ["backend", "design_name", "design_config", "pdk"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_status",
+            "description": (
+                "Check the status of a previously submitted async job. "
+                "Returns the job status, run_id (if completed), and error message if failed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job ID returned from submit_job.",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_logs",
+            "description": (
+                "Fetch the log file from a background job. "
+                "Returns the last N lines of the log."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job ID returned from submit_job.",
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of last lines to return (default 50).",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_job",
+            "description": (
+                "Cancel a pending or running background job. "
+                "Returns whether the cancellation succeeded."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job ID returned from submit_job.",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
 ]
 
 
@@ -385,8 +542,9 @@ def _run_eda_stage(
                 parser = get_parser(rpt.report_type)
                 records = parser.parse_file(rpt.path)
                 _ingest_records(records, run_db_id, rpt.stage)
-            except Exception:
-                logger.exception("Failed to parse %s", rpt.path)
+            except Exception as e:
+                # Best-effort: don't fail the run for parse errors
+                logger.debug("Failed to parse %s: %s", rpt.path, e)
 
         # Archive the run data to Parquet (best-effort; never fails the main flow)
         try:
@@ -409,7 +567,7 @@ def _run_eda_stage(
     }
 
 
-def _run_eda_flow(
+def _run_eda_flow_sync(
     backend: str,
     stage_start: str,
     design_name: str,
@@ -463,8 +621,10 @@ def _run_eda_flow(
                     parser = get_parser(rpt.report_type)
                     records = parser.parse_file(rpt.path)
                     _ingest_records(records, run_db_id, rpt.stage)
-                except Exception:
-                    logger.exception("Failed to parse %s", rpt.path)
+                except Exception as e:
+                    # Best-effort: don't fail the flow for parse errors
+                    # (some stages like floorplan may not have certain report types)
+                    logger.debug("Failed to parse %s: %s", rpt.path, e)
 
             # Archive to Parquet (best-effort)
             try:
@@ -493,6 +653,149 @@ def _run_eda_flow(
         "pdk": pdk,
         "results": results,
     }
+
+
+def _run_eda_flow(
+    backend: str,
+    stage_start: str,
+    design_name: str,
+    design_config: str,
+    pdk: str,
+    stage_end: str | None = None,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Submit a flow job asynchronously to keep CLI interactive.
+
+    NOTE: Synchronous flow execution is implemented by ``_run_eda_flow_sync``
+    and is used by the background worker.
+    """
+    # Keep tool-facing behavior non-blocking: return job_id immediately.
+    return _submit_job(
+        backend=backend,
+        stage=stage_start,
+        design_name=design_name,
+        design_config=design_config,
+        pdk=pdk,
+        params=params,
+        stage_start=stage_start,
+        stage_end=stage_end,
+        run_mode="flow",
+    )
+
+
+# ── Async job queue tools ───────────────────────────────────────────────────
+
+
+def _submit_job(
+    backend: str,
+    design_name: str,
+    design_config: str,
+    pdk: str,
+    stage: str | None = None,
+    params: dict[str, Any] | None = None,
+    stage_start: str | None = None,
+    stage_end: str | None = None,
+    run_mode: str = "stage",
+) -> dict[str, Any]:
+    """Submit an async job to the queue (stage or flow mode)."""
+    from eda_agent.queue.store import JobStore
+
+    if run_mode not in ("stage", "flow"):
+        return {"error": f"Invalid run_mode '{run_mode}'. Use 'stage' or 'flow'."}
+
+    if run_mode == "stage" and not stage:
+        return {"error": "'stage' is required when run_mode='stage'"}
+
+    # The queue schema requires a non-null stage. In flow mode we store an
+    # informational stage value and use stage_start/stage_end for execution.
+    effective_stage = stage or stage_start or "all"
+
+    store = JobStore()
+    job_id = store.enqueue(
+        backend=backend,
+        stage=effective_stage,
+        design_name=design_name,
+        design_config=design_config,
+        pdk=pdk,
+        params=params or {},
+        stage_start=stage_start,
+        stage_end=stage_end,
+        run_mode=run_mode,
+    )
+
+    # Auto-start worker for tool-driven submissions (interactive NL path).
+    try:
+        _ensure_worker_running()
+    except Exception:
+        logger.warning("Failed to auto-start worker after job submission", exc_info=True)
+
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "message": f"Job {job_id} submitted ({run_mode} mode). Use job_status to poll.",
+    }
+
+
+def _job_status(job_id: str) -> dict[str, Any]:
+    """Check async job status."""
+    from eda_agent.queue.store import JobStore, JobStatus
+
+    store = JobStore()
+    job = store.get_job(job_id)
+    if job is None:
+        return {"error": f"Job {job_id} not found"}
+
+    result: dict[str, Any] = {
+        "job_id": job.job_id,
+        "status": job.status.value,
+        "backend": job.backend,
+        "stage": job.stage,
+        "design_name": job.design_name,
+    }
+    if job.run_db_id is not None:
+        result["run_id"] = job.run_db_id
+    if job.status in (JobStatus.SUCCESS, JobStatus.FAILED):
+        result["error_message"] = job.error_message
+        result["log_path"] = job.log_path
+    return result
+
+
+def _job_logs(job_id: str, lines: int = 50) -> dict[str, Any]:
+    """Get log file from async job."""
+    from eda_agent.queue.store import JobStore
+
+    store = JobStore()
+    job = store.get_job(job_id)
+    if job is None:
+        return {"error": f"Job {job_id} not found"}
+    if not job.log_path:
+        return {"error": "No log path available for this job"}
+
+    try:
+        log_content = Path(job.log_path).read_text()
+        log_lines = log_content.splitlines()[-lines:]
+        return {"logs": "\n".join(log_lines)}
+    except OSError as e:
+        return {"error": f"Failed to read log: {e}"}
+
+
+def _cancel_job(job_id: str) -> dict[str, Any]:
+    """Cancel a pending/pending_async job."""
+    from eda_agent.queue.store import JobStore, JobStatus
+
+    store = JobStore()
+    job = store.get_job(job_id)
+    if job is None:
+        return {"error": f"Job {job_id} not found"}
+
+    if job.status != JobStatus.PENDING:
+        return {
+            "success": False,
+            "error": f"Cannot cancel job in status '{job.status.value}'",
+        }
+
+    store.mark_done(job_id, status=JobStatus.CANCELLED, error_message="Cancelled by user")
+    return {"success": True, "message": f"Job {job_id} cancelled"}
 
 
 def _query_timing(
@@ -1437,6 +1740,11 @@ _TOOL_DISPATCH = {
     "suggest_params": _suggest_params,
     "tune_ppa": _tune_ppa,
     "tune_ppa_multistage": _tune_ppa_multistage,
+    # Async job queue tools
+    "submit_job": _submit_job,
+    "job_status": _job_status,
+    "job_logs": _job_logs,
+    "cancel_job": _cancel_job,
 }
 
 

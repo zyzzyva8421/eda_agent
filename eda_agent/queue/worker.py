@@ -84,24 +84,55 @@ def _execute_job(job, store: JobStore) -> None:
         job.design_name,
     )
     try:
-        result = _run_eda_stage(
-            backend=job.backend,
-            stage=job.stage,
-            design_name=job.design_name,
-            design_config=job.design_config,
-            pdk=job.pdk,
-            params=job.params,
-        )
-        final_status = (
-            JobStatus.SUCCESS if result.get("status") == "success" else JobStatus.FAILED
-        )
-        store.mark_done(
-            job.job_id,
-            status=final_status,
-            run_db_id=result.get("run_id"),
-            log_path=result.get("log_path"),
-            error_message=result.get("error") or "",
-        )
+        # Choose execution mode based on job.run_mode
+        if job.run_mode == "flow":
+            from eda_agent.agent.tools import _run_eda_flow_sync  # noqa: PLC0415
+
+            result = _run_eda_flow_sync(
+                backend=job.backend,
+                stage_start=job.stage_start or "all",
+                stage_end=job.stage_end,
+                design_name=job.design_name,
+                design_config=job.design_config,
+                pdk=job.pdk,
+                params=job.params,
+            )
+            overall = result.get("overall_status", "failed")
+            final_status = JobStatus.SUCCESS if overall == "success" else JobStatus.FAILED
+            # For flow, use the last stage's run_id as the primary
+            run_db_id = None
+            for r in result.get("results", []):
+                if r.get("run_id"):
+                    run_db_id = r["run_id"]
+            store.mark_done(
+                job.job_id,
+                status=final_status,
+                run_db_id=run_db_id,
+                log_path=result.get("log_path"),
+                error_message=result.get("error") or "",
+            )
+        else:
+            # Single stage mode (original behavior)
+            from eda_agent.agent.tools import _run_eda_stage  # noqa: PLC0415
+
+            result = _run_eda_stage(
+                backend=job.backend,
+                stage=job.stage,
+                design_name=job.design_name,
+                design_config=job.design_config,
+                pdk=job.pdk,
+                params=job.params,
+            )
+            final_status = (
+                JobStatus.SUCCESS if result.get("status") == "success" else JobStatus.FAILED
+            )
+            store.mark_done(
+                job.job_id,
+                status=final_status,
+                run_db_id=result.get("run_id"),
+                log_path=result.get("log_path"),
+                error_message=result.get("error") or "",
+            )
         logger.info("Job %s finished → %s", job.job_id, final_status.value)
     except Exception as exc:
         logger.exception("Job %s raised an unhandled exception", job.job_id)

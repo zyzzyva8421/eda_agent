@@ -70,6 +70,9 @@ class Job:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    stage_start: str | None = None
+    stage_end: str | None = None
+    run_mode: str = "stage"  # "stage" or "flow"
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +117,10 @@ class JobStore:
             worker_pid    INTEGER,
             created_at    TEXT    NOT NULL,
             started_at    TEXT,
-            finished_at   TEXT
+            finished_at  TEXT,
+            stage_start  TEXT,
+            stage_end   TEXT,
+            run_mode    TEXT    NOT NULL DEFAULT 'stage'
         )
     """
 
@@ -165,6 +171,9 @@ class JobStore:
             created_at=_parse_dt(row["created_at"]) or datetime.now(timezone.utc),
             started_at=_parse_dt(row["started_at"]),
             finished_at=_parse_dt(row["finished_at"]),
+            stage_start=row["stage_start"],
+            stage_end=row["stage_end"],
+            run_mode=row["run_mode"] or "stage",
         )
 
     # ------------------------------------------------------------------
@@ -179,6 +188,9 @@ class JobStore:
         design_config: str,
         pdk: str,
         params: dict[str, Any] | None = None,
+        stage_start: str | None = None,
+        stage_end: str | None = None,
+        run_mode: str = "stage",
     ) -> Job:
         """Insert a new *pending* job and return it."""
         job_id = str(uuid.uuid4())
@@ -188,8 +200,8 @@ class JobStore:
                 """
                 INSERT INTO jobs
                     (job_id, backend, stage, design_name, design_config, pdk,
-                     params, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                     params, status, created_at, stage_start, stage_end, run_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -200,6 +212,9 @@ class JobStore:
                     pdk,
                     json.dumps(params or {}),
                     _fmt_dt(now),
+                    stage_start,
+                    stage_end,
+                    run_mode,
                 ),
             )
         return Job(
@@ -212,7 +227,36 @@ class JobStore:
             params=params or {},
             status=JobStatus.PENDING,
             created_at=now,
+            stage_start=stage_start,
+            stage_end=stage_end,
+            run_mode=run_mode,
         )
+
+    def enqueue(
+        self,
+        backend: str,
+        stage: str,
+        design_name: str,
+        design_config: str,
+        pdk: str,
+        params: dict[str, Any] | None = None,
+        stage_start: str | None = None,
+        stage_end: str | None = None,
+        run_mode: str = "stage",
+    ) -> str:
+        """Create a job and return its job_id (convenience wrapper)."""
+        job = self.create_job(
+            backend=backend,
+            stage=stage,
+            design_name=design_name,
+            design_config=design_config,
+            pdk=pdk,
+            params=params,
+            stage_start=stage_start,
+            stage_end=stage_end,
+            run_mode=run_mode,
+        )
+        return job.job_id
 
     def get_job(self, job_id: str) -> Job | None:
         """Return the :class:`Job` with the given *job_id*, or ``None``."""
