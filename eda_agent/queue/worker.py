@@ -99,16 +99,19 @@ def _execute_job(job, store: JobStore) -> None:
             )
             overall = result.get("overall_status", "failed")
             final_status = JobStatus.SUCCESS if overall == "success" else JobStatus.FAILED
-            # For flow, use the last stage's run_id as the primary
+            # For flow, use the last stage's run_id and log_path as the primary
             run_db_id = None
+            log_path = None
             for r in result.get("results", []):
                 if r.get("run_id"):
                     run_db_id = r["run_id"]
+                if r.get("log_path"):
+                    log_path = r["log_path"]
             store.mark_done(
                 job.job_id,
                 status=final_status,
                 run_db_id=run_db_id,
-                log_path=result.get("log_path"),
+                log_path=log_path,
                 error_message=result.get("error") or "",
             )
         else:
