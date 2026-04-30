@@ -88,6 +88,9 @@ def _execute_job(job, store: JobStore) -> None:
         if job.run_mode == "flow":
             from eda_agent.agent.tools import _run_eda_flow_sync  # noqa: PLC0415
 
+            # Check for clean flag
+            clean = job.params.get("_clean", False) if job.params else False
+
             result = _run_eda_flow_sync(
                 backend=job.backend,
                 stage_start=job.stage_start or "all",
@@ -96,6 +99,7 @@ def _execute_job(job, store: JobStore) -> None:
                 design_config=job.design_config,
                 pdk=job.pdk,
                 params=job.params,
+                clean=clean,
             )
             overall = result.get("overall_status", "failed")
             final_status = JobStatus.SUCCESS if overall == "success" else JobStatus.FAILED

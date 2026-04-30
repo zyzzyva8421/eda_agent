@@ -155,6 +155,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "object",
                         "description": "Key-value EDA parameters (e.g. CORE_UTILIZATION).",
                     },
+                    "clean": {
+                        "type": "boolean",
+                        "description": "If true, run 'make clean' before starting to force rerun all stages.",
+                    },
                 },
                 "required": ["backend", "stage_start", "design_name", "design_config", "pdk"],
             },
@@ -575,8 +579,24 @@ def _run_eda_flow_sync(
     pdk: str,
     stage_end: str | None = None,
     params: dict[str, Any] | None = None,
+    clean: bool = False,
 ) -> dict[str, Any]:
     """Run a sequence of EDA flow stages."""
+    # Handle clean flag - run make clean first if requested
+    if clean:
+        be = get_backend(backend)
+        design = DesignSpec(
+            name=design_name,
+            config_path=Path(design_config),
+            pdk=pdk,
+        )
+        # Import and run clean
+        import subprocess
+        subprocess.run(
+            ["make", "clean", "-C", str(be._flow_dir), f"DESIGN_CONFIG={design.config_path}"],
+            capture_output=True,
+        )
+
     be = get_backend(backend)
     design = DesignSpec(
         name=design_name,
@@ -663,12 +683,18 @@ def _run_eda_flow(
     pdk: str,
     stage_end: str | None = None,
     params: dict[str, Any] | None = None,
+    clean: bool = False,
 ) -> dict[str, Any]:
     """Submit a flow job asynchronously to keep CLI interactive.
 
     NOTE: Synchronous flow execution is implemented by ``_run_eda_flow_sync``
     and is used by the background worker.
     """
+    # Handle clean flag for forcing rerun
+    if clean:
+        params = params or {}
+        params["_clean"] = True
+
     # Keep tool-facing behavior non-blocking: return job_id immediately.
     return _submit_job(
         backend=backend,
