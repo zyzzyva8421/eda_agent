@@ -30,6 +30,7 @@ jobs(
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -39,6 +40,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Generator
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_DB_PATH: Path = Path.home() / ".eda_agent" / "jobs.db"
 
@@ -268,7 +271,36 @@ class JobStore:
 
     def list_jobs(self, status: JobStatus | None = None) -> list[Job]:
         """Return all jobs, optionally filtered by *status*, newest first."""
+        return self._fix_stale_jobs(
+            status
+        )  # check and fix stale jobs before listing
+
+    def _fix_stale_jobs(self, status: JobStatus | None = None) -> list[Job]:
+        """Fix stale running jobs whose worker process is dead, then return jobs."""
         with self._conn() as conn:
+            # Find running jobs with dead worker processes
+            rows = conn.execute(
+                "SELECT job_id, worker_pid FROM jobs WHERE status = 'running'"
+            ).fetchall()
+            for row in rows:
+                pid = row["worker_pid"]
+                if pid is not None:
+                    try:
+                        os.kill(pid, 0)  # signal 0 checks if process exists
+                    except OSError:
+                        # Process is dead - mark as failed
+                        logger.warning(
+                            "Worker PID %s is dead, marking job %s as failed",
+                            pid,
+                            row["job_id"],
+                        )
+                        now = _fmt_dt(datetime.now(timezone.utc))
+                        conn.execute(
+                            "UPDATE jobs SET status='failed', finished_at=? WHERE job_id=?",
+                            (now, row["job_id"]),
+                        )
+
+            # Now return jobs as normal
             if status is not None:
                 rows = conn.execute(
                     "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC",
