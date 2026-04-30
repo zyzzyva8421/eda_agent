@@ -228,13 +228,18 @@ class ORFSBackend(AbstractEDABackend):
         design: DesignSpec,
         params: dict[str, Any],
     ) -> list[str]:
+        # Check if clean is requested
+        clean_before = params.pop("_clean", False)
         cmd = [
             "make",
             f"-j{self._make_jobs}",
             f"-C", str(self._flow_dir),
             f"DESIGN_CONFIG={design.config_path}",
-            target,
         ]
+        if clean_before:
+            cmd.extend(["clean", target])
+        else:
+            cmd.append(target)
         # Extra make variable overrides from params
         for key, value in params.items():
             cmd.append(f"{key}={value}")

@@ -303,6 +303,11 @@ def _build_parser():
         action="store_true",
         help="Do not auto-start the background worker.",
     )
+    sp.add_argument(
+        "--clean",
+        action="store_true",
+        help="Run 'make clean' before the target stage (forces rerun).",
+    )
 
     # -- list ------------------------------------------------------------------
     lp = sub.add_parser("list", help="List submitted jobs.")
@@ -400,6 +405,8 @@ def _cmd_submit(args) -> None:
     from eda_agent.queue.store import JobStore
 
     params = _parse_params(args.param)
+    if args.clean:
+        params["_clean"] = True
     store = JobStore()
     job = store.create_job(
         backend=args.backend,
