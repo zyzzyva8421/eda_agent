@@ -513,6 +513,54 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_case",
+            "description": (
+                "Save a resolved debugging case to persistent memory. "
+                "Call this AFTER diagnosing a root cause so the knowledge can "
+                "be retrieved in future sessions with similar problems."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "design_name": {
+                        "type": "string",
+                        "description": "Top-level design name (e.g. 'gcd').",
+                    },
+                    "pdk": {
+                        "type": "string",
+                        "description": "PDK identifier (e.g. 'sky130hd').",
+                    },
+                    "symptoms": {
+                        "type": "string",
+                        "description": (
+                            "Free-text description of the observed problems "
+                            "(timing violations, congestion, DRC errors, etc.)."
+                        ),
+                    },
+                    "root_cause": {
+                        "type": "string",
+                        "description": "The diagnosed root cause of the problems.",
+                    },
+                    "actions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Ordered list of actions taken to fix the issue.",
+                    },
+                    "result_metrics": {
+                        "type": "object",
+                        "description": (
+                            "Key QoR metrics before and after the fix, e.g. "
+                            "{\"wns_before\": -0.5, \"wns_after\": -0.1}."
+                        ),
+                    },
+                },
+                "required": ["symptoms", "root_cause"],
+            },
+        },
+    },
 ]
 
 
@@ -1752,6 +1800,28 @@ def _tune_ppa_multistage(
     }
 
 
+def _save_case_tool(
+    symptoms: str,
+    root_cause: str,
+    design_name: str = "",
+    pdk: str = "",
+    actions: list[str] | None = None,
+    result_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist a resolved debugging case to the case_memory table."""
+    from eda_agent.agent.memory import save_case
+
+    case_id = save_case(
+        design_name=design_name,
+        symptoms=symptoms,
+        root_cause=root_cause,
+        pdk=pdk,
+        actions=actions,
+        result_metrics=result_metrics,
+    )
+    return {"status": "saved", "case_id": case_id}
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 
 _TOOL_DISPATCH = {
@@ -1771,6 +1841,7 @@ _TOOL_DISPATCH = {
     "job_status": _job_status,
     "job_logs": _job_logs,
     "cancel_job": _cancel_job,
+    "save_case": _save_case_tool,
 }
 
 

@@ -29,7 +29,7 @@ from typing import Any
 
 import httpx
 
-from eda_agent.agent.memory import AgentMemory, Message
+from eda_agent.agent.memory import AgentMemory, Message, search_similar_cases
 from eda_agent.agent.tools import TOOL_SCHEMAS, execute_tool
 from eda_agent.config import settings
 
@@ -91,6 +91,17 @@ class Planner:
     def run(self, user_message: str, memory: AgentMemory | None = None) -> str:
         """Run the ReAct loop and return the final assistant response."""
         mem = memory or AgentMemory()
+
+        # Inject similar historical cases into the scratchpad so _call_llm can
+        # include them in the system prompt.  We do this once per session (when
+        # the first user message arrives) using a lightweight DB query; failures
+        # are silently ignored so offline/test environments still work.
+        if not mem.get("_cases_loaded"):
+            similar = search_similar_cases(user_message, limit=3)
+            if similar:
+                mem.set("_similar_cases", similar)
+            mem.set("_cases_loaded", True)
+
         mem.add_user(user_message)
 
         for iteration in range(self._max_iterations):
@@ -190,18 +201,34 @@ class Planner:
 
     def _call_llm(self, mem: AgentMemory) -> dict[str, Any]:
         """POST to MiniMax chat completions and return the parsed response."""
-        
+
         # Inject design context into system prompt if available
         context = mem.extract_design_context()
         context_prompt = ""
         if context:
-            context_prompt = f"\n\n## Current Design Context (USE THIS)\n"
+            context_prompt = "\n\n## Current Design Context (USE THIS)\n"
             for k, v in context.items():
                 context_prompt += f"- {k}: {v}\n"
-        
-        # Build full system prompt with context
-        full_system_prompt = _SYSTEM_PROMPT + context_prompt
-        
+
+        # Inject similar historical cases if available
+        cases_prompt = ""
+        similar_cases: list[dict] = mem.get("_similar_cases") or []
+        if similar_cases:
+            cases_prompt = "\n\n## Similar Historical Cases (for reference)\n"
+            for i, case in enumerate(similar_cases, 1):
+                cases_prompt += (
+                    f"\n### Case {i} (design: {case.get('design_name', 'unknown')})\n"
+                    f"**Symptoms**: {case.get('symptoms', '')}\n"
+                    f"**Root cause**: {case.get('root_cause', '')}\n"
+                    f"**Actions taken**: {'; '.join(case.get('actions', []))}\n"
+                )
+                metrics = case.get("result_metrics") or {}
+                if metrics:
+                    cases_prompt += f"**Result metrics**: {metrics}\n"
+
+        # Build full system prompt
+        full_system_prompt = _SYSTEM_PROMPT + context_prompt + cases_prompt
+
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",

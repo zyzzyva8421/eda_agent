@@ -365,6 +365,34 @@ class AgentSession(Base):
     __table_args__ = (Index("ix_agent_sessions_username", "username"),)
 
 
+# ── case_memory ───────────────────────────────────────────────────────────────
+
+class CaseRecord(Base):
+    """Persistent debugging case memory.
+
+    Each record captures a resolved debugging episode so future sessions can
+    retrieve similar cases and bootstrap root-cause reasoning.
+    """
+
+    __tablename__ = "case_memory"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    design_name: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    pdk: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # Free-text symptom description – indexed with a GIN tsvector for FTS
+    symptoms: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    root_cause: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Ordered list of action strings (tool name + key params)
+    actions: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    # Key QoR metrics captured after the fix (e.g. wns_before, wns_after)
+    result_metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (Index("ix_case_memory_design_name", "design_name"),)
+
+
 # ── users (for API auth) ──────────────────────────────────────────────────────
 
 class User(Base):
