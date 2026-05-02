@@ -561,6 +561,65 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "infer_root_cause",
+            "description": (
+                "Run the rule-based root cause inference engine against a specific "
+                "EDA run and return ranked root cause hypotheses with evidence and "
+                "experiment suggestions. Call this when the user asks WHY a run is "
+                "failing or wants to diagnose timing/congestion/DRC issues."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "integer",
+                        "description": "DB run id (runs.id) to diagnose.",
+                    },
+                    "symptoms": {
+                        "type": "string",
+                        "description": (
+                            "Optional free-text description of the observed problems "
+                            "(e.g. 'WNS is -0.5ns and there are many congestion hotspots'). "
+                            "Stored alongside the inference record."
+                        ),
+                    },
+                },
+                "required": ["run_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "confirm_root_cause",
+            "description": (
+                "Confirm the engineer-approved root cause for a previous inference. "
+                "Persists the result to case memory so it can be retrieved in future "
+                "sessions. Call this AFTER the engineer agrees with a hypothesis."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "inference_id": {
+                        "type": "integer",
+                        "description": "inference_id returned by infer_root_cause.",
+                    },
+                    "confirmed_cause_id": {
+                        "type": "string",
+                        "description": (
+                            "The cause_id to confirm (e.g. 'routing_detour'). "
+                            "Must match one of the cause_id values in the hypotheses list, "
+                            "or a free-text string if none matched."
+                        ),
+                    },
+                },
+                "required": ["inference_id", "confirmed_cause_id"],
+            },
+        },
+    },
 ]
 
 
@@ -1822,6 +1881,22 @@ def _save_case_tool(
     return {"status": "saved", "case_id": case_id}
 
 
+def _infer_root_cause_tool(run_id: int, symptoms: str = "") -> dict[str, Any]:
+    """Invoke the rule-based inference engine and return ranked hypotheses."""
+    from eda_agent.agent.inference.engine import infer
+
+    return infer(run_id=run_id, symptoms=symptoms)
+
+
+def _confirm_root_cause_tool(
+    inference_id: int, confirmed_cause_id: str
+) -> dict[str, Any]:
+    """Confirm the engineer-approved root cause and save to case memory."""
+    from eda_agent.agent.inference.engine import confirm
+
+    return confirm(inference_id=inference_id, confirmed_cause_id=confirmed_cause_id)
+
+
 # ── Dispatch table ────────────────────────────────────────────────────────────
 
 _TOOL_DISPATCH = {
@@ -1842,6 +1917,8 @@ _TOOL_DISPATCH = {
     "job_logs": _job_logs,
     "cancel_job": _cancel_job,
     "save_case": _save_case_tool,
+    "infer_root_cause": _infer_root_cause_tool,
+    "confirm_root_cause": _confirm_root_cause_tool,
 }
 
 

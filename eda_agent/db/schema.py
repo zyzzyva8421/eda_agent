@@ -13,6 +13,8 @@ power_summary      – per-run power breakdown
 drc_violations     – per-run DRC violation records
 artifacts          – file artefacts produced by a run
 agent_sessions     – persistent multi-turn agent conversation history
+root_cause_inferences – per-run root cause inference results (Phase A engine)
+case_memory        – persisted resolved debugging cases
 
 All spatial columns use SRID 0 (unitless chip-coordinate space).
 """
@@ -363,6 +365,32 @@ class AgentSession(Base):
     )
 
     __table_args__ = (Index("ix_agent_sessions_username", "username"),)
+
+
+# ── root_cause_inferences ────────────────────────────────────────────────────
+
+class RootCauseInference(Base):
+    """Stores the output of the rule-based inference engine for a single run."""
+
+    __tablename__ = "root_cause_inferences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
+    )
+    symptoms: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Full feature vector snapshot at inference time
+    features: Mapped[dict | None] = mapped_column(JSONB, nullable=False, default=dict)
+    # Top-k ranked hypotheses list
+    hypotheses: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    # Filled in by confirm()
+    chosen_cause: Mapped[str | None] = mapped_column(String(256))
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (Index("ix_root_cause_inferences_run_id", "run_id"),)
 
 
 # ── case_memory ───────────────────────────────────────────────────────────────
