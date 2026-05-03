@@ -25,6 +25,7 @@ from eda_agent.db.session import get_db
 
 from .features import FeatureVector, extract_features
 from .rules import RULE_BY_ID, RULES
+from .weights import get_multipliers, update_weights
 
 logger = logging.getLogger(__name__)
 
@@ -137,27 +138,35 @@ def infer(run_id: int, symptoms: str = "") -> dict:
     """
     fv = extract_features(run_id)
 
-    # Score every rule
-    fired: list[tuple[float, list, list, "Rule"]] = []
-    for rule in RULES:
-        score, evidence, anti_evidence = rule.score(fv)
-        if score >= rule.min_score:
-            fired.append((score, evidence, anti_evidence, rule))
+    # Load per-rule multipliers (Phase B feedback weights)
+    multipliers = get_multipliers()
 
-    # Sort descending
+    # Score every rule and apply multiplier
+    fired: list[tuple[float, float, list, list, "Rule"]] = []
+    for rule in RULES:
+        raw_score, evidence, anti_evidence = rule.score(fv)
+        mult = multipliers.get(rule.id, 1.0)
+        adjusted = min(1.0, raw_score * mult)  # cap at 1.0 to keep confidence thresholds stable
+        if adjusted >= rule.min_score:
+            fired.append((adjusted, raw_score, evidence, anti_evidence, rule))
+
+    # Sort descending by adjusted score
     fired.sort(key=lambda t: t[0], reverse=True)
 
     # Build hypothesis list (top 3)
     hypotheses: list[dict] = []
-    for rank, (score, evidence, anti_evidence, rule) in enumerate(fired[:3], start=1):
+    for rank, (adj_score, raw_score, evidence, anti_evidence, rule) in enumerate(fired[:3], start=1):
+        mult = multipliers.get(rule.id, 1.0)
         hypotheses.append(
             {
                 "rank": rank,
                 "cause_id": rule.id,
                 "display_name": rule.display_name,
                 "description": rule.description,
-                "score": round(score, 4),
-                "confidence": _score_to_confidence(score),
+                "score": round(adj_score, 4),
+                "raw_score": round(raw_score, 4),
+                "multiplier": round(mult, 4),
+                "confidence": _score_to_confidence(adj_score),
                 "evidence": evidence,
                 "anti_evidence": anti_evidence,
                 "experiments": [e.to_dict() for e in rule.experiments],
@@ -260,6 +269,12 @@ def confirm(inference_id: int, confirmed_cause_id: str) -> dict:
                         pdk = dr["pdk"] or ""
             except Exception:
                 pass
+
+            # Phase B: update rule weights based on this confirmation
+            update_weights(
+                confirmed_cause_id=confirmed_cause_id,
+                top_hypotheses=hypotheses,
+            )
 
             from eda_agent.agent.memory import save_case
             case_id = save_case(

@@ -14,6 +14,7 @@ drc_violations     – per-run DRC violation records
 artifacts          – file artefacts produced by a run
 agent_sessions     – persistent multi-turn agent conversation history
 root_cause_inferences – per-run root cause inference results (Phase A engine)
+rule_weights           – per-rule score multipliers for Phase B feedback learning
 case_memory        – persisted resolved debugging cases
 
 All spatial columns use SRID 0 (unitless chip-coordinate space).
@@ -391,6 +392,21 @@ class RootCauseInference(Base):
     )
 
     __table_args__ = (Index("ix_root_cause_inferences_run_id", "run_id"),)
+
+
+# ── rule_weights ───────────────────────────────────────────────────────────────
+
+class RuleWeight(Base):
+    """Per-rule score multiplier updated by engineer feedback (Phase B)."""
+
+    __tablename__ = "rule_weights"
+
+    rule_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    multiplier: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    confirm_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 # ── case_memory ───────────────────────────────────────────────────────────────
