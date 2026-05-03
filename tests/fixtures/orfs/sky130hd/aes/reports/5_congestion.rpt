@@ -1,0 +1,16 @@
+Global Routing Congestion Report
+---------------------------------
+Layer  Direction  Overflow  Max H/V Usage  Available  Resources
+metal1  H         0         0.74          480        648
+metal2  V         2         0.89          392        440
+metal3  H         4         0.97          368        380
+metal4  V         1         0.88          280        318
+metal5  H         0         0.62          260        420
+Total overflow: 7
+Worst congestion tile: (84, 62) to (85, 63)  overflow=4
+Worst congestion tile: (86, 61) to (87, 62)  overflow=3
+Worst congestion tile: (83, 60) to (84, 61)  overflow=2
+Worst congestion tile: (85, 63) to (86, 64)  overflow=2
+Worst congestion tile: (80, 58) to (81, 59)  overflow=1
+average routing utilization: 78.4%
+maximum routing utilization: 97.0%

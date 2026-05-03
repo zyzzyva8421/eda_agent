@@ -1,0 +1,38 @@
+wns -0.352
+tns -2.816
+violating paths 8
+view setup_typical
+clk period_min = 2.84 fmax = 144.93
+setup skew 0.06
+max slew violation count 2
+max fanout violation count 0
+max cap violation count 0
+setup violation count 8
+hold violation count 0
+critical path delay
+  2.84
+slack div critical path delay
+  0.876
+
+------------------------------------------------------------------------------------------
+Startpoint: genblk1[0].u_round.u_sub.u_xor4/A[3]
+             (rising edge-triggered flip-flop clocked by clk)
+Endpoint:   genblk1[1].u_round.u_add.u_carry_out_reg[3]
+             (rising edge-triggered flip-flop clocked by clk)
+Path Group: clk
+slack (VIOLATED) -0.352
+------------------------------------------------------------------------------------------
+Startpoint: genblk1[0].u_round.u_sub.u_xor4/A[1]
+             (rising edge-triggered flip-flop clocked by clk)
+Endpoint:   genblk1[1].u_round.u_add.u_carry_out_reg[1]
+             (rising edge-triggered flip-flop clocked by clk)
+Path Group: clk
+slack (VIOLATED) -0.281
+------------------------------------------------------------------------------------------
+Startpoint: u_sbox.gen_sbox[7].u_lut/Z
+             (rising edge-triggered flip-flop clocked by clk)
+Endpoint:   genblk1[0].u_round.u_xorkey.out_reg[15]
+             (rising edge-triggered flip-flop clocked by clk)
+Path Group: clk
+slack (VIOLATED) -0.190
+------------------------------------------------------------------------------------------
