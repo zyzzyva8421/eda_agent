@@ -66,6 +66,14 @@ test-api:
 ## Quick smoke-run: unit tests without coverage overhead (alias for test-unit).
 test-fast: test-unit
 
+## Run real-LLM integration tests (requires MINIMAX_API_KEY in environment / .env).
+test-llm:
+	$(PYTEST) tests/integration/test_orfs_aes_llm.py -v -s
+
+## Run all tests except real-LLM tests (safe for CI without API key).
+test-no-llm:
+	$(PYTEST) -m "not llm" -q
+
 ## Lint with ruff (no changes).
 lint:
 	$(RUFF) check eda_agent tests
