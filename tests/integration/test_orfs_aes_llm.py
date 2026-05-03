@@ -52,7 +52,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
+import re
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -212,6 +214,100 @@ def _make_planner():
     """Return a Planner instance using the real API key but short iteration cap."""
     from eda_agent.agent.planner import Planner
     return Planner(max_iterations=8)
+
+
+def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+    """Extract and parse the first JSON object found in text."""
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _baseline_finish_metrics_from_fixture() -> dict[str, float | int]:
+    """Load baseline finish metrics from AES fixture timing report."""
+    from eda_agent.parsers.timing import TimingParser
+
+    rpt = (
+        Path(__file__).parent.parent
+        / "fixtures"
+        / "orfs"
+        / "sky130hd"
+        / "aes"
+        / "reports"
+        / "6_finish_timing.rpt"
+    )
+    records = TimingParser().parse_file(rpt)
+    summary = next(r for r in records if r.get("kind") == "summary")
+    return {
+        "wns_ns": float(summary.get("wns_ns", 0.0)),
+        "tns_ns": float(summary.get("tns_ns", 0.0)),
+        "setup_violations": int(summary.get("setup_violations", 0)),
+        "hold_violations": int(summary.get("hold_violations", 0)),
+    }
+
+
+def _request_real_llm_param_suggestion(baseline: dict[str, float | int]) -> dict[str, Any]:
+    """Call MiniMax directly and request make-variable suggestions as strict JSON."""
+    import httpx
+
+    prompt = (
+        "You are an EDA physical design expert. Diagnose root cause and propose "
+        "conservative parameter changes for one re-run. Return ONLY JSON object "
+        "without markdown.\\n"
+        "Schema:\\n"
+        "{\\n"
+        "  \"diagnosis\": string,\\n"
+        "  \"suggested_params\": {\\n"
+        "    \"PLACE_DENSITY\": string,\\n"
+        "    \"CELL_PAD_IN_SITES\": string\\n"
+        "  }\\n"
+        "}\\n"
+        f"Current metrics: {json.dumps(baseline)}\\n"
+        "Constraints: PLACE_DENSITY between 0.55 and 0.68, keep changes low risk."
+    )
+
+    payload = {
+        "model": settings.minimax_model,
+        "messages": [
+            {"role": "system", "content": "You are an expert EDA assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 256,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {settings.minimax_api_key}",
+        "Content-Type": "application/json",
+    }
+    if settings.minimax_group_id:
+        headers["X-Group-Id"] = settings.minimax_group_id
+
+    url = f"{settings.minimax_base_url.rstrip('/')}/chat/completions"
+    with httpx.Client(timeout=60) as client:
+        resp = client.post(url, json=payload, headers=headers)
+    resp.raise_for_status()
+
+    content = resp.json()["choices"][0]["message"]["content"]
+    parsed = _extract_first_json_object(content)
+    if not parsed:
+        raise AssertionError(f"LLM did not return parseable JSON: {content}")
+
+    params = parsed.get("suggested_params", {})
+    if not isinstance(params, dict):
+        raise AssertionError(f"LLM suggested_params invalid: {parsed}")
+
+    # Keep only known make vars for this closed-loop test.
+    allow = {"PLACE_DENSITY", "CELL_PAD_IN_SITES"}
+    safe_params = {k: str(v) for k, v in params.items() if k in allow}
+    if "PLACE_DENSITY" not in safe_params:
+        safe_params["PLACE_DENSITY"] = "0.60"
+    return safe_params
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -422,3 +518,106 @@ def test_llm_single_turn_summary():
     )
 
     logger.info("Single-turn LLM summary:\n%s", answer)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test 6 – Real closed loop: LLM suggestion → real finish rerun → compare
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.slow
+@_skip_no_key
+def test_llm_real_finish_rerun_and_compare_metrics():
+    """Run one real ORFS finish rerun using LLM-suggested params and compare.
+
+    Opt-in guards:
+      - EDA_REAL_RUN=1
+      - ORFS flow/design config exists
+      - PostgreSQL service reachable by eda_agent settings
+
+    This test performs a true tool-driven loop:
+      1) real LLM suggests params from baseline finish metrics
+      2) run_eda_stage (finish) executes ORFS with suggested params
+      3) query_timing fetches new run metrics from DB
+      4) compare new metrics against old finish baseline
+    """
+    if os.getenv("EDA_REAL_RUN", "0") != "1":
+        pytest.skip("Set EDA_REAL_RUN=1 to enable real ORFS rerun comparison test")
+
+    from eda_agent.agent.tools import execute_tool
+
+    design_name = os.getenv("EDA_REAL_DESIGN_NAME", "aes")
+    pdk = os.getenv("EDA_REAL_PDK", "sky130hd")
+
+    default_cfg = Path(settings.orfs_root) / "flow" / "designs" / pdk / design_name / "config.mk"
+    cfg_path = Path(os.getenv("EDA_REAL_DESIGN_CONFIG", str(default_cfg)))
+    if not cfg_path.is_file():
+        pytest.skip(
+            f"Design config not found: {cfg_path}. "
+            "Set EDA_REAL_DESIGN_CONFIG to a valid ORFS design config path."
+        )
+
+    baseline = _baseline_finish_metrics_from_fixture()
+    llm_params = _request_real_llm_param_suggestion(baseline)
+
+    rerun_raw = execute_tool(
+        "run_eda_stage",
+        {
+            "backend": "orfs",
+            "stage": "finish",
+            "design_name": design_name,
+            "design_config": str(cfg_path),
+            "pdk": pdk,
+            "params": llm_params,
+            # allow low-risk guardrail warnings without manual confirm cycle
+            "_guardrail_confirmed": True,
+        },
+    )
+    rerun = json.loads(rerun_raw)
+    assert rerun.get("status") == "success", f"Rerun failed: {rerun}"
+
+    new_run_id = rerun.get("run_id")
+    assert isinstance(new_run_id, int), f"Invalid new run_id in rerun result: {rerun}"
+
+    timing_raw = execute_tool(
+        "query_timing",
+        {
+            "design_name": design_name,
+            "run_id": new_run_id,
+            "limit": 10,
+        },
+    )
+    timing = json.loads(timing_raw)
+    rows = timing.get("summary", [])
+    assert rows, f"No timing summary rows for new run_id={new_run_id}: {timing}"
+
+    # Use worst WNS row as representative for this run.
+    worst = min(rows, key=lambda r: float(r.get("wns_ns") or 0.0))
+    new_wns = float(worst.get("wns_ns") or 0.0)
+    new_tns = float(worst.get("tns_ns") or 0.0)
+    new_setup = int(worst.get("setup_violations") or 0)
+
+    delta_wns = new_wns - float(baseline["wns_ns"])
+    delta_tns = new_tns - float(baseline["tns_ns"])
+    delta_setup = int(baseline["setup_violations"]) - new_setup
+
+    logger.info(
+        "AES rerun compare | params=%s | baseline=%s | new={wns:%s, tns:%s, setup:%s} "
+        "| delta={wns:%+.3f, tns:%+.3f, setup:%+d}",
+        llm_params,
+        baseline,
+        new_wns,
+        new_tns,
+        new_setup,
+        delta_wns,
+        delta_tns,
+        delta_setup,
+    )
+
+    # Practical pass criterion for one low-risk rerun:
+    # at least one of WNS/TNS/setup improves.
+    improved = (delta_wns > 0.0) or (delta_tns > 0.0) or (delta_setup > 0)
+    assert improved, (
+        "No improvement after LLM-guided rerun. "
+        f"baseline={baseline}, new={{'wns_ns': {new_wns}, 'tns_ns': {new_tns}, "
+        f"'setup_violations': {new_setup}}}, params={llm_params}"
+    )
