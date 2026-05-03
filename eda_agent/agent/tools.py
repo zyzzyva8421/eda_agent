@@ -20,6 +20,12 @@ compare_runs       – diff PPA between two runs
 suggest_params     – LLM-assisted parameter suggestion based on history
 tune_ppa          – autonomous PPA tuning loop (suggest → run → repeat)
 tune_ppa_multistage – multi-stage autonomous PPA tuning
+infer_root_cause  – rule-based root cause inference
+confirm_root_cause – confirm root cause and save to case memory
+save_case         – persist a debugging case to case memory
+
+All tool calls are intercepted by the guardrail layer before execution.
+See :mod:`eda_agent.agent.guardrails` for the risk policy.
 """
 
 from __future__ import annotations
@@ -1923,12 +1929,36 @@ _TOOL_DISPATCH = {
 
 
 def execute_tool(name: str, arguments: dict[str, Any]) -> str:
-    """Execute a tool by name with *arguments* and return a JSON string."""
+    """Execute a tool by name with *arguments* and return a JSON string.
+
+    All calls pass through the guardrail layer first.  Blocked calls return a
+    structured ``{"blocked": true, ...}`` JSON response without invoking the
+    underlying function.  WARN-level calls execute normally but include a
+    ``_warnings`` list in the result.
+    """
+    from eda_agent.agent.guardrails import RiskLevel, check
+
     fn = _TOOL_DISPATCH.get(name)
     if fn is None:
         return json.dumps({"error": f"Unknown tool: {name}"})
+
+    # Strip internal guardrail flag before forwarding to implementation
+    args = {k: v for k, v in arguments.items() if k != "_guardrail_confirmed"}
+
+    # Guardrail check (uses original arguments so confirmed flag is visible)
+    gr = check(name, arguments)
+    if gr.is_blocked:
+        return json.dumps(gr.blocked_response(name, args))
+
     try:
-        result = fn(**arguments)
+        result = fn(**args)
+        # Attach warnings to result when present
+        if gr.level == RiskLevel.WARN and gr.warnings:
+            if isinstance(result, dict):
+                result["_warnings"] = gr.warnings
+            else:
+                # Wrap non-dict results
+                result = {"result": result, "_warnings": gr.warnings}
         return json.dumps(result, default=str)
     except Exception as exc:
         logger.exception("Tool %s failed", name)
