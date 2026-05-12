@@ -32,7 +32,7 @@ if {[file exists "$saved_dir/postCTSopt.inv.dat"]} {
     exit 1
 }
 
-setDrawView route
+setDrawView place
 puts "Design loaded: $design_name"
 
 # Step 2: Global routing
@@ -59,16 +59,16 @@ puts "Step 5: Generating reports..."
 report_timing > $output_dir/timing.rpt
 
 # DRC report
-verifyGeometry -outdir $output_dir > $output_dir/drc.rpt
+verifyGeometry -report $output_dir/drc.rpt
 
 # Congestion report
-report_congestion -verbose > $output_dir/congestion.rpt
+reportCongestion -overflow > $output_dir/congestion.rpt
 
 # Area report
 report_area > $output_dir/area.rpt
 
 # Power report
-report_power -nosplit > $output_dir/power.rpt
+report_power > $output_dir/power.rpt
 
 puts "Reports generated"
 
