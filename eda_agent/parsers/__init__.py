@@ -13,6 +13,10 @@ from __future__ import annotations
 from eda_agent.parsers.base import BaseParser, ParseError
 from eda_agent.parsers.congestion import CongestionParser
 from eda_agent.parsers.drc import DRCParser
+from eda_agent.parsers.innovus_drc import InnovusDRCParser
+from eda_agent.parsers.innovus_power import InnovusPowerParser
+from eda_agent.parsers.innovus_timing import InnovusTimingParser
+from eda_agent.parsers.innovus_utilization import InnovusUtilizationParser
 from eda_agent.parsers.power import PowerParser
 from eda_agent.parsers.timing import TimingParser
 from eda_agent.parsers.utilization import UtilizationParser
@@ -23,6 +27,10 @@ _PARSER_REGISTRY: dict[str, BaseParser] = {
     "utilization": UtilizationParser(),
     "power": PowerParser(),
     "drc": DRCParser(),
+    "innovus_timing": InnovusTimingParser(),
+    "innovus_power": InnovusPowerParser(),
+    "innovus_utilization": InnovusUtilizationParser(),
+    "innovus_drc": InnovusDRCParser(),
 }
 
 
@@ -56,6 +64,10 @@ __all__ = [
     "UtilizationParser",
     "PowerParser",
     "DRCParser",
+    "InnovusTimingParser",
+    "InnovusPowerParser",
+    "InnovusUtilizationParser",
+    "InnovusDRCParser",
     "get_parser",
     "register_parser",
 ]

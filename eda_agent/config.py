@@ -59,6 +59,20 @@ class Settings(BaseSettings):
     orfs_root: Path = Field(default_factory=lambda: Path.home() / "OpenROAD-flow-scripts")
     orfs_make_jobs: int = Field(default=4)
 
+    # ── Innovus backend (SSH) ────────────────────────────────────────────────
+    innovus_ssh_host: str = Field(default="")
+    innovus_ssh_user: str = Field(default="")
+    innovus_ssh_port: int = Field(default=22)
+    innovus_ssh_password: str = Field(default="")
+    innovus_bin: str = Field(default="/opt/cadance/INNOVUS181/bin/innovus")
+    innovus_remote_workdir: str = Field(default="~")
+    innovus_timeout_sec: int = Field(default=7200)
+    innovus_connect_retries: int = Field(default=5)
+    innovus_connect_initial_backoff_sec: float = Field(default=2.0)
+    innovus_connect_backoff_multiplier: float = Field(default=1.8)
+    innovus_connect_max_backoff_sec: float = Field(default=20.0)
+    innovus_ssh_probe_timeout_sec: int = Field(default=8)
+
     # ── Parquet archive ───────────────────────────────────────────────────────
     parquet_archive_dir: Path = Field(default=Path("/data/archive"))
 

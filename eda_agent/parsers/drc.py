@@ -47,6 +47,8 @@ _VIOLATION_BBOX = re.compile(
 
 # Layer name following the bbox
 _VIOLATION_LAYER = re.compile(r"on\s+Layer\s+(\S+)", re.IGNORECASE)
+_INNOVUS_SUMMARY_ROW = re.compile(r"^\s*(Cells|SameNet|Wiring|Antenna|Short|Overlap)\s*:\s*(\d+)", re.MULTILINE | re.IGNORECASE)
+_INNOVUS_NO_DRC = re.compile(r"No\s+DRC\s+violations\s+were\s+found", re.IGNORECASE)
 
 
 class DRCParser(BaseParser):
@@ -75,6 +77,12 @@ class DRCParser(BaseParser):
         m = _DRC_SUMMARY.search(text)
         if m:
             return {"kind": "summary", "total_violations": int(m.group(1))}
+        innovus_rows = _INNOVUS_SUMMARY_ROW.findall(text)
+        if innovus_rows:
+            total = sum(int(count) for _name, count in innovus_rows)
+            return {"kind": "summary", "total_violations": total}
+        if _INNOVUS_NO_DRC.search(text):
+            return {"kind": "summary", "total_violations": 0}
         return None
 
     def _parse_violations(self, text: str) -> list[dict[str, Any]]:

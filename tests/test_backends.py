@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import subprocess
 
 from eda_agent.backends import get_backend, list_backends, register_backend
 from eda_agent.backends.base import (
@@ -40,9 +41,33 @@ def test_validate_params_bad_stage():
         b.validate_params("invalid_stage", {})
 
 
-def test_innovus_stub_not_available():
+def test_innovus_available():
+    """InnovusBackend.is_available() returns True when SSH is configured."""
     b = get_backend("innovus")
-    assert not b.is_available()
+    # Note: This test passes when VM is running and SSH is accessible
+    assert b.is_available()
+
+
+def test_innovus_transient_ssh_failure_detection():
+    b = get_backend("innovus")
+    result = subprocess.CompletedProcess(
+        args=["ssh"],
+        returncode=255,
+        stdout="",
+        stderr="ssh: connect to host 192.168.58.10 port 22: No route to host",
+    )
+    assert b._is_transient_ssh_failure(result)
+
+
+def test_innovus_non_transient_ssh_failure_detection():
+    b = get_backend("innovus")
+    result = subprocess.CompletedProcess(
+        args=["ssh"],
+        returncode=255,
+        stdout="",
+        stderr="Permission denied (publickey,password)",
+    )
+    assert not b._is_transient_ssh_failure(result)
 
 
 def test_icc2_stub_not_available():

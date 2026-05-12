@@ -654,6 +654,10 @@ def _run_eda_stage(
     # Parse and ingest reports if the stage succeeded
     if result.status.value == "success":
         reports = be.collect_reports(result)
+        try:
+            _upsert_artifacts(run_db_id, reports)
+        except Exception:
+            logger.debug("Failed to upsert artifacts for run %s", run_db_id, exc_info=True)
         for rpt in reports:
             try:
                 parser = get_parser(rpt.report_type)
@@ -749,6 +753,10 @@ def _run_eda_flow_sync(
         # Parse reports if successful
         if stage_result.status.value == "success":
             reports = be.collect_reports(stage_result)
+            try:
+                _upsert_artifacts(run_db_id, reports)
+            except Exception:
+                logger.debug("Failed to upsert artifacts for run %s", run_db_id, exc_info=True)
             for rpt in reports:
                 try:
                     parser = get_parser(rpt.report_type)
@@ -2036,6 +2044,28 @@ def _upsert_run(result: Any, design: DesignSpec) -> int:
             {"uuid": result.run_id},
         ).scalar()
     return run_id
+
+
+def _upsert_artifacts(run_id: int, reports: list[Any]) -> None:
+    """Persist collected report files into artifacts table (best effort)."""
+    with get_db() as db:
+        for rpt in reports:
+            path = Path(str(rpt.path))
+            file_size = path.stat().st_size if path.exists() else None
+            db.execute(
+                text(
+                    """
+                    INSERT INTO artifacts (run_id, file_path, artifact_type, file_size_bytes)
+                    VALUES (:run_id, :file_path, :artifact_type, :file_size_bytes)
+                    """
+                ),
+                {
+                    "run_id": run_id,
+                    "file_path": str(path),
+                    "artifact_type": str(getattr(rpt, "report_type", "generic")),
+                    "file_size_bytes": file_size,
+                },
+            )
 
 
 def _ingest_records(records: list[dict], run_id: int, stage: str) -> None:

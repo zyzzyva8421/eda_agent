@@ -38,6 +38,10 @@ _SUMMARY_VIEW = re.compile(
     r"^(?:view|corner|analysis\s+view)[:=\s]+(\S+)",
     re.MULTILINE | re.IGNORECASE,
 )
+_INNOVUS_SLACK = re.compile(
+    r"^=\s+Slack\s+Time\s+(-?\d+\.\d+)",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 # ── Path-detail patterns ──────────────────────────────────────────────────────
 
@@ -47,11 +51,17 @@ _PATH_SEP = re.compile(r"-{40,}|={40,}")
 _PATH_STARTPOINT = re.compile(
     r"^Startpoint:\s+(.+?)(?:\s+\(|$)$", re.MULTILINE | re.IGNORECASE
 )
+_PATH_BEGINPOINT = re.compile(
+    r"^Beginpoint:\s+(.+?)(?:\s+\(|$)$", re.MULTILINE | re.IGNORECASE
+)
 _PATH_ENDPOINT = re.compile(
     r"^Endpoint:\s+(.+?)(?:\s+\(|$)$", re.MULTILINE | re.IGNORECASE
 )
 _PATH_GROUP = re.compile(
     r"^Path\s+Group:\s+(.+)$", re.MULTILINE | re.IGNORECASE
+)
+_PATH_GROUPS = re.compile(
+    r"^Path\s+Groups:\s+\{?(.+?)\}?$", re.MULTILINE | re.IGNORECASE
 )
 # Match slack line – two formats produced by different OpenROAD versions:
 #   Format A (value before keyword):  "  -0.59   slack (VIOLATED)"
@@ -138,6 +148,7 @@ class TimingParser(BaseParser):
         tns_m = _SUMMARY_TNS.search(text)
         fep_m = _SUMMARY_FEP.search(text)
         worst_slack_m = _SUMMARY_WORST_SLACK.search(text)
+        innovus_slack_m = _INNOVUS_SLACK.search(text)
         fmax_m = _FMAX.search(text)
         skew_m = _CLOCK_SKEW.search(text)
         slew_vio_m = _SLEW_VIO.search(text)
@@ -150,7 +161,7 @@ class TimingParser(BaseParser):
         view_m = _SUMMARY_VIEW.search(text)
 
         if not any([
-            wns_m, tns_m, fep_m, worst_slack_m,
+            wns_m, tns_m, fep_m, worst_slack_m, innovus_slack_m,
             fmax_m, skew_m, slew_vio_m, fanout_vio_m,
             cap_vio_m, setup_vio_m, hold_vio_m,
             cpd_m, ratio_m,
@@ -162,6 +173,8 @@ class TimingParser(BaseParser):
             wns_value = float(wns_m.group(1))
         elif worst_slack_m:
             wns_value = float(worst_slack_m.group(1))
+        elif innovus_slack_m:
+            wns_value = float(innovus_slack_m.group(1))
 
         def _int(m: re.Match | None) -> int | None:
             return int(m.group(1)) if m else None
@@ -197,9 +210,10 @@ class TimingParser(BaseParser):
         
         # First, find all path section boundaries (separated by === or ----)
         # This is more reliable than fixed character counts
-        section_starts = [m.start() for m in _PATH_STARTPOINT.finditer(text)]
+        start_matches = list(_PATH_STARTPOINT.finditer(text)) or list(_PATH_BEGINPOINT.finditer(text))
+        section_starts = [m.start() for m in start_matches]
         
-        for i, sp_match in enumerate(_PATH_STARTPOINT.finditer(text)):
+        for i, sp_match in enumerate(start_matches):
             sp = sp_match.group(1).strip()
             sp_start = sp_match.start()
 
@@ -219,6 +233,8 @@ class TimingParser(BaseParser):
 
             # Find path group
             gr_match = _PATH_GROUP.search(section_text)
+            if not gr_match:
+                gr_match = _PATH_GROUPS.search(section_text)
             gr = gr_match.group(1).strip() if gr_match else None
 
             # Find slack value - first try primary VIOLATED/MET pattern

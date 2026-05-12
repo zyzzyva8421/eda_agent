@@ -50,6 +50,13 @@ _CELL_TYPE_ROW = re.compile(
     r"^\s+(\$\w+|\w+)\s+(\d+)\s*$", re.MULTILINE
 )
 
+# Innovus hierarchy area table:
+# 0      DTMF_CHIP   5667   1274168.74283
+_INNOVUS_TOP_ROW = re.compile(
+    r"^0\s+\S+\s+(\d+)\s+([\d.]+)\s*$",
+    re.MULTILINE,
+)
+
 
 class UtilizationParser(BaseParser):
     """Parse OpenROAD / Yosys utilization and area reports."""
@@ -76,10 +83,11 @@ class UtilizationParser(BaseParser):
 
     def _parse_summary(self, text: str) -> dict[str, Any] | None:
         area_m = _DESIGN_AREA.search(text) or _YOSYS_AREA.search(text)
+        innovus_top_m = _INNOVUS_TOP_ROW.search(text)
         cells_m = _NUM_CELLS.search(text)
         regs_m = _NUM_REGS.search(text)
 
-        if not any([area_m, cells_m, regs_m]):
+        if not any([area_m, innovus_top_m, cells_m, regs_m]):
             return None
 
         # Design area line gives both area and utilization
@@ -89,6 +97,9 @@ class UtilizationParser(BaseParser):
             util_pct = float(da.group(2))
         elif area_m:
             area_um2 = float(area_m.group(1))
+            util_pct = None
+        elif innovus_top_m:
+            area_um2 = float(innovus_top_m.group(2))
             util_pct = None
         else:
             area_um2 = None
@@ -103,7 +114,7 @@ class UtilizationParser(BaseParser):
             "kind": "summary",
             "design_area_um2": area_um2,
             "utilization_pct": util_pct,
-            "num_cells": _parse_int(cells_m),
+            "num_cells": _parse_int(cells_m) if cells_m else (_parse_int(innovus_top_m) if innovus_top_m else None),
             "num_registers": _parse_int(regs_m),
         }
 
