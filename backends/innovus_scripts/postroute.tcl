@@ -1,7 +1,7 @@
 #!/usr/bin/env tcl
 #===============================================================================
-# Innovus CTS (Clock Tree Synthesis) Stage Script
-# Usage: innovus -no_gui -overwrite -files cts.tcl
+# Innovus Post-Route Optimization Stage Script
+# Usage: innovus -no_gui -overwrite -files postroute.tcl
 #===============================================================================
 
 set design_name "DTMF_CHIP"
@@ -9,19 +9,25 @@ set design_dir "/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1/FPR"
 set saved_dir "$design_dir/saved"
 
 # Output directory for this stage
-set output_dir "$design_dir/work/cts"
+set output_dir "$design_dir/work/postroute"
 file mkdir $output_dir
 
 suppressMessage ENCEXT-2799
 encMessage warning 0
 
 puts "=========================================="
-puts "Innovus CTS Stage"
+puts "Innovus Post-Route Optimization Stage"
 puts "=========================================="
 
-# Step 1: Load design from placement
+# Step 1: Load design from route
 puts "Step 1: Loading design..."
-if {[file exists "$saved_dir/pr.inv.dat"]} {
+if {[file exists "$design_dir/work/route/route.dat"]} {
+    restoreDesign $design_dir/work/route/route.dat $design_name
+    puts "Loaded from work/route/route.dat"
+} elseif {[file exists "$saved_dir/postCTSopt.inv.dat"]} {
+    restoreDesign $saved_dir/postCTSopt.inv.dat $design_name
+    puts "Loaded from postCTSopt.inv.dat"
+} elseif {[file exists "$saved_dir/pr.inv.dat"]} {
     restoreDesign $saved_dir/pr.inv.dat $design_name
     puts "Loaded from pr.inv.dat"
 } else {
@@ -32,34 +38,30 @@ if {[file exists "$saved_dir/pr.inv.dat"]} {
 setDrawView place
 puts "Design loaded: $design_name"
 
-# Step 2: Clock tree synthesis
-puts "Step 2: Running CTS..."
+# Step 2: Run post-route optimization
+puts "Step 2: Running post-route optimization..."
+optDesign -postRoute -setup -hold
+puts "Post-route optimization complete"
 
-# Use Innovus CCOPT for CTS
-create_ccopt_clock_tree_spec
-ccopt_design
-
-puts "CTS complete"
-
-# Step 3: Save CTS stage
-puts "Step 3: Saving CTS..."
-saveDesign $output_dir/cts
-puts "CTS saved to $output_dir/cts"
+# Step 3: Save stage
+puts "Step 3: Saving postroute..."
+saveDesign $output_dir/postroute
+puts "Post-route saved to $output_dir/postroute"
 
 # Step 4: Generate reports
 puts "Step 4: Generating reports..."
 
 # Timing report
-report_timing -nosplit -verbose > $output_dir/timing.rpt
+report_timing > $output_dir/timing.rpt
 
-# Clock tree report
-report_ccopt_clock_tree_structure > $output_dir/clock_tree.rpt
-
-# Area report
+# Area/utilization report
 report_area > $output_dir/area.rpt
 
-# Power report  
-report_power -nosplit > $output_dir/power.rpt
+# Power report
+report_power > $output_dir/power.rpt
+
+# DRC report
+verifyGeometry -report $output_dir/drc.rpt
 
 # Congestion summary + hotspot map
 if {[catch {reportCongestion -overflow > $output_dir/congestion.rpt} err]} {
@@ -72,6 +74,6 @@ if {[catch {reportCongestion -hotSpot > $output_dir/congestion_map.rpt} err]} {
 puts "Reports generated"
 
 puts "=========================================="
-puts "CTS stage complete"
+puts "Post-route optimization stage complete"
 puts "=========================================="
 exit 0

@@ -66,6 +66,14 @@ report_power > $output_dir/power.rpt
 # DRC report
 verifyGeometry -report $output_dir/drc.rpt
 
+# Congestion summary + hotspot map
+if {[catch {reportCongestion -overflow > $output_dir/congestion.rpt} err]} {
+    puts "WARN: failed to generate congestion.rpt: $err"
+}
+if {[catch {reportCongestion -hotSpot > $output_dir/congestion_map.rpt} err]} {
+    puts "WARN: failed to generate congestion_map.rpt: $err"
+}
+
 puts "Reports generated"
 
 puts "=========================================="

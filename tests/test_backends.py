@@ -48,6 +48,19 @@ def test_innovus_available():
     assert b.is_available()
 
 
+def test_innovus_supports_intermediate_physical_stages():
+    from eda_agent.backends.innovus import _INNOVUS_REPORT_PATTERNS
+
+    b = get_backend("innovus")
+    stages = b.get_supported_stages()
+
+    for stage in ("place", "prects", "cts", "postcts", "route", "postroute", "signoff"):
+        assert stage in stages
+        report_types = {report_type for _, report_type in _INNOVUS_REPORT_PATTERNS[stage]}
+        assert "innovus_congestion" in report_types
+        assert "innovus_congestion_map" in report_types
+
+
 def test_innovus_transient_ssh_failure_detection():
     b = get_backend("innovus")
     result = subprocess.CompletedProcess(

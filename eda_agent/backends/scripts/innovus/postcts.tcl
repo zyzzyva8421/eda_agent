@@ -63,6 +63,14 @@ report_area > $output_dir/area.rpt
 # Power report
 report_power > $output_dir/power.rpt
 
+# Congestion summary + hotspot map
+if {[catch {reportCongestion -overflow > $output_dir/congestion.rpt} err]} {
+    puts "WARN: failed to generate congestion.rpt: $err"
+}
+if {[catch {reportCongestion -hotSpot > $output_dir/congestion_map.rpt} err]} {
+    puts "WARN: failed to generate congestion_map.rpt: $err"
+}
+
 puts "Reports generated"
 
 puts "=========================================="
