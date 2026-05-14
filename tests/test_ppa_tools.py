@@ -107,9 +107,10 @@ def test_check_ppa_target_missing_metric():
 # ── Param filtering (regression for P0.1 fix) ────────────────────────────────
 
 
-def test_tune_ppa_filters_non_numeric_params():
-    """Advisory strings must be discarded; only concrete numerics pass through."""
-    # This replicates the filtering logic in _tune_ppa
+def test_filter_suggested_params_orfs_keeps_only_numeric_values():
+    """ORFS 仍应丢弃 advisory/non-numeric 字符串。"""
+    from eda_agent.agent.tools import _filter_suggested_params
+
     raw_params = {
         "CLOCK_PERIOD": "increase by 0.5 ns",  # advisory – must be dropped
         "CORE_UTILIZATION": 45,                  # integer – must be kept
@@ -117,21 +118,31 @@ def test_tune_ppa_filters_non_numeric_params():
         "SOME_FLAG": "enable",                   # non-numeric string – must be dropped
     }
 
-    filtered: dict = {}
-    for k, v in raw_params.items():
-        if isinstance(v, (int, float)):
-            filtered[k] = v
-        elif isinstance(v, str):
-            try:
-                float(v)
-                filtered[k] = v
-            except ValueError:
-                pass
+    filtered = _filter_suggested_params(raw_params, backend="orfs", stage="place")
 
     assert "CLOCK_PERIOD" not in filtered, "Advisory string should be dropped"
     assert "SOME_FLAG" not in filtered, "Non-numeric string should be dropped"
     assert filtered["CORE_UTILIZATION"] == 45
     assert filtered["TNS_END_PERCENT"] == "20"
+
+
+def test_filter_suggested_params_innovus_accepts_enum_and_boolean():
+    """Innovus 应允许阶段目录中的枚举/布尔参数。"""
+    from eda_agent.agent.tools import _filter_suggested_params
+
+    raw_params = {
+        "place_cong_effort": "high",
+        "place_global_SPP_enhancement": "true",
+        "unknown_param": "foo",
+        "route_ppa_2": True,
+    }
+
+    filtered = _filter_suggested_params(raw_params, backend="innovus", stage="place")
+
+    assert filtered["place_cong_effort"] == "high"
+    assert filtered["place_global_SPP_enhancement"] is True
+    assert "unknown_param" not in filtered
+    assert "route_ppa_2" not in filtered, "route-only param should be dropped for place stage"
 
 
 # ── _pick_bottleneck_stage ────────────────────────────────────────────────────

@@ -40,6 +40,7 @@ from typing import Any
 import httpx
 from sqlalchemy import text
 
+from eda_agent.agent.param_mapper import PARAM_MAPPER, OptimizationObjective
 from eda_agent.backends import get_backend
 from eda_agent.backends.base import DesignSpec
 from eda_agent.config import settings
@@ -1079,6 +1080,104 @@ def _compare_runs(run_id_a: int, run_id_b: int) -> dict[str, Any]:
     return diff
 
 
+def _infer_objective_from_target_spec(
+    target_spec: str,
+    timing_summary: dict[str, Any] | None = None,
+) -> OptimizationObjective:
+    """Infer the primary optimisation objective from natural-language target text."""
+    spec = target_spec.lower()
+    if any(token in spec for token in ("leakage", "leak", "static power")):
+        return OptimizationObjective.LEAKAGE
+    if any(token in spec for token in ("dynamic", "switching power")):
+        return OptimizationObjective.DYNAMIC
+    if any(token in spec for token in ("area", "utilization", "utilisation", "density")):
+        return OptimizationObjective.AREA
+    if any(token in spec for token in ("congestion", "overflow", "hotspot", "route overflow")):
+        return OptimizationObjective.CONGESTION
+    if any(token in spec for token in ("power", "total power")):
+        return OptimizationObjective.DYNAMIC
+
+    summary = timing_summary or {}
+    if (summary.get("hold_violations") or 0) > 0:
+        return OptimizationObjective.SETUP
+    return OptimizationObjective.SETUP
+
+
+def _coerce_innovus_param_value(raw_value: Any, sample_values: list[Any]) -> Any:
+    """Coerce LLM/heuristic output into the sample domain expected by PARAM_MAPPER."""
+    if isinstance(raw_value, str):
+        lowered = raw_value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+
+        has_numeric_sample = any(isinstance(v, (int, float)) and not isinstance(v, bool) for v in sample_values)
+        if has_numeric_sample:
+            try:
+                numeric = float(raw_value)
+                if any(isinstance(v, int) and not isinstance(v, bool) for v in sample_values) and numeric.is_integer():
+                    return int(numeric)
+                return numeric
+            except ValueError:
+                return raw_value
+
+    return raw_value
+
+
+def _filter_suggested_params(
+    raw_params: dict[str, Any],
+    backend: str,
+    stage: str,
+) -> dict[str, Any]:
+    """Filter suggestions into backend-safe parameter values.
+
+    ORFS keeps the existing numeric-only contract.
+    Innovus accepts only parameters defined in PARAM_MAPPER for the given stage,
+    including enum / boolean values.
+    """
+    if backend.lower() != "innovus":
+        filtered: dict[str, Any] = {}
+        for key, value in raw_params.items():
+            if isinstance(value, (int, float)):
+                filtered[key] = value
+                continue
+            if isinstance(value, str):
+                try:
+                    float(value)
+                    filtered[key] = value
+                except ValueError:
+                    logger.debug(
+                        "Dropping non-numeric suggestion for backend %s: %s=%r",
+                        backend,
+                        key,
+                        value,
+                    )
+        return filtered
+
+    stage_specs = PARAM_MAPPER.get_flow_stage_params(stage)
+    filtered = {}
+    for key, value in raw_params.items():
+        spec = stage_specs.get(key)
+        if spec is None:
+            logger.debug("Dropping unknown Innovus param suggestion %s=%r", key, value)
+            continue
+
+        coerced = _coerce_innovus_param_value(value, spec.sample_values)
+        if coerced in spec.sample_values:
+            filtered[key] = coerced
+            continue
+
+        logger.debug(
+            "Dropping out-of-domain Innovus param suggestion %s=%r; allowed=%s",
+            key,
+            value,
+            spec.sample_values,
+        )
+
+    return filtered
+
+
 def _query_utilization(
     design_name: str,
     stage: str | None = None,
@@ -1207,8 +1306,11 @@ def _suggest_params(run_id: int, target_spec: str) -> dict[str, Any]:
 
         run_row = db.execute(
             text(
-                "SELECT r.params, r.stage, d.name AS design_name, d.pdk "
-                "FROM runs r JOIN designs d ON d.id = r.design_id WHERE r.id = :rid"
+                "SELECT r.params, r.stage, d.name AS design_name, d.pdk, b.name AS backend "
+                "FROM runs r "
+                "JOIN designs d ON d.id = r.design_id "
+                "JOIN backends b ON b.id = r.backend_id "
+                "WHERE r.id = :rid"
             ),
             {"rid": run_id},
         ).mappings().first()
@@ -1267,6 +1369,40 @@ def _suggest_params(run_id: int, target_spec: str) -> dict[str, Any]:
     # ── Heuristic fallback ────────────────────────────────────────────────────
     suggestions_h: dict[str, Any] = {}
     reasoning: list[str] = []
+    backend_name = (run_row.get("backend") if run_row else "") or ""
+    stage_name = (run_row.get("stage") if run_row else "") or ""
+
+    if backend_name.lower() == "innovus":
+        objective = _infer_objective_from_target_spec(target_spec, dict(ts_row) if ts_row else {})
+        available_specs = PARAM_MAPPER.get_flow_stage_params(stage_name)
+        suggested = PARAM_MAPPER.suggest_params(objective)
+        suggestions_h = {
+            key: value for key, value in suggested.items() if key in available_specs
+        }
+
+        reasoning.append(
+            f"Using Innovus stage catalog for stage '{stage_name}' with objective '{objective.value}'."
+        )
+        if ts_row:
+            wns = ts_row.get("wns_ns")
+            hold_vio = ts_row.get("hold_violations")
+            fep = ts_row.get("failing_endpoints")
+            if wns is not None:
+                reasoning.append(f"Current WNS={wns:.3f}ns drives stage-specific tuning selection.")
+            if hold_vio:
+                reasoning.append(f"Detected hold violations={hold_vio}; CTS/post-CTS skew knobs are prioritised.")
+            if fep:
+                reasoning.append(f"Detected failing endpoints={fep}; timing and congestion knobs are prioritised.")
+
+        return {
+            "run_id": run_id,
+            "target_spec": target_spec,
+            "suggested_params": suggestions_h,
+            "reasoning": reasoning,
+            "available_params": sorted(available_specs.keys()),
+            "stage_catalog": PARAM_MAPPER.build_stage_catalog().get(stage_name, []),
+            "source": "heuristic",
+        }
 
     if ts_row:
         wns = ts_row["wns_ns"] or 0.0
@@ -1359,11 +1495,21 @@ def _llm_suggest_params(
     """
     context_parts = [
         f"Design: {run_row.get('design_name', 'unknown')}  PDK: {run_row.get('pdk', 'unknown')}",
+        f"Backend: {run_row.get('backend', 'unknown')}",
         f"Stage: {run_row.get('stage', 'unknown')}",
         f"Current params: {json.dumps(run_row.get('params') or {})}",
         "",
         "## Current run metrics",
     ]
+    if str(run_row.get("backend", "")).lower() == "innovus":
+        stage_catalog = PARAM_MAPPER.build_stage_catalog().get(run_row.get("stage", ""), [])
+        if stage_catalog:
+            context_parts.append("")
+            context_parts.append("## Allowed Innovus tunable parameters for this stage")
+            for item in stage_catalog:
+                context_parts.append(
+                    f"  {item['name']}: values={item['sample_values']} command={item['tcl_command']}"
+                )
     if ts_row:
         context_parts.append(
             f"  Timing – WNS: {ts_row.get('wns_ns')} ns, "
@@ -1414,17 +1560,28 @@ def _llm_suggest_params(
                 f"FEP={h.get('failing_endpoints')} params={h.get('params')}"
             )
 
-    system_prompt = (
-        "You are an expert EDA physical design engineer specialised in VLSI PPA optimisation "
-        "with OpenROAD Flow Scripts (ORFS). "
-        "Given current metrics and run history, output ONLY a JSON object with two keys:\n"
-        '  "suggested_params": an object mapping ORFS make variable names to CONCRETE NUMERIC '
-        "values (integers or floats). "
-        "NEVER use relative adjustments like 'increase by X' or 'reduce by Y%'. "
-        "Always compute the absolute target value from the current params shown above.\n"
-        '  "reasoning": an array of concise strings explaining each suggestion.\n'
-        "Do NOT include any other text outside the JSON object."
-    )
+    if str(run_row.get("backend", "")).lower() == "innovus":
+        system_prompt = (
+            "You are an expert Cadence Innovus physical design engineer. "
+            "Given current metrics and run history, output ONLY a JSON object with two keys:\n"
+            '  "suggested_params": an object mapping parameter names to values chosen ONLY from the '
+            "allowed Innovus stage catalog shown in the prompt. Values may be booleans, enums, or numeric values. "
+            "NEVER use relative adjustments like 'increase by X' or values outside the listed sample set.\n"
+            '  "reasoning": an array of concise strings explaining each suggestion.\n'
+            "Do NOT include any other text outside the JSON object."
+        )
+    else:
+        system_prompt = (
+            "You are an expert EDA physical design engineer specialised in VLSI PPA optimisation "
+            "with OpenROAD Flow Scripts (ORFS). "
+            "Given current metrics and run history, output ONLY a JSON object with two keys:\n"
+            '  "suggested_params": an object mapping ORFS make variable names to CONCRETE NUMERIC '
+            "values (integers or floats). "
+            "NEVER use relative adjustments like 'increase by X' or 'reduce by Y%'. "
+            "Always compute the absolute target value from the current params shown above.\n"
+            '  "reasoning": an array of concise strings explaining each suggestion.\n'
+            "Do NOT include any other text outside the JSON object."
+        )
     user_msg = (
         f"PPA target: {target_spec}\n\n"
         + "\n".join(context_parts)
@@ -1575,26 +1732,11 @@ def _tune_ppa(
             suggestion = _suggest_params(run_db_id, augmented_spec)
             raw_params = suggestion.get("suggested_params", {})
 
-            # Keep only concrete numeric values.
-            # Advisory strings like "increase by 0.5 ns" cannot be passed to make
-            # and would silently result in an unchanged run.
-            filtered: dict[str, Any] = {}
-            for k, v in raw_params.items():
-                if isinstance(v, (int, float)):
-                    filtered[k] = v
-                    continue
-                if isinstance(v, str):
-                    try:
-                        float(v)  # numeric string → safe to pass as-is
-                        filtered[k] = v
-                    except ValueError:
-                        logger.debug(
-                            "tune_ppa: dropping non-numeric suggestion %s=%r", k, v
-                        )
+            filtered = _filter_suggested_params(raw_params, backend=backend, stage=stage)
 
             if not filtered and raw_params:
                 logger.warning(
-                    "tune_ppa: all suggested params were non-numeric and were dropped; "
+                    "tune_ppa: all suggested params were dropped after validation; "
                     "re-running with same params (iteration %d)",
                     iteration,
                 )
@@ -1841,19 +1983,7 @@ def _tune_ppa_multistage(
             suggestion = _suggest_params(last_run_id, augmented_spec)
             raw_params = suggestion.get("suggested_params", {})
 
-            # Validate: keep concrete numeric values only
-            filtered: dict[str, Any] = {}
-            for k, v in raw_params.items():
-                if isinstance(v, (int, float)):
-                    filtered[k] = v
-                elif isinstance(v, str):
-                    try:
-                        float(v)
-                        filtered[k] = v
-                    except ValueError:
-                        logger.debug(
-                            "tune_ppa_multistage: dropping non-numeric suggestion %s=%r", k, v
-                        )
+            filtered = _filter_suggested_params(raw_params, backend=backend, stage=bottleneck)
 
             if filtered:
                 stage_params[bottleneck] = filtered

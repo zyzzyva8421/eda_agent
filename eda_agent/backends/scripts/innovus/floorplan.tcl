@@ -32,12 +32,18 @@ if {[file exists "$saved_dir/pr.inv.dat"]} {
 setDrawView fplan
 puts "Design loaded: $design_name"
 
-# Step 2: Floorplan commands (customize for your design)
+# Step 2: Floorplan commands - create tighter floorplan for congestion
 puts "Step 2: Creating floorplan..."
 
-# Example: create basic floorplan
-# adjustFloorPlan
-# createPinAssignment
+# Create very tight floorplan (95% utilization) to force congestion
+setDesignMode -plate density 95
+
+# Set tight aspect ratio
+setDesignMode -aspect_ratio 1.0
+
+# Run create_floorplan with much higher density to create congestion
+create_floorplan -core_utilization 0.95 -aspect_ratio 1.0 \
+    -left_existing 5 -bottom_existing 5 -right_existing 5 -top_existing 5
 
 # Step 3: Save floorplan stage
 puts "Step 3: Saving floorplan..."
