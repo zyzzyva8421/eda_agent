@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -1486,6 +1487,11 @@ def _add_placement_blockage(
         )
 
         existing_params = run_row["params"] if isinstance(run_row["params"], dict) else {}
+        if isinstance(run_row["params"], str):
+            try:
+                existing_params = json.loads(run_row["params"])
+            except json.JSONDecodeError:
+                existing_params = {}
         blockage_history = list(existing_params.get("placement_blockages", []))
         blockage_history.extend(blockages)
         updated_params = dict(existing_params)
@@ -1853,9 +1859,10 @@ def _llm_suggest_params(
 
 
 def _bbox_from_wkt(geom_wkt: str) -> tuple[float, float, float, float] | None:
-    import re
-
-    points = re.findall(r"(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", geom_wkt)
+    points = re.findall(
+        r"(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
+        geom_wkt,
+    )
     if len(points) < 4:
         return None
     xs = [float(p[0]) for p in points]
@@ -2260,8 +2267,6 @@ def _check_ppa_target(
         "hold_violations": "hold_violations",
     }
     _CONGESTION_METRIC_MAP = {
-        "overflow": "overflow_h_pct",
-        "overflow_pct": "overflow_h_pct",
         "overflow_h_pct": "overflow_h_pct",
         "overflow_v_pct": "overflow_v_pct",
     }
@@ -2273,7 +2278,7 @@ def _check_ppa_target(
         re.IGNORECASE,
     )
     _CONGESTION_COND_RE = re.compile(
-        r"(overflow|overflow_pct|overflow_h_pct|overflow_v_pct)\s*(>=|<=|>|<|==)\s*(-?[\d.]+)%?",
+        r"(overflow_h_pct|overflow_v_pct|overflow_pct|overflow)\s*(>=|<=|>|<|==)\s*(-?[\d.]+)%?",
         re.IGNORECASE,
     )
 
@@ -2311,10 +2316,16 @@ def _check_ppa_target(
         if not summary:
             return False
         for metric_alias, op, raw_threshold in congestion_conditions:
-            data_key = _CONGESTION_METRIC_MAP.get(metric_alias.lower())
-            if data_key is None:
-                continue
-            actual = summary.get(data_key)
+            alias = metric_alias.lower()
+            if alias in {"overflow", "overflow_pct"}:
+                overflow_h = float(summary.get("overflow_h_pct", 0.0) or 0.0)
+                overflow_v = float(summary.get("overflow_v_pct", 0.0) or 0.0)
+                actual = max(overflow_h, overflow_v)
+            else:
+                data_key = _CONGESTION_METRIC_MAP.get(alias)
+                if data_key is None:
+                    continue
+                actual = summary.get(data_key)
             if actual is None:
                 return False
             if not _apply(op, float(actual), float(raw_threshold)):

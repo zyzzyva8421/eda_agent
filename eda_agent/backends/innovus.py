@@ -245,7 +245,10 @@ class InnovusBackend(AbstractEDABackend):
         """Write and apply placement blockages to remote Innovus design state."""
         if not blockage_specs:
             raise ValueError("blockage_specs cannot be empty")
-        remote_workdir = (workdir or self._workdir).strip()
+        base_workdir = workdir if workdir is not None else self._workdir
+        if not base_workdir:
+            raise ValueError("Innovus remote workdir is not configured")
+        remote_workdir = str(base_workdir).strip()
         output_dir = f"{remote_workdir}/FPR/work/{stage}"
         saved_dir = f"{remote_workdir}/FPR/saved"
         blockages_tcl = f"{output_dir}/blockages.tcl"
@@ -271,7 +274,6 @@ class InnovusBackend(AbstractEDABackend):
             )
 
         script_body = "\n".join(cmds) + "\n"
-        quoted_blockage = shlex.quote(script_body)
 
         write_script_cmd = (
             f"mkdir -p {shlex.quote(output_dir)} && "
@@ -302,7 +304,6 @@ class InnovusBackend(AbstractEDABackend):
             "stage": stage,
             "blockage_file": blockages_tcl,
             "blockage_count": len(blockage_specs),
-            "script_preview": quoted_blockage,
         }
 
     def _ssh_run(self, remote_cmd: str, timeout: int) -> subprocess.CompletedProcess[str]:

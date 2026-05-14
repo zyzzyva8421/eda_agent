@@ -18,7 +18,7 @@ _BBOX_WITH_OVERFLOW = re.compile(
     (?:-|to)\s*
     \(?\s*([-\d.]+)\s*,?\s+([-\d.]+)\s*\)?     # x2 y2
     .*?
-    overflow\s*[:=]?\s*([-\d.]+)
+    overflow\s*[:=]?\s*(\d+)
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -50,7 +50,7 @@ class InnovusCongestionMapParser(BaseParser):
                     "y1": y1f,
                     "x2": x2f,
                     "y2": y2f,
-                    "overflow": int(float(overflow)),
+                    "overflow": int(overflow),
                 }
             )
 
