@@ -162,7 +162,10 @@ class InnovusBackend(AbstractEDABackend):
     ) -> RunResult:
         params = self.validate_params(stage, params)
         if not self._host or not self._user:
-            raise RuntimeError("Innovus SSH is not configured. Set INNOVUS_SSH_HOST/INNOVUS_SSH_USER.")
+            raise RuntimeError(
+                "Innovus SSH is not configured. "
+                "Set INNOVUS_SSH_HOST/INNOVUS_SSH_USER."
+            )
 
         run_id = str(uuid.uuid4())
         started_at = datetime.now(tz=timezone.utc)
@@ -189,13 +192,16 @@ class InnovusBackend(AbstractEDABackend):
                 raise ValueError("Innovus stage requires params['tcl'] or params['command'].")
             remote_cmd = (
                 f"cd {shlex.quote(remote_workdir)} && "
-                f"{shlex.quote(self._innovus_bin)} -no_gui -overwrite -files {shlex.quote(remote_tcl)}"
+                f"{shlex.quote(self._innovus_bin)} "
+                f"-no_gui -overwrite -files {shlex.quote(remote_tcl)}"
             )
 
         status = StageStatus.FAILED
         error_message = ""
         # report_dir is the local directory where reports will be copied to
-        remote_rpt_dir = str(params.get("report_dir", "")).strip() or f"{remote_workdir}/FPR/work/{stage}"
+        remote_rpt_dir = str(params.get("report_dir", "")).strip() or (
+            f"{remote_workdir}/FPR/work/{stage}"
+        )
         local_report_dir = Path("/tmp/eda_agent/innovus") / design.name / stage / "reports"
         if local_report_dir.exists():
             shutil.rmtree(local_report_dir)
@@ -416,7 +422,10 @@ class InnovusBackend(AbstractEDABackend):
         for attempt in range(1, self._connect_retries + 1):
             if self._probe_ping() and self._probe_ssh():
                 return True, ""
-            last_reason = f"attempt {attempt}/{self._connect_retries}: host {self._host} not reachable"
+            last_reason = (
+                f"attempt {attempt}/{self._connect_retries}: "
+                f"host {self._host} not reachable"
+            )
             if attempt < self._connect_retries:
                 time.sleep(backoff)
                 backoff = min(self._connect_max_backoff, backoff * self._connect_backoff_multiplier)
@@ -431,7 +440,10 @@ class InnovusBackend(AbstractEDABackend):
             return False
 
     def _probe_ssh(self) -> bool:
-        result = self._ssh_run_once("echo __eda_ssh_probe_ok__", timeout=self._ssh_probe_timeout_sec)
+        result = self._ssh_run_once(
+            "echo __eda_ssh_probe_ok__",
+            timeout=self._ssh_probe_timeout_sec,
+        )
         return result.returncode == 0 and "__eda_ssh_probe_ok__" in (result.stdout or "")
 
     def _scp_copy(self, remote_dir: str, local_dir: str) -> None:

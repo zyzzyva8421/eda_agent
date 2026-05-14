@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-import pytest
 import subprocess
 
+import pytest
+
 from eda_agent.backends import get_backend, list_backends, register_backend
-from eda_agent.backends.base import (
-    AbstractEDABackend,
-    DesignSpec,
-    ReportFile,
-    RunResult,
-    StageStatus,
-)
+from eda_agent.backends.base import AbstractEDABackend
 from eda_agent.backends.orfs import ORFSBackend
 
 
