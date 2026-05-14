@@ -104,6 +104,22 @@ def test_check_ppa_target_missing_metric():
     assert _check_ppa_target(_make_timing(fmax=None), "fmax >= 400") is False
 
 
+def test_check_ppa_target_overflow_condition():
+    from eda_agent.agent.tools import _check_ppa_target
+
+    t = _make_timing(fep=0)
+    assert _check_ppa_target(
+        t,
+        "overflow_h_pct <= 2.0",
+        congestion_summary={"overflow_h_pct": 1.8, "overflow_v_pct": 1.0},
+    ) is True
+    assert _check_ppa_target(
+        t,
+        "overflow_h_pct <= 2.0",
+        congestion_summary={"overflow_h_pct": 2.2, "overflow_v_pct": 1.0},
+    ) is False
+
+
 # ── Param filtering (regression for P0.1 fix) ────────────────────────────────
 
 
@@ -176,6 +192,19 @@ def test_pick_bottleneck_clean():
     assert _pick_bottleneck_stage(timing) == "place"
 
 
+def test_pick_bottleneck_congestion_forces_place():
+    from unittest.mock import patch
+
+    from eda_agent.agent.tools import _pick_bottleneck_stage
+
+    timing = _make_timing(wns=-0.2, fep=5)
+    with patch(
+        "eda_agent.agent.tools._query_congestion_summary",
+        return_value={"overflow_h_pct": 3.2, "overflow_v_pct": 1.5},
+    ):
+        assert _pick_bottleneck_stage(timing, run_id=123) == "place"
+
+
 # ── Tool schema coverage ──────────────────────────────────────────────────────
 
 
@@ -185,7 +214,13 @@ def test_tune_ppa_multistage_schema_registered():
 
     names = [s["function"]["name"] for s in TOOL_SCHEMAS]
     assert "tune_ppa_multistage" in names, "tune_ppa_multistage must be in TOOL_SCHEMAS"
+    assert "tune_congestion_with_blockage" in names
+    assert "add_placement_blockage" in names
+    assert "query_congestion_summary" in names
     assert "tune_ppa_multistage" in _TOOL_DISPATCH, "tune_ppa_multistage must be dispatchable"
+    assert "tune_congestion_with_blockage" in _TOOL_DISPATCH
+    assert "add_placement_blockage" in _TOOL_DISPATCH
+    assert "query_congestion_summary" in _TOOL_DISPATCH
 
 
 def test_tune_ppa_multistage_schema_required_params():

@@ -61,8 +61,13 @@ report_timing -nosplit -verbose > $output_dir/timing.rpt
 # DRC report
 verifyGeometry -outdir $output_dir > $output_dir/drc.rpt
 
-# Congestion report
-report_congestion -verbose > $output_dir/congestion.rpt
+# Congestion summary + hotspot map
+if {[catch {reportCongestion -overflow > $output_dir/congestion.rpt} err]} {
+    puts "WARN: failed to generate congestion.rpt: $err"
+}
+if {[catch {reportCongestion -hotSpot > $output_dir/congestion_map.rpt} err]} {
+    puts "WARN: failed to generate congestion_map.rpt: $err"
+}
 
 # Area report
 report_area > $output_dir/area.rpt

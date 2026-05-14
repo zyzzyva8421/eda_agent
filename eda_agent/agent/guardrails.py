@@ -118,7 +118,7 @@ def _check_utilization(args: dict[str, Any]) -> GuardrailResult | None:
 
 def _check_long_running(tool_name: str) -> GuardrailResult | None:
     """Warn before multi-hour autonomous tuning loops."""
-    long_running = {"tune_ppa", "tune_ppa_multistage"}
+    long_running = {"tune_ppa", "tune_ppa_multistage", "tune_congestion_with_blockage"}
     if tool_name in long_running:
         return GuardrailResult(
             level=RiskLevel.WARN,

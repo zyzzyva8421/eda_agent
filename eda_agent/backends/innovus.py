@@ -41,12 +41,33 @@ _INNOVUS_REPORT_PATTERNS = {
         ("*area*.rpt", "innovus_utilization"),
         ("*geom*.rpt", "innovus_drc"),
         ("*drc*.rpt", "innovus_drc"),
+        ("*congestion_map*.rpt", "innovus_congestion_map"),
+        ("*congestion*.rpt", "innovus_congestion"),
+    ],
+    "prects": [
+        ("*prects*.rpt", "innovus_timing"),
+        ("*timing*.rpt", "innovus_timing"),
+        ("*power*.rpt", "innovus_power"),
+        ("*area*.rpt", "innovus_utilization"),
+        ("*congestion_map*.rpt", "innovus_congestion_map"),
+        ("*congestion*.rpt", "innovus_congestion"),
     ],
     "cts": [
         ("*cts*.rpt", "innovus_timing"),
         ("*clock*.rpt", "innovus_timing"),
         ("*timing*.rpt", "innovus_timing"),
         ("*power*.rpt", "innovus_power"),
+        ("*area*.rpt", "innovus_utilization"),
+        ("*congestion_map*.rpt", "innovus_congestion_map"),
+        ("*congestion*.rpt", "innovus_congestion"),
+    ],
+    "postcts": [
+        ("*postcts*.rpt", "innovus_timing"),
+        ("*timing*.rpt", "innovus_timing"),
+        ("*power*.rpt", "innovus_power"),
+        ("*area*.rpt", "innovus_utilization"),
+        ("*congestion_map*.rpt", "innovus_congestion_map"),
+        ("*congestion*.rpt", "innovus_congestion"),
     ],
     "route": [
         ("*route*.rpt", "innovus_timing"),
@@ -54,13 +75,26 @@ _INNOVUS_REPORT_PATTERNS = {
         ("*power*.rpt", "innovus_power"),
         ("*drc*.rpt", "innovus_drc"),
         ("*geom*.rpt", "innovus_drc"),
-        ("*congestion*.rpt", "congestion"),
+        ("*congestion_map*.rpt", "innovus_congestion_map"),
+        ("*congestion*.rpt", "innovus_congestion"),
+    ],
+    "postroute": [
+        ("*postroute*.rpt", "innovus_timing"),
+        ("*timing*.rpt", "innovus_timing"),
+        ("*power*.rpt", "innovus_power"),
+        ("*area*.rpt", "innovus_utilization"),
+        ("*drc*.rpt", "innovus_drc"),
+        ("*geom*.rpt", "innovus_drc"),
+        ("*congestion_map*.rpt", "innovus_congestion_map"),
+        ("*congestion*.rpt", "innovus_congestion"),
     ],
     "signoff": [
         ("*timing*.rpt", "innovus_timing"),
         ("*power*.rpt", "innovus_power"),
         ("*area*.rpt", "innovus_utilization"),
         ("*geom*.rpt", "innovus_drc"),
+        ("*congestion_map*.rpt", "innovus_congestion_map"),
+        ("*congestion*.rpt", "innovus_congestion"),
         ("*qor.rpt", "summary"),
     ],
 }
@@ -70,8 +104,11 @@ _INNOVUS_STAGES = [
     "floorplan",
     "powerplan",
     "place",
+    "prects",
     "cts",
+    "postcts",
     "route",
+    "postroute",
     "signoff",
 ]
 
@@ -125,7 +162,10 @@ class InnovusBackend(AbstractEDABackend):
     ) -> RunResult:
         params = self.validate_params(stage, params)
         if not self._host or not self._user:
-            raise RuntimeError("Innovus SSH is not configured. Set INNOVUS_SSH_HOST/INNOVUS_SSH_USER.")
+            raise RuntimeError(
+                "Innovus SSH is not configured. "
+                "Set INNOVUS_SSH_HOST/INNOVUS_SSH_USER."
+            )
 
         run_id = str(uuid.uuid4())
         started_at = datetime.now(tz=timezone.utc)
@@ -152,13 +192,16 @@ class InnovusBackend(AbstractEDABackend):
                 raise ValueError("Innovus stage requires params['tcl'] or params['command'].")
             remote_cmd = (
                 f"cd {shlex.quote(remote_workdir)} && "
-                f"{shlex.quote(self._innovus_bin)} -no_gui -overwrite -files {shlex.quote(remote_tcl)}"
+                f"{shlex.quote(self._innovus_bin)} "
+                f"-no_gui -overwrite -files {shlex.quote(remote_tcl)}"
             )
 
         status = StageStatus.FAILED
         error_message = ""
         # report_dir is the local directory where reports will be copied to
-        remote_rpt_dir = str(params.get("report_dir", "")).strip() or f"{remote_workdir}/FPR/work/{stage}"
+        remote_rpt_dir = str(params.get("report_dir", "")).strip() or (
+            f"{remote_workdir}/FPR/work/{stage}"
+        )
         local_report_dir = Path("/tmp/eda_agent/innovus") / design.name / stage / "reports"
         if local_report_dir.exists():
             shutil.rmtree(local_report_dir)
@@ -230,6 +273,78 @@ class InnovusBackend(AbstractEDABackend):
                     )
 
         return files
+
+    def add_blockage_to_design_state(
+        self,
+        *,
+        design_name: str,
+        blockage_specs: list[dict[str, Any]],
+        workdir: str | None = None,
+        stage: str = "place",
+    ) -> dict[str, Any]:
+        """Write and apply placement blockages to remote Innovus design state."""
+        if not blockage_specs:
+            raise ValueError("blockage_specs cannot be empty")
+        base_workdir = workdir if workdir is not None else self._workdir
+        if not base_workdir:
+            raise ValueError("Innovus remote workdir is not configured")
+        remote_workdir = str(base_workdir).strip()
+        output_dir = f"{remote_workdir}/FPR/work/{stage}"
+        saved_dir = f"{remote_workdir}/FPR/saved"
+        blockages_tcl = f"{output_dir}/blockages.tcl"
+        apply_tcl = f"{output_dir}/apply_blockages.tcl"
+
+        cmds: list[str] = []
+        for idx, spec in enumerate(blockage_specs, start=1):
+            btype = str(spec.get("type", "soft")).strip().lower()
+            if btype not in {"soft", "hard", "partial"}:
+                raise ValueError(f"Unsupported blockage type at index {idx}: {btype}")
+            try:
+                x1 = float(spec["x1"])
+                y1 = float(spec["y1"])
+                x2 = float(spec["x2"])
+                y2 = float(spec["y2"])
+            except KeyError as exc:
+                raise ValueError(f"Missing blockage coordinate at index {idx}: {exc}") from exc
+            if x2 <= x1 or y2 <= y1:
+                raise ValueError(f"Invalid blockage bbox at index {idx}: ({x1},{y1})-({x2},{y2})")
+            cmds.append(
+                "createPlaceBlockage -type "
+                f"{shlex.quote(btype)} -box {{{x1} {y1} {x2} {y2}}}"
+            )
+
+        script_body = "\n".join(cmds) + "\n"
+
+        write_script_cmd = (
+            f"mkdir -p {shlex.quote(output_dir)} && "
+            f"cat > {shlex.quote(blockages_tcl)} <<'EOF'\n{script_body}EOF\n"
+        )
+        write_result = self._ssh_run(write_script_cmd, timeout=30)
+        if write_result.returncode != 0:
+            raise RuntimeError("Failed to write remote blockages.tcl")
+
+        apply_body = (
+            f"restoreDesign {saved_dir}/pr.inv.dat {design_name}\n"
+            f"source {blockages_tcl}\n"
+            f"saveDesign {saved_dir}/pr.inv.dat\n"
+            "exit 0\n"
+        )
+        apply_cmd = (
+            f"cat > {shlex.quote(apply_tcl)} <<'EOF'\n{apply_body}EOF\n"
+            f"cd {shlex.quote(remote_workdir)} && "
+            f"{shlex.quote(self._innovus_bin)} -no_gui -overwrite -files {shlex.quote(apply_tcl)}"
+        )
+        apply_result = self._ssh_run(apply_cmd, timeout=120)
+        if apply_result.returncode != 0:
+            raise RuntimeError("Failed to apply placement blockages in Innovus")
+
+        return {
+            "status": "success",
+            "workdir": remote_workdir,
+            "stage": stage,
+            "blockage_file": blockages_tcl,
+            "blockage_count": len(blockage_specs),
+        }
 
     def _ssh_run(self, remote_cmd: str, timeout: int) -> subprocess.CompletedProcess[str]:
         backoff = self._connect_initial_backoff
@@ -307,7 +422,10 @@ class InnovusBackend(AbstractEDABackend):
         for attempt in range(1, self._connect_retries + 1):
             if self._probe_ping() and self._probe_ssh():
                 return True, ""
-            last_reason = f"attempt {attempt}/{self._connect_retries}: host {self._host} not reachable"
+            last_reason = (
+                f"attempt {attempt}/{self._connect_retries}: "
+                f"host {self._host} not reachable"
+            )
             if attempt < self._connect_retries:
                 time.sleep(backoff)
                 backoff = min(self._connect_max_backoff, backoff * self._connect_backoff_multiplier)
@@ -322,7 +440,10 @@ class InnovusBackend(AbstractEDABackend):
             return False
 
     def _probe_ssh(self) -> bool:
-        result = self._ssh_run_once("echo __eda_ssh_probe_ok__", timeout=self._ssh_probe_timeout_sec)
+        result = self._ssh_run_once(
+            "echo __eda_ssh_probe_ok__",
+            timeout=self._ssh_probe_timeout_sec,
+        )
         return result.returncode == 0 and "__eda_ssh_probe_ok__" in (result.stdout or "")
 
     def _scp_copy(self, remote_dir: str, local_dir: str) -> None:
