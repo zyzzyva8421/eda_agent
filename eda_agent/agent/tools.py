@@ -216,6 +216,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_congestion_summary",
+            "description": (
+                "Query congestion summary metrics for a run (total overflow, horizontal/vertical "
+                "overflow percentages) parsed from Innovus congestion reports."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "integer"},
+                },
+                "required": ["run_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "compare_runs",
             "description": "Compare PPA metrics between two run IDs.",
             "parameters": {
@@ -288,6 +305,81 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "required": [
                     "backend", "stage", "design_name", "design_config", "pdk", "target_spec",
                 ],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_placement_blockage",
+            "description": (
+                "Apply one or more Innovus placement blockages (soft/hard/partial) on the remote "
+                "design state and persist them for subsequent place runs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "integer"},
+                    "blockages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x1": {"type": "number"},
+                                "y1": {"type": "number"},
+                                "x2": {"type": "number"},
+                                "y2": {"type": "number"},
+                                "type": {
+                                    "type": "string",
+                                    "description": "Blockage type: soft/hard/partial.",
+                                },
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["x1", "y1", "x2", "y2"],
+                        },
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Optional remote Innovus workdir override.",
+                    },
+                    "stage": {
+                        "type": "string",
+                        "description": "Flow stage whose output_dir should host blockages.tcl (default: place).",
+                    },
+                },
+                "required": ["run_id", "blockages"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tune_congestion_with_blockage",
+            "description": (
+                "Iteratively run Innovus place, evaluate congestion summary, let the LLM decide "
+                "placement blockages from hotspots, and repeat until overflow target is met."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "backend": {"type": "string"},
+                    "design_name": {"type": "string"},
+                    "design_config": {"type": "string"},
+                    "pdk": {"type": "string"},
+                    "congestion_threshold_pct": {
+                        "type": "number",
+                        "description": "Target max of horizontal/vertical overflow percentage.",
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "description": "Maximum tuning iterations.",
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Optional Innovus remote workdir override.",
+                    },
+                },
+                "required": ["backend", "design_name", "design_config", "pdk"],
             },
         },
     },
@@ -1047,6 +1139,73 @@ def _query_congestion(
     return [dict(r) for r in rows]
 
 
+def _query_congestion_summary(run_id: int) -> dict[str, Any]:
+    """Return congestion summary metrics for a run.
+
+    Primary source: parsed Innovus congestion report artifact.
+    Fallback: congestion_hotspots aggregates when no summary artifact exists.
+    """
+    with get_db() as db:
+        artifact_row = db.execute(
+            text(
+                """
+                SELECT file_path, artifact_type
+                FROM artifacts
+                WHERE run_id = :run_id
+                  AND artifact_type IN ('innovus_congestion', 'congestion')
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            {"run_id": run_id},
+        ).mappings().first()
+
+        if artifact_row:
+            file_path = Path(str(artifact_row["file_path"]))
+            if file_path.is_file():
+                try:
+                    parser_name = str(artifact_row["artifact_type"])
+                    parser = get_parser(parser_name)
+                    records = parser.parse_file(file_path)
+                    summary = next((r for r in records if r.get("kind") == "summary"), None)
+                    if summary:
+                        return {
+                            "run_id": run_id,
+                            "source": "report",
+                            **summary,
+                        }
+                except Exception:
+                    logger.debug(
+                        "query_congestion_summary: failed to parse artifact for run_id=%s",
+                        run_id,
+                        exc_info=True,
+                    )
+
+        hotspot_agg = db.execute(
+            text(
+                """
+                SELECT COALESCE(MAX(overflow), 0) AS max_overflow,
+                       COALESCE(SUM(overflow), 0) AS sum_overflow,
+                       COUNT(*) AS hotspot_count
+                FROM congestion_hotspots
+                WHERE run_id = :run_id
+                """
+            ),
+            {"run_id": run_id},
+        ).mappings().first()
+
+    if hotspot_agg:
+        return {
+            "run_id": run_id,
+            "source": "hotspot_fallback",
+            "kind": "summary",
+            "total_overflow": int(hotspot_agg["sum_overflow"] or 0),
+            "max_overflow": int(hotspot_agg["max_overflow"] or 0),
+            "hotspot_count": int(hotspot_agg["hotspot_count"] or 0),
+        }
+    return {"run_id": run_id, "error": "No congestion data found"}
+
+
 def _compare_runs(run_id_a: int, run_id_b: int) -> dict[str, Any]:
     with get_db() as db:
         def _fetch(rid: int) -> dict:
@@ -1285,6 +1444,65 @@ def _get_run_log(run_id: int, lines: int = 50) -> dict[str, Any]:
         }
     except Exception as e:
         return {"error": f"Failed to read log: {e}"}
+
+
+def _add_placement_blockage(
+    run_id: int,
+    blockages: list[dict[str, Any]],
+    workdir: str | None = None,
+    stage: str = "place",
+) -> dict[str, Any]:
+    """Apply placement blockages to an Innovus run context and persist metadata."""
+    with get_db() as db:
+        run_row = db.execute(
+            text(
+                """
+                SELECT r.id AS run_id, r.params, r.stage, b.name AS backend, d.name AS design_name
+                FROM runs r
+                JOIN designs d ON d.id = r.design_id
+                JOIN backends b ON b.id = r.backend_id
+                WHERE r.id = :rid
+                """
+            ),
+            {"rid": run_id},
+        ).mappings().first()
+
+        if not run_row:
+            return {"error": f"Run {run_id} not found"}
+
+        backend_name = str(run_row["backend"]).lower()
+        if backend_name != "innovus":
+            return {"error": f"add_placement_blockage supports only innovus backend, got '{backend_name}'"}
+
+        be = get_backend(backend_name)
+        if not hasattr(be, "add_blockage_to_design_state"):
+            return {"error": "Selected backend does not support placement blockage injection"}
+
+        result = be.add_blockage_to_design_state(  # type: ignore[attr-defined]
+            design_name=str(run_row["design_name"]),
+            blockage_specs=blockages,
+            workdir=workdir,
+            stage=stage,
+        )
+
+        existing_params = run_row["params"] if isinstance(run_row["params"], dict) else {}
+        blockage_history = list(existing_params.get("placement_blockages", []))
+        blockage_history.extend(blockages)
+        updated_params = dict(existing_params)
+        updated_params["placement_blockages"] = blockage_history
+        db.execute(
+            text("UPDATE runs SET params = :params WHERE id = :rid"),
+            {"rid": run_id, "params": json.dumps(updated_params)},
+        )
+
+    return {
+        "run_id": run_id,
+        "status": "success",
+        "backend": "innovus",
+        "applied_blockages": len(blockages),
+        "blockages": blockages,
+        "details": result,
+    }
 
 
 def _suggest_params(run_id: int, target_spec: str) -> dict[str, Any]:
@@ -1634,6 +1852,250 @@ def _llm_suggest_params(
     }
 
 
+def _bbox_from_wkt(geom_wkt: str) -> tuple[float, float, float, float] | None:
+    import re
+
+    points = re.findall(r"(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", geom_wkt)
+    if len(points) < 4:
+        return None
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _heuristic_decide_blockages(
+    hotspots: list[dict[str, Any]],
+    max_blockages: int = 3,
+) -> list[dict[str, Any]]:
+    selected = sorted(
+        hotspots,
+        key=lambda h: float(h.get("overflow", 0) or 0),
+        reverse=True,
+    )[:max_blockages]
+
+    blockages: list[dict[str, Any]] = []
+    for idx, hs in enumerate(selected, start=1):
+        geom_wkt = hs.get("geom_wkt")
+        bbox = _bbox_from_wkt(geom_wkt) if isinstance(geom_wkt, str) else None
+        if not bbox:
+            continue
+        x1, y1, x2, y2 = bbox
+        blockages.append(
+            {
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "type": "soft",
+                "reason": (
+                    f"heuristic_hotspot_rank_{idx}; "
+                    f"overflow={hs.get('overflow', 0)}"
+                ),
+            }
+        )
+    return blockages
+
+
+def _llm_decide_blockages(
+    *,
+    run_id: int,
+    congestion_summary: dict[str, Any],
+    hotspots: list[dict[str, Any]],
+    max_blockages: int = 3,
+) -> list[dict[str, Any]]:
+    """Use LLM to decide blockage bounding boxes; fallback to heuristics."""
+    if not hotspots:
+        return []
+
+    summary_json = json.dumps(congestion_summary, ensure_ascii=False)
+    hotspot_sample = hotspots[:12]
+    hotspot_json = json.dumps(hotspot_sample, ensure_ascii=False)
+
+    system_prompt = (
+        "You are an expert Innovus placement optimization engineer. "
+        "Return ONLY JSON: {\"blockages\": [...]}.\n"
+        "Each blockage item must include x1,y1,x2,y2,type,reason. "
+        "Allowed type values: soft, hard, partial. "
+        "Use no more than max_blockages items and prioritize highest overflow hotspots."
+    )
+    user_prompt = (
+        f"run_id={run_id}\n"
+        f"max_blockages={max_blockages}\n"
+        f"congestion_summary={summary_json}\n"
+        f"hotspots={hotspot_json}\n"
+        "Output strict JSON only."
+    )
+
+    api_key = settings.minimax_api_key
+    if not api_key:
+        return _heuristic_decide_blockages(hotspots, max_blockages=max_blockages)
+
+    model = settings.minimax_model
+    base_url = settings.minimax_base_url.rstrip("/")
+    group_id = settings.minimax_group_id
+    url = (
+        f"{base_url}/text/chatcompletion_v2?GroupId={group_id}"
+        if group_id
+        else f"{base_url}/chat/completions"
+    )
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 800,
+        "temperature": 0.1,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        with httpx.Client(timeout=45) as client:
+            resp = client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.split("```", 2)[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.rsplit("```", 1)[0].strip()
+        parsed = json.loads(content)
+        raw_blockages = parsed.get("blockages", [])
+        if not isinstance(raw_blockages, list):
+            return _heuristic_decide_blockages(hotspots, max_blockages=max_blockages)
+        validated: list[dict[str, Any]] = []
+        for item in raw_blockages[:max_blockages]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                x1 = float(item["x1"])
+                y1 = float(item["y1"])
+                x2 = float(item["x2"])
+                y2 = float(item["y2"])
+            except Exception:
+                continue
+            if x2 <= x1 or y2 <= y1:
+                continue
+            btype = str(item.get("type", "soft")).lower()
+            if btype not in {"soft", "hard", "partial"}:
+                btype = "soft"
+            validated.append(
+                {
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "type": btype,
+                    "reason": str(item.get("reason", "llm_hotspot")),
+                }
+            )
+        if validated:
+            return validated
+    except Exception:
+        logger.warning("LLM blockage decision failed; using heuristic fallback", exc_info=True)
+
+    return _heuristic_decide_blockages(hotspots, max_blockages=max_blockages)
+
+
+def _tune_congestion_with_blockage(
+    backend: str,
+    design_name: str,
+    design_config: str,
+    pdk: str,
+    congestion_threshold_pct: float = 2.0,
+    max_iterations: int = 5,
+    workdir: str | None = None,
+) -> dict[str, Any]:
+    """Iteratively tune place congestion by adding placement blockages."""
+    history: list[dict[str, Any]] = []
+
+    for iteration in range(1, max_iterations + 1):
+        run_result = _run_eda_stage(
+            backend=backend,
+            stage="place",
+            design_name=design_name,
+            design_config=design_config,
+            pdk=pdk,
+            params={"workdir": workdir} if workdir else {},
+        )
+        run_id = run_result.get("run_id")
+        status = run_result.get("status")
+        iter_row: dict[str, Any] = {
+            "iteration": iteration,
+            "run_id": run_id,
+            "status": status,
+            "target_threshold_pct": congestion_threshold_pct,
+        }
+        if status != "success" or run_id is None:
+            iter_row["error"] = run_result.get("error")
+            history.append(iter_row)
+            break
+
+        summary = _query_congestion_summary(run_id)
+        iter_row["congestion_summary"] = summary
+
+        overflow_h_pct = float(summary.get("overflow_h_pct", 0.0) or 0.0)
+        overflow_v_pct = float(summary.get("overflow_v_pct", 0.0) or 0.0)
+        has_pct = ("overflow_h_pct" in summary) or ("overflow_v_pct" in summary)
+        effective_overflow = (
+            max(overflow_h_pct, overflow_v_pct)
+            if has_pct
+            else float(summary.get("total_overflow", 0.0) or 0.0)
+        )
+        iter_row["effective_overflow"] = effective_overflow
+        iter_row["overflow_basis"] = "pct" if has_pct else "count"
+
+        if effective_overflow <= congestion_threshold_pct:
+            iter_row["converged"] = True
+            history.append(iter_row)
+            return {
+                "converged": True,
+                "iterations": iteration,
+                "threshold_pct": congestion_threshold_pct,
+                "history": history,
+            }
+
+        hotspots = _query_congestion(run_id)
+        iter_row["hotspot_count"] = len(hotspots)
+        if not hotspots:
+            iter_row["converged"] = False
+            iter_row["error"] = "No congestion hotspots found for blockage synthesis"
+            history.append(iter_row)
+            break
+
+        blockages = _llm_decide_blockages(
+            run_id=run_id,
+            congestion_summary=summary,
+            hotspots=hotspots,
+        )
+        if not blockages:
+            iter_row["converged"] = False
+            iter_row["error"] = "No valid blockage candidates produced"
+            history.append(iter_row)
+            break
+
+        apply_result = _add_placement_blockage(
+            run_id=run_id,
+            blockages=blockages,
+            workdir=workdir,
+            stage="place",
+        )
+        iter_row["applied_blockages"] = blockages
+        iter_row["blockage_apply_result"] = apply_result
+        history.append(iter_row)
+
+    return {
+        "converged": False,
+        "iterations": len(history),
+        "threshold_pct": congestion_threshold_pct,
+        "history": history,
+    }
+
+
 def _tune_ppa(
     backend: str,
     stage: str,
@@ -1711,8 +2173,14 @@ def _tune_ppa(
                 iteration_record["improved"] = False
 
         # Step 3 – check target
-        target_met = _check_ppa_target(timing, target_spec)
+        congestion_summary = _query_congestion_summary(run_db_id)
+        target_met = _check_ppa_target(
+            timing,
+            target_spec,
+            congestion_summary=congestion_summary,
+        )
         iteration_record["target_met"] = target_met
+        iteration_record["congestion_summary"] = congestion_summary
         history.append(iteration_record)
 
         if target_met:
@@ -1751,7 +2219,11 @@ def _tune_ppa(
     }
 
 
-def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
+def _check_ppa_target(
+    timing: dict[str, Any],
+    target_spec: str,
+    congestion_summary: dict[str, Any] | None = None,
+) -> bool:
     """Evaluate a natural-language PPA target against timing data.
 
     Supports multi-metric patterns (case-insensitive):
@@ -1761,6 +2233,7 @@ def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
       - fep == 0  /  failing_endpoints == 0
       - setup_violations == 0
       - hold_violations == 0
+      - overflow_h_pct <= 2.0 / overflow_v_pct <= 2.0 / overflow <= 2.0
 
     Multiple conditions joined by 'and' are all required to be true.
     Returns True if all parsed conditions are satisfied, or if no
@@ -1775,7 +2248,7 @@ def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
     latest = summary[0]
     spec_lower = target_spec.lower()
 
-    # Map metric aliases → data key in the summary dict
+    # Map metric aliases → data key in the timing summary dict
     _METRIC_MAP = {
         "wns": "wns_ns",
         "tns": "tns_ns",
@@ -1786,16 +2259,27 @@ def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
         "setup_violations": "setup_violations",
         "hold_violations": "hold_violations",
     }
+    _CONGESTION_METRIC_MAP = {
+        "overflow": "overflow_h_pct",
+        "overflow_pct": "overflow_h_pct",
+        "overflow_h_pct": "overflow_h_pct",
+        "overflow_v_pct": "overflow_v_pct",
+    }
 
     # Pattern: <metric> <op> <value>
-    _COND_RE = re.compile(
+    _TIMING_COND_RE = re.compile(
         r"(wns|tns|fmax|fep|failing[_ ]endpoints|setup_violations|hold_violations)"
         r"\s*(>=|<=|>|<|==)\s*(-?[\d.]+)",
         re.IGNORECASE,
     )
+    _CONGESTION_COND_RE = re.compile(
+        r"(overflow|overflow_pct|overflow_h_pct|overflow_v_pct)\s*(>=|<=|>|<|==)\s*(-?[\d.]+)%?",
+        re.IGNORECASE,
+    )
 
-    conditions = _COND_RE.findall(spec_lower)
-    if not conditions:
+    timing_conditions = _TIMING_COND_RE.findall(spec_lower)
+    congestion_conditions = _CONGESTION_COND_RE.findall(spec_lower)
+    if not timing_conditions and not congestion_conditions:
         # No parseable spec → satisfied when FEP == 0
         return (latest.get("failing_endpoints") or 0) == 0
 
@@ -1812,7 +2296,7 @@ def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
             return actual == threshold
         return False
 
-    for metric_alias, op, raw_threshold in conditions:
+    for metric_alias, op, raw_threshold in timing_conditions:
         data_key = _METRIC_MAP.get(metric_alias.replace(" ", "_"))
         if data_key is None:
             continue
@@ -1821,6 +2305,20 @@ def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
             return False
         if not _apply(op, float(actual), float(raw_threshold)):
             return False
+
+    if congestion_conditions:
+        summary = congestion_summary or {}
+        if not summary:
+            return False
+        for metric_alias, op, raw_threshold in congestion_conditions:
+            data_key = _CONGESTION_METRIC_MAP.get(metric_alias.lower())
+            if data_key is None:
+                continue
+            actual = summary.get(data_key)
+            if actual is None:
+                return False
+            if not _apply(op, float(actual), float(raw_threshold)):
+                return False
 
     return True
 
@@ -1831,7 +2329,11 @@ def _check_ppa_target(timing: dict[str, Any], target_spec: str) -> bool:
 _ORFS_STAGE_ORDER: list[str] = ["synth", "floorplan", "place", "cts", "route", "finish"]
 
 
-def _pick_bottleneck_stage(timing: dict[str, Any]) -> str:
+def _pick_bottleneck_stage(
+    timing: dict[str, Any],
+    run_id: int | None = None,
+    congestion_threshold_pct: float = 2.0,
+) -> str:
     """Choose which stage to re-run based on violation profile.
 
     Decision rules (checked in priority order):
@@ -1842,6 +2344,16 @@ def _pick_bottleneck_stage(timing: dict[str, Any]) -> str:
     - Otherwise → re-run place (general timing improvement)
     """
     summary = timing.get("summary", [{}])[0] if timing.get("summary") else {}
+    if run_id is not None:
+        try:
+            congestion = _query_congestion_summary(run_id)
+            overflow_h_pct = float(congestion.get("overflow_h_pct", 0.0) or 0.0)
+            overflow_v_pct = float(congestion.get("overflow_v_pct", 0.0) or 0.0)
+            if max(overflow_h_pct, overflow_v_pct) > congestion_threshold_pct:
+                return "place"
+        except Exception:
+            logger.debug("Failed to query congestion summary for run_id=%s", run_id, exc_info=True)
+
     hold_vio = summary.get("hold_violations") or 0
     setup_vio = summary.get("setup_violations") or 0
     wns = summary.get("wns_ns") or 0.0
@@ -1961,8 +2473,14 @@ def _tune_ppa_multistage(
                 iteration_record["improved"] = True
 
         # Check target
-        target_met = _check_ppa_target(last_timing, target_spec)
+        final_congestion_summary = _query_congestion_summary(last_run_id) if last_run_id else {}
+        target_met = _check_ppa_target(
+            last_timing,
+            target_spec,
+            congestion_summary=final_congestion_summary,
+        )
         iteration_record["target_met"] = target_met
+        iteration_record["congestion_summary"] = final_congestion_summary
         history.append(iteration_record)
 
         if target_met:
@@ -1971,7 +2489,7 @@ def _tune_ppa_multistage(
 
         if iteration < max_iterations and last_run_id is not None:
             # Pick bottleneck stage and suggest params for it
-            bottleneck = _pick_bottleneck_stage(last_timing)
+            bottleneck = _pick_bottleneck_stage(last_timing, run_id=last_run_id)
 
             augmented_spec = target_spec
             if not iteration_record["improved"] and iteration > 1:
@@ -2049,12 +2567,15 @@ _TOOL_DISPATCH = {
     "get_run_log": _get_run_log,
     "query_timing": _query_timing,
     "query_congestion": _query_congestion,
+    "query_congestion_summary": _query_congestion_summary,
     "query_utilization": _query_utilization,
     "query_power": _query_power,
     "compare_runs": _compare_runs,
     "suggest_params": _suggest_params,
     "tune_ppa": _tune_ppa,
     "tune_ppa_multistage": _tune_ppa_multistage,
+    "add_placement_blockage": _add_placement_blockage,
+    "tune_congestion_with_blockage": _tune_congestion_with_blockage,
     # Async job queue tools
     "submit_job": _submit_job,
     "job_status": _job_status,

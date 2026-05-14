@@ -14,6 +14,7 @@ from eda_agent.parsers.base import BaseParser, ParseError
 from eda_agent.parsers.congestion import CongestionParser
 from eda_agent.parsers.drc import DRCParser
 from eda_agent.parsers.innovus_congestion import InnovusCongestionParser
+from eda_agent.parsers.innovus_congestion_map import InnovusCongestionMapParser
 from eda_agent.parsers.innovus_drc import InnovusDRCParser
 from eda_agent.parsers.innovus_power import InnovusPowerParser
 from eda_agent.parsers.innovus_timing import InnovusTimingParser
@@ -33,6 +34,7 @@ _PARSER_REGISTRY: dict[str, BaseParser] = {
     "innovus_utilization": InnovusUtilizationParser(),
     "innovus_drc": InnovusDRCParser(),
     "innovus_congestion": InnovusCongestionParser(),
+    "innovus_congestion_map": InnovusCongestionMapParser(),
 }
 
 
@@ -70,6 +72,7 @@ __all__ = [
     "InnovusPowerParser",
     "InnovusUtilizationParser",
     "InnovusDRCParser",
+    "InnovusCongestionMapParser",
     "get_parser",
     "register_parser",
 ]

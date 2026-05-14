@@ -41,6 +41,8 @@ _INNOVUS_REPORT_PATTERNS = {
         ("*area*.rpt", "innovus_utilization"),
         ("*geom*.rpt", "innovus_drc"),
         ("*drc*.rpt", "innovus_drc"),
+        ("*congestion_map*.rpt", "innovus_congestion_map"),
+        ("*congestion*.rpt", "innovus_congestion"),
     ],
     "cts": [
         ("*cts*.rpt", "innovus_timing"),
@@ -54,7 +56,8 @@ _INNOVUS_REPORT_PATTERNS = {
         ("*power*.rpt", "innovus_power"),
         ("*drc*.rpt", "innovus_drc"),
         ("*geom*.rpt", "innovus_drc"),
-        ("*congestion*.rpt", "congestion"),
+        ("*congestion_map*.rpt", "innovus_congestion_map"),
+        ("*congestion*.rpt", "innovus_congestion"),
     ],
     "signoff": [
         ("*timing*.rpt", "innovus_timing"),
@@ -230,6 +233,77 @@ class InnovusBackend(AbstractEDABackend):
                     )
 
         return files
+
+    def add_blockage_to_design_state(
+        self,
+        *,
+        design_name: str,
+        blockage_specs: list[dict[str, Any]],
+        workdir: str | None = None,
+        stage: str = "place",
+    ) -> dict[str, Any]:
+        """Write and apply placement blockages to remote Innovus design state."""
+        if not blockage_specs:
+            raise ValueError("blockage_specs cannot be empty")
+        remote_workdir = (workdir or self._workdir).strip()
+        output_dir = f"{remote_workdir}/FPR/work/{stage}"
+        saved_dir = f"{remote_workdir}/FPR/saved"
+        blockages_tcl = f"{output_dir}/blockages.tcl"
+        apply_tcl = f"{output_dir}/apply_blockages.tcl"
+
+        cmds: list[str] = []
+        for idx, spec in enumerate(blockage_specs, start=1):
+            btype = str(spec.get("type", "soft")).strip().lower()
+            if btype not in {"soft", "hard", "partial"}:
+                raise ValueError(f"Unsupported blockage type at index {idx}: {btype}")
+            try:
+                x1 = float(spec["x1"])
+                y1 = float(spec["y1"])
+                x2 = float(spec["x2"])
+                y2 = float(spec["y2"])
+            except KeyError as exc:
+                raise ValueError(f"Missing blockage coordinate at index {idx}: {exc}") from exc
+            if x2 <= x1 or y2 <= y1:
+                raise ValueError(f"Invalid blockage bbox at index {idx}: ({x1},{y1})-({x2},{y2})")
+            cmds.append(
+                "createPlaceBlockage -type "
+                f"{shlex.quote(btype)} -box {{{x1} {y1} {x2} {y2}}}"
+            )
+
+        script_body = "\n".join(cmds) + "\n"
+        quoted_blockage = shlex.quote(script_body)
+
+        write_script_cmd = (
+            f"mkdir -p {shlex.quote(output_dir)} && "
+            f"cat > {shlex.quote(blockages_tcl)} <<'EOF'\n{script_body}EOF\n"
+        )
+        write_result = self._ssh_run(write_script_cmd, timeout=30)
+        if write_result.returncode != 0:
+            raise RuntimeError("Failed to write remote blockages.tcl")
+
+        apply_body = (
+            f"restoreDesign {saved_dir}/pr.inv.dat {design_name}\n"
+            f"source {blockages_tcl}\n"
+            f"saveDesign {saved_dir}/pr.inv.dat\n"
+            "exit 0\n"
+        )
+        apply_cmd = (
+            f"cat > {shlex.quote(apply_tcl)} <<'EOF'\n{apply_body}EOF\n"
+            f"cd {shlex.quote(remote_workdir)} && "
+            f"{shlex.quote(self._innovus_bin)} -no_gui -overwrite -files {shlex.quote(apply_tcl)}"
+        )
+        apply_result = self._ssh_run(apply_cmd, timeout=120)
+        if apply_result.returncode != 0:
+            raise RuntimeError("Failed to apply placement blockages in Innovus")
+
+        return {
+            "status": "success",
+            "workdir": remote_workdir,
+            "stage": stage,
+            "blockage_file": blockages_tcl,
+            "blockage_count": len(blockage_specs),
+            "script_preview": quoted_blockage,
+        }
 
     def _ssh_run(self, remote_cmd: str, timeout: int) -> subprocess.CompletedProcess[str]:
         backoff = self._connect_initial_backoff
