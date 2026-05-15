@@ -97,7 +97,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "backend": {
                         "type": "string",
-                        "description": "Backend name: 'orfs', 'innovus', 'icc2', or custom.",
+                        "description": "Backend name: 'orfs', 'innovus', 'icc2', or custom. 如果用户提到 'place' 但没有指定 backend，默认使用 'innovus'。",
                     },
                     "stage": {
                         "type": "string",
@@ -120,9 +120,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "Key-value EDA parameters (e.g. CORE_UTILIZATION).",
                     },
                 },
-                "required": ["backend", "stage", "design_name", "design_config", "pdk"],
+                "required": ["backend", "stage", "design_name"],
             },
         },
+        # 注：design_config 和 pdk 对某些 backend（如 innovus）可从 settings 自动获取
     },
     {
         "type": "function",
@@ -168,7 +169,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "If true, run 'make clean' before starting to force rerun all stages.",
                     },
                 },
-                "required": ["backend", "stage_start", "design_name", "design_config", "pdk"],
+                "required": ["backend", "stage_start", "design_name"],
             },
         },
     },
@@ -380,7 +381,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "Optional Innovus remote workdir override.",
                     },
                 },
-                "required": ["backend", "design_name", "design_config", "pdk"],
+                "required": ["backend", "design_name"],
             },
         },
     },
@@ -545,7 +546,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "Execution mode: 'stage' (single stage) or 'flow' (sequence of stages). Default: 'stage'.",
                     },
                 },
-                "required": ["backend", "design_name", "design_config", "pdk"],
+                "required": ["backend", "design_name"],
             },
         },
     },
@@ -730,10 +731,30 @@ def _run_eda_stage(
     backend: str,
     stage: str,
     design_name: str,
-    design_config: str,
-    pdk: str,
+    design_config: str | None = None,
+    pdk: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # 对于 innovus，可以从 settings 自动获取配置
+    if not backend:
+        # 根据 stage 名称自动推断 backend
+        if stage in ("place", "cts", "route", "floorplan", "powerplan", "prects", "postcts", "postroute", "signoff"):
+            backend = "innovus"
+        else:
+            backend = "orfs"
+    
+    if backend.lower() == "innovus":
+        from eda_agent.config import settings
+        if not design_config:
+            design_config = settings.innovus_remote_workdir
+        if not pdk:
+            pdk = "tsmc18"
+    
+    if not design_config:
+        raise ValueError("design_config is required. For innovus, set INNOVUS_REMOTE_WORKDIR in config.")
+    if not pdk:
+        raise ValueError("pdk is required. For innovus, default is tsmc18.")
+
     be = get_backend(backend)
     design = DesignSpec(
         name=design_name,
