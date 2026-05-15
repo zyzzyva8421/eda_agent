@@ -112,3 +112,23 @@ def test_orfs_is_available_without_install(tmp_path):
     """ORFSBackend.is_available() returns False when the path doesn't exist."""
     b = ORFSBackend(orfs_root=tmp_path / "nonexistent")
     assert not b.is_available()
+
+
+def test_innovus_stage_scripts_restore_previous_stage_outputs():
+    from pathlib import Path
+
+    base = Path("/home/aliu/eda_agent/eda_agent/backends/scripts/innovus")
+    expectations = {
+        "powerplan.tcl": 'restoreDesign $design_dir/work/floorplan/floorplan.dat $design_name',
+        "place.tcl": 'restoreDesign $design_dir/work/powerplan/powerplan.dat $design_name',
+        "prects.tcl": 'restoreDesign $design_dir/work/place/place.dat $design_name',
+        "cts.tcl": 'restoreDesign $design_dir/work/prects/prects.dat $design_name',
+        "postcts.tcl": 'restoreDesign $design_dir/work/cts/cts.dat $design_name',
+        "route.tcl": 'restoreDesign $design_dir/work/postcts/postcts.dat $design_name',
+        "postroute.tcl": 'restoreDesign $design_dir/work/route/route.dat $design_name',
+        "signoff.tcl": 'restoreDesign $postroute_dir/postroute.dat $design_name',
+    }
+
+    for file_name, needle in expectations.items():
+        text = (base / file_name).read_text()
+        assert needle in text, f"{file_name} must restore from previous stage output"

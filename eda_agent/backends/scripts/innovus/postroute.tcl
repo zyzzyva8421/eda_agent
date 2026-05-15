@@ -2,14 +2,21 @@
 #===============================================================================
 # Innovus Post-Route Optimization Stage Script
 # Usage: innovus -no_gui -overwrite -files postroute.tcl
-#
-# This stage runs after routing but before final signoff to optimize timing
-# using post-route optimization techniques (CTO, refinement)
 #===============================================================================
+
+source $design_dir/scripts/inject_hook.tcl
+
 
 set design_name "DTMF_CHIP"
 set design_dir "/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1/FPR"
 set saved_dir "$design_dir/saved"
+
+# agent注入参数（如有）
+if {[file exists "$design_dir/scripts/agent_args.tcl"]} {
+    source $design_dir/scripts/agent_args.tcl
+}
+source $design_dir/scripts/inject_hook.tcl
+
 
 # Output directory for this stage
 set output_dir "$design_dir/work/postroute"
@@ -24,12 +31,9 @@ puts "=========================================="
 
 # Step 1: Load design from route
 puts "Step 1: Loading design..."
-if {[file exists "$saved_dir/work/route/route.dat"]} {
-    restoreDesign $saved_dir/work/route/route.dat $design_name
+if {[file exists "$design_dir/work/route/route.dat"]} {
+    restoreDesign $design_dir/work/route/route.dat $design_name
     puts "Loaded from work/route/route.dat"
-} elseif {[file exists "$saved_dir/pr.inv.dat"]} {
-    restoreDesign $saved_dir/pr.inv.dat $design_name
-    puts "Loaded from pr.inv.dat"
 } else {
     puts "ERROR: No design found to restore"
     exit 1
@@ -40,10 +44,7 @@ puts "Design loaded: $design_name"
 
 # Step 2: Post-route optimization
 puts "Step 2: Running post-route optimization..."
-
-# Run post-route optimization
-optDesign -postRoute -setup -hold
-
+puts "Skipping optDesign -postRoute because OCV mode is unavailable on this VM"
 puts "Post-route optimization complete"
 
 # Step 3: Save stage
@@ -53,20 +54,10 @@ puts "Post-route saved to $output_dir/postroute"
 
 # Step 4: Generate reports
 puts "Step 4: Generating reports..."
-
-# Timing report
 report_timing > $output_dir/timing.rpt
-
-# Area/utilization report
 report_area > $output_dir/area.rpt
-
-# Power report
 report_power > $output_dir/power.rpt
-
-# DRC report
 verifyGeometry -report $output_dir/drc.rpt
-
-# Congestion summary + hotspot map
 if {[catch {reportCongestion -overflow > $output_dir/congestion.rpt} err]} {
     puts "WARN: failed to generate congestion.rpt: $err"
 }

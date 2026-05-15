@@ -4,9 +4,19 @@
 # Usage: innovus -no_gui -overwrite -files powerplan.tcl
 #===============================================================================
 
+source $design_dir/scripts/inject_hook.tcl
+
+
 set design_name "DTMF_CHIP"
 set design_dir "/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1/FPR"
 set saved_dir "$design_dir/saved"
+
+# agent注入参数（如有）
+if {[file exists "$design_dir/scripts/agent_args.tcl"]} {
+    source $design_dir/scripts/agent_args.tcl
+}
+source $design_dir/scripts/inject_hook.tcl
+
 
 # Output directory for this stage
 set output_dir "$design_dir/work/powerplan"
@@ -21,9 +31,9 @@ puts "=========================================="
 
 # Step 1: Load design from floorplan
 puts "Step 1: Loading design..."
-if {[file exists "$saved_dir/pr.inv.dat"]} {
-    restoreDesign $saved_dir/pr.inv.dat $design_name
-    puts "Loaded from pr.inv.dat"
+if {[file exists "$design_dir/work/floorplan/floorplan.dat"]} {
+    restoreDesign $design_dir/work/floorplan/floorplan.dat $design_name
+    puts "Loaded from work/floorplan/floorplan.dat"
 } else {
     puts "ERROR: No design found to restore"
     exit 1

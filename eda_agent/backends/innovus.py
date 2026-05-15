@@ -282,18 +282,21 @@ class InnovusBackend(AbstractEDABackend):
         workdir: str | None = None,
         stage: str = "place",
     ) -> dict[str, Any]:
-        """Write and apply placement blockages to remote Innovus design state."""
+        """Apply placement blockages using inject_hook mechanism.
+
+        Generates agent_args.tcl with INJECT_PLACEDESIGN_BEFORE variable,
+        which is sourced by place.tcl before placeDesign for dynamic injection.
+        """
         if not blockage_specs:
             raise ValueError("blockage_specs cannot be empty")
         base_workdir = workdir if workdir is not None else self._workdir
         if not base_workdir:
             raise ValueError("Innovus remote workdir is not configured")
         remote_workdir = str(base_workdir).strip()
-        output_dir = f"{remote_workdir}/FPR/work/{stage}"
-        saved_dir = f"{remote_workdir}/FPR/saved"
-        blockages_tcl = f"{output_dir}/blockages.tcl"
-        apply_tcl = f"{output_dir}/apply_blockages.tcl"
+        scripts_dir = f"{remote_workdir}/FPR/scripts"
+        agent_args_tcl = f"{scripts_dir}/agent_args.tcl"
 
+        # Generate injection commands for each blockage spec
         cmds: list[str] = []
         for idx, spec in enumerate(blockage_specs, start=1):
             btype = str(spec.get("type", "soft")).strip().lower()
@@ -308,42 +311,36 @@ class InnovusBackend(AbstractEDABackend):
                 raise ValueError(f"Missing blockage coordinate at index {idx}: {exc}") from exc
             if x2 <= x1 or y2 <= y1:
                 raise ValueError(f"Invalid blockage bbox at index {idx}: ({x1},{y1})-({x2},{y2})")
+            reason = spec.get("reason", f"llm_blockage_{idx}")
             cmds.append(
-                "createPlaceBlockage -type "
-                f"{shlex.quote(btype)} -box {{{x1} {y1} {x2} {y2}}}"
+                f'    puts "== INJECTED blockage {idx}: {reason} =="\n'
+                f'    createPlaceBlockage -box {int(x1)} {int(y1)} {int(x2)} {int(y2)} -type {btype}'
             )
 
-        script_body = "\n".join(cmds) + "\n"
+        # Generate agent_args.tcl with INJECT_PLACEDESIGN_BEFORE variable
+        script_body = (
+            "# Auto-generated agent_args.tcl for placement blockage injection\n"
+            "# This file is sourced by place.tcl before inject_hook.tcl\n"
+            "set ::INJECT_PLACEDESIGN_BEFORE {\n"
+            + "\n".join(cmds) + "\n"
+            "}\n"
+        )
 
         write_script_cmd = (
-            f"mkdir -p {shlex.quote(output_dir)} && "
-            f"cat > {shlex.quote(blockages_tcl)} <<'EOF'\n{script_body}EOF\n"
+            f"mkdir -p {shlex.quote(scripts_dir)} && "
+            f"cat > {shlex.quote(agent_args_tcl)} <<'EOF'\n{script_body}EOF\n"
         )
         write_result = self._ssh_run(write_script_cmd, timeout=30)
         if write_result.returncode != 0:
-            raise RuntimeError("Failed to write remote blockages.tcl")
-
-        apply_body = (
-            f"restoreDesign {saved_dir}/pr.inv.dat {design_name}\n"
-            f"source {blockages_tcl}\n"
-            f"saveDesign {saved_dir}/pr.inv.dat\n"
-            "exit 0\n"
-        )
-        apply_cmd = (
-            f"cat > {shlex.quote(apply_tcl)} <<'EOF'\n{apply_body}EOF\n"
-            f"cd {shlex.quote(remote_workdir)} && "
-            f"{shlex.quote(self._innovus_bin)} -no_gui -overwrite -files {shlex.quote(apply_tcl)}"
-        )
-        apply_result = self._ssh_run(apply_cmd, timeout=120)
-        if apply_result.returncode != 0:
-            raise RuntimeError("Failed to apply placement blockages in Innovus")
+            raise RuntimeError("Failed to write remote agent_args.tcl")
 
         return {
             "status": "success",
             "workdir": remote_workdir,
             "stage": stage,
-            "blockage_file": blockages_tcl,
+            "injection_file": agent_args_tcl,
             "blockage_count": len(blockage_specs),
+            "mechanism": "inject_hook",
         }
 
     def _ssh_run(self, remote_cmd: str, timeout: int) -> subprocess.CompletedProcess[str]:
