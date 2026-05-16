@@ -4,22 +4,40 @@
 # Usage: innovus -no_gui -overwrite -files powerplan.tcl
 #===============================================================================
 
-source $design_dir/scripts/inject_hook.tcl
+# Get job-specific workdir from environment (fallback to default)
+if {[info exists ::env(JOB_WORKDIR)] && $::env(JOB_WORKDIR) ne ""} {
+    set job_workdir $::env(JOB_WORKDIR)
+} else {
+    set job_workdir "/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1"
+}
 
+# Previous stage name (for restore)
+if {[info exists ::env(PREV_STAGE)] && $::env(PREV_STAGE) ne ""} {
+    set prev_stage $::env(PREV_STAGE)
+} else {
+    set prev_stage "floorplan"
+}
+
+# Previous job's workdir (for direct restore without copy)
+if {[info exists ::env(PREV_JOB_DIR)] && $::env(PREV_JOB_DIR) ne ""} {
+    set prev_job_dir $::env(PREV_JOB_DIR)
+} else {
+    set prev_job_dir ""
+}
 
 set design_name "DTMF_CHIP"
-set design_dir "/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1/FPR"
+set design_dir "$job_workdir/FPR"
 set saved_dir "$design_dir/saved"
+set work_dir "$job_workdir/FPR/work"
+set prev_work_dir "$prev_job_dir/FPR/work"
 
-# agent注入参数（如有）
-if {[file exists "$design_dir/scripts/agent_args.tcl"]} {
-    source $design_dir/scripts/agent_args.tcl
+# Inject hook
+if {[file exists "$job_workdir/scripts/inject_hook.tcl"]} {
+    source $job_workdir/scripts/inject_hook.tcl
 }
-source $design_dir/scripts/inject_hook.tcl
-
 
 # Output directory for this stage
-set output_dir "$design_dir/work/powerplan"
+set output_dir "$work_dir/powerplan"
 file mkdir $output_dir
 
 suppressMessage ENCEXT-2799
@@ -27,15 +45,23 @@ encMessage warning 0
 
 puts "=========================================="
 puts "Innovus Powerplan Stage"
+puts "Job workdir: $job_workdir"
 puts "=========================================="
 
-# Step 1: Load design from floorplan
-puts "Step 1: Loading design..."
-if {[file exists "$design_dir/work/floorplan/floorplan.dat"]} {
-    restoreDesign $design_dir/work/floorplan/floorplan.dat $design_name
-    puts "Loaded from work/floorplan/floorplan.dat"
+# Step 1: Load design from previous stage
+# Prefer direct restore from previous job directory (no copy needed)
+puts "Step 1: Loading design from previous stage: $prev_stage..."
+if {$prev_job_dir ne ""} {
+    set prev_db "$prev_work_dir/$prev_stage/${prev_stage}.dat"
+    puts "Trying direct restore from prev_job_dir: $prev_db"
 } else {
-    puts "ERROR: No design found to restore"
+    set prev_db "$work_dir/$prev_stage/${prev_stage}.dat"
+}
+if {[file exists $prev_db]} {
+    restoreDesign $prev_db $design_name
+    puts "Loaded from $prev_db"
+} else {
+    puts "ERROR: No design found to restore from $prev_db"
     exit 1
 }
 
@@ -60,7 +86,7 @@ puts "Powerplan saved to $output_dir/powerplan"
 
 # Step 4: Generate reports
 puts "Step 4: Generating reports..."
-report_power -nosplit > $output_dir/power.rpt
+report_power > $output_dir/power.rpt
 
 puts "Reports generated"
 

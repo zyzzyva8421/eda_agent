@@ -42,7 +42,8 @@ _INNOVUS_REPORT_PATTERNS = {
         ("*geom*.rpt", "innovus_drc"),
         ("*drc*.rpt", "innovus_drc"),
         ("*congestion_map*.rpt", "innovus_congestion_map"),
-        ("*congestion*.rpt", "innovus_congestion"),
+        # Must come AFTER _map to avoid double-matching
+        ("*congestion.rpt", "innovus_congestion"),
     ],
     "prects": [
         ("*prects*.rpt", "innovus_timing"),
@@ -177,21 +178,134 @@ class InnovusBackend(AbstractEDABackend):
         # Auto-find script if not provided
         remote_tcl = str(params.get("tcl", "")).strip()
         remote_cmd = str(params.get("command", "")).strip()
+        
+        # Use shared workdir
         remote_workdir = str(params.get("workdir", self._workdir)).strip()
-
-        # Default script location on remote
-        default_script_dir = f"{remote_workdir}/scripts"
+        
+        # Job-specific workdir for isolation
+        job_workdir = f"{remote_workdir}/runs/{run_id}"
+        
+        # Get stage order for PREV_STAGE calculation
+        stage_order = ["floorplan", "powerplan", "place", "prects", "cts", "postcts", "route", "postroute", "signoff"]
+        try:
+            stage_idx = stage_order.index(stage)
+            prev_stage = stage_order[stage_idx - 1] if stage_idx > 0 else ""
+        except ValueError:
+            prev_stage = ""
+        
+        # Get local TCL scripts path
+        local_scripts_dir = Path(__file__).parent / "scripts" / "innovus"
+        
+        # Sync local TCL scripts to remote common directory (if local scripts exist)
+        if local_scripts_dir.exists():
+            sync_cmd = f"mkdir -p {shlex.quote(remote_workdir)}/scripts"
+            self._ssh_run(sync_cmd, timeout=30)
+            # Upload each TCL script
+            for tcl_file in local_scripts_dir.glob("*.tcl"):
+                if tcl_file.name.startswith("agent_args"):
+                    continue  # Skip agent_args templates, will be generated per-job
+                if tcl_file.name == "inject_hook.tcl":
+                    continue  # Will be synced separately or exists on remote
+                with open(tcl_file, "r") as f:
+                    tcl_content = f.read()
+                # Quote content for safe shell transfer
+                escaped_content = tcl_content.replace("'", "'\\''")
+                upload_cmd = f"cat > {shlex.quote(remote_workdir)}/scripts/{tcl_file.name} <<'TCLEOF'\n{escaped_content}\nTCLEOF"
+                self._ssh_run(upload_cmd, timeout=30)
+        
+        # Create job-specific directory with copied scripts and previous stage DB
+        # Key insight: 
+        # - First run (no prev_job_id): copy from common (remote_workdir)
+        # - Iterations (has prev_job_id): copy from previous job
+        prev_db_copy = ""
+        if stage == "floorplan":
+            # floorplan restores from initial saved design in common/FPR/saved
+            saved_design = f"{remote_workdir}/FPR/saved/{design.name}.dat"
+            prev_db_copy = (
+                f"&& mkdir -p {shlex.quote(job_workdir)}/FPR/saved && "
+                f"cp {saved_design} {shlex.quote(job_workdir)}/FPR/saved/ 2>/dev/null || true"
+            )
+        elif stage != "floorplan" and prev_stage:
+            prev_job_id = params.get("prev_job_id", "")
+            last_job_id = params.get("last_job_id", "")  # Previous stage's job ID
+            
+            if prev_job_id:
+                # Copy from previous iteration's output
+                prev_work_base = f"{remote_workdir}/runs/{prev_job_id}/FPR/work/{prev_stage}"
+            elif last_job_id:
+                # First run after previous stage, copy from previous stage's job output
+                prev_work_base = f"{remote_workdir}/runs/{last_job_id}/FPR/work/{prev_stage}"
+            else:
+                # Fallback: try common directory
+                prev_work_base = f"{remote_workdir}/FPR/work/{prev_stage}"
+            
+            prev_db_copy = (
+                f"&& mkdir -p {shlex.quote(job_workdir)}/FPR/work/{prev_stage} && "
+                f"cp -r {prev_work_base}/{prev_stage}.dat "
+                f"{shlex.quote(job_workdir)}/FPR/work/{prev_stage}/ 2>/dev/null || true"
+            )
+        
+        setup_cmd = (
+            f"mkdir -p {shlex.quote(job_workdir)}/scripts && "
+            f"mkdir -p {shlex.quote(job_workdir)}/FPR/work && "
+            f"cp -r {shlex.quote(remote_workdir)}/scripts/*.tcl {shlex.quote(job_workdir)}/scripts/ 2>/dev/null || true {prev_db_copy}"
+        )
+        self._ssh_run(setup_cmd, timeout=60)
+        
+        # For default script (not custom command), inherit from previous if exists
+        if not remote_cmd:
+            prev_agent_args = str(params.get("prev_agent_args", "")).strip()
+            
+            if prev_agent_args:
+                # Inherit previous injection
+                self._ssh_run(
+                    f"cp {shlex.quote(prev_agent_args)} {shlex.quote(job_workdir)}/scripts/agent_args_inherited.tcl",
+                    timeout=10
+                )
+            
+            agent_args_tcl = f"{job_workdir}/scripts/agent_args_{run_id}.tcl"
+            if prev_agent_args:
+                # Source inherited file
+                self._ssh_run(
+                    f'echo "source {job_workdir}/scripts/agent_args_inherited.tcl" > {shlex.quote(agent_args_tcl)}',
+                    timeout=10
+                )
+            
+            params["tcl"] = agent_args_tcl
+            params["_agent_args_inherited"] = f"{job_workdir}/scripts/agent_args_inherited.tcl"
+        
+        # Always use job-specific workdir
+        params["workdir"] = job_workdir
+        
+        # Default script location - use stage-specific script from job directory
+        default_script = f"{job_workdir}/scripts/{stage}.tcl"
         if not remote_tcl and not remote_cmd:
-            # Try to use stage-specific script
-            remote_tcl = f"{default_script_dir}/{stage}.tcl"
+            remote_tcl = default_script
 
         timeout_sec = int(params.get("timeout_sec", self._timeout_sec))
 
         if not remote_cmd:
             if not remote_tcl:
                 raise ValueError("Innovus stage requires params['tcl'] or params['command'].")
+            # Use job-specific workdir for execution with environment variables
+            use_workdir = str(params.get("workdir", job_workdir)).strip()
+            # Pass environment variables for job isolation and stage chaining
+            # JOB_WORKDIR: job-specific workdir
+            # PREV_STAGE: previous stage name (for restore)
+            # CASE_DIR: base case directory (for initial DB restore)
+            # PREV_JOB_DIR: previous job's workdir (for direct restore without copy)
+            env_vars = f"JOB_WORKDIR={shlex.quote(job_workdir)}"
+            if prev_stage:
+                env_vars += f" PREV_STAGE={shlex.quote(prev_stage)}"
+            if stage == "floorplan":
+                env_vars += f" CASE_DIR={shlex.quote(remote_workdir)}"
+            prev_job_id = params.get("last_job_id", "")
+            if prev_job_id:
+                # Pass previous job's directory for direct restore
+                env_vars += f" PREV_JOB_DIR={shlex.quote(remote_workdir)}/runs/{prev_job_id}"
             remote_cmd = (
-                f"cd {shlex.quote(remote_workdir)} && "
+                f"cd {shlex.quote(use_workdir)} && "
+                f"export {env_vars} && "
                 f"{shlex.quote(self._innovus_bin)} "
                 f"-no_gui -overwrite -files {shlex.quote(remote_tcl)}"
             )
@@ -199,10 +313,13 @@ class InnovusBackend(AbstractEDABackend):
         status = StageStatus.FAILED
         error_message = ""
         # report_dir is the local directory where reports will be copied to
+        # Use job-specific workdir for reports
+        use_workdir = str(params.get("workdir", job_workdir)).strip()
         remote_rpt_dir = str(params.get("report_dir", "")).strip() or (
-            f"{remote_workdir}/FPR/work/{stage}"
+            f"{use_workdir}/FPR/work/{stage}"
         )
-        local_report_dir = Path("/tmp/eda_agent/innovus") / design.name / stage / "reports"
+        # Use isolated local report dir for each run to avoid pollution
+        local_report_dir = Path("/tmp/eda_agent/innovus") / design.name / stage / run_id / "reports"
         if local_report_dir.exists():
             shutil.rmtree(local_report_dir)
         local_report_dir.mkdir(parents=True, exist_ok=True)
@@ -279,25 +396,53 @@ class InnovusBackend(AbstractEDABackend):
         *,
         design_name: str,
         blockage_specs: list[dict[str, Any]],
-        workdir: str | None = None,
+        run_id: str | None = None,
+        job_workdir: str | None = None,
+        prev_agent_args: str | None = None,
         stage: str = "place",
     ) -> dict[str, Any]:
         """Apply placement blockages using inject_hook mechanism.
 
         Generates agent_args.tcl with INJECT_PLACEDESIGN_BEFORE variable,
         which is sourced by place.tcl before placeDesign for dynamic injection.
+        
+        Args:
+            run_id: Current run ID for job-specific file naming
+            job_workdir: Job-specific workdir (e.g., {base}/runs/{run_id})
+            prev_agent_args: Previous run's agent_args.tcl to inherit from
         """
         if not blockage_specs:
             raise ValueError("blockage_specs cannot be empty")
-        base_workdir = workdir if workdir is not None else self._workdir
+        
+        base_workdir = job_workdir if job_workdir else self._workdir
         if not base_workdir:
             raise ValueError("Innovus remote workdir is not configured")
         remote_workdir = str(base_workdir).strip()
+        
+        # Use job-specific directory if run_id provided
+        if run_id and not job_workdir:
+            remote_workdir = f"{self._workdir}/runs/{run_id}"
+        
         scripts_dir = f"{remote_workdir}/FPR/scripts"
-        agent_args_tcl = f"{scripts_dir}/agent_args.tcl"
-
+        
+        # Generate run_id if not provided
+        if not run_id:
+            run_id = str(uuid.uuid4())
+        
+        # Job-specific agent_args file
+        agent_args_tcl = f"{scripts_dir}/agent_args_{run_id}.tcl"
+        
+        # Inherit from previous if provided
+        inherited_cmds = []
+        if prev_agent_args:
+            # Read previous agent_args.tcl to extract commands
+            read_prev = self._ssh_run(f"cat {prev_agent_args}", timeout=10)
+            if read_prev.returncode == 0 and read_prev.stdout:
+                inherited_cmds.append(f"# Inherited from previous run")
+                inherited_cmds.append(f"source {shlex.quote(prev_agent_args)}")
+        
         # Generate injection commands for each blockage spec
-        cmds: list[str] = []
+        cmds: list[str] = inherited_cmds + []
         for idx, spec in enumerate(blockage_specs, start=1):
             btype = str(spec.get("type", "soft")).strip().lower()
             if btype not in {"soft", "hard", "partial"}:
@@ -319,7 +464,7 @@ class InnovusBackend(AbstractEDABackend):
 
         # Generate agent_args.tcl with INJECT_PLACEDESIGN_BEFORE variable
         script_body = (
-            "# Auto-generated agent_args.tcl for placement blockage injection\n"
+            f"# Auto-generated agent_args.tcl for run {run_id}\n"
             "# This file is sourced by place.tcl before inject_hook.tcl\n"
             "set ::INJECT_PLACEDESIGN_BEFORE {\n"
             + "\n".join(cmds) + "\n"
@@ -336,11 +481,14 @@ class InnovusBackend(AbstractEDABackend):
 
         return {
             "status": "success",
+            "run_id": run_id,
             "workdir": remote_workdir,
             "stage": stage,
             "injection_file": agent_args_tcl,
-            "blockage_count": len(blockage_specs),
+            "injection_commands": cmds,
+            "prev_agent_args": prev_agent_args,
             "mechanism": "inject_hook",
+            "blockage_count": len(blockage_specs),
         }
 
     def _ssh_run(self, remote_cmd: str, timeout: int) -> subprocess.CompletedProcess[str]:

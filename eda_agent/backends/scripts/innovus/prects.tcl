@@ -4,19 +4,37 @@
 # Usage: innovus -no_gui -overwrite -files prects.tcl
 #===============================================================================
 
-# 注入钩子，支持 agent 侧参数注入
-source $design_dir/scripts/inject_hook.tcl
+# Get job-specific workdir from environment (fallback to default)
+if {[info exists ::env(JOB_WORKDIR)] && $::env(JOB_WORKDIR) ne ""} {
+    set job_workdir $::env(JOB_WORKDIR)
+} else {
+    set job_workdir "/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1"
+}
 
+# Previous stage name (for restore)
+if {[info exists ::env(PREV_STAGE)] && $::env(PREV_STAGE) ne ""} {
+    set prev_stage $::env(PREV_STAGE)
+} else {
+    set prev_stage "place"
+}
+
+# Previous job's workdir (for direct restore without copy)
+if {[info exists ::env(PREV_JOB_DIR)] && $::env(PREV_JOB_DIR) ne ""} {
+    set prev_job_dir $::env(PREV_JOB_DIR)
+} else {
+    set prev_job_dir ""
+}
 
 set design_name "DTMF_CHIP"
-set design_dir "/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1/FPR"
+set design_dir "$job_workdir/FPR"
 set saved_dir "$design_dir/saved"
+set work_dir "$job_workdir/FPR/work"
+set prev_work_dir "$prev_job_dir/FPR/work"
 
-# agent注入参数（如有）
-if {[file exists "$design_dir/scripts/agent_args.tcl"]} {
-    source $design_dir/scripts/agent_args.tcl
+# Inject hook
+if {[file exists "$job_workdir/scripts/inject_hook.tcl"]} {
+    source $job_workdir/scripts/inject_hook.tcl
 }
-source $design_dir/scripts/inject_hook.tcl
 
 
 # Output directory for this stage
@@ -30,13 +48,19 @@ puts "=========================================="
 puts "Innovus Pre-CTS Optimization Stage"
 puts "=========================================="
 
-# Step 1: Load design from placement
-puts "Step 1: Loading design..."
-if {[file exists "$design_dir/work/place/place.dat"]} {
-    restoreDesign $design_dir/work/place/place.dat $design_name
-    puts "Loaded from work/place/place.dat"
+# Step 1: Load design from previous stage
+puts "Step 1: Loading design from previous stage: $prev_stage..."
+if {$prev_job_dir ne ""} {
+    set prev_db "$prev_work_dir/$prev_stage/${prev_stage}.dat"
+    puts "Trying direct restore from prev_job_dir: $prev_db"
 } else {
-    puts "ERROR: No design found to restore"
+    set prev_db "$work_dir/$prev_stage/${prev_stage}.dat"
+}
+if {[file exists $prev_db]} {
+    restoreDesign $prev_db $design_name
+    puts "Loaded from $prev_db"
+} else {
+    puts "ERROR: No design found to restore from $prev_db"
     exit 1
 }
 
