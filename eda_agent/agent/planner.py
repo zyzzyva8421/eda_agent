@@ -32,6 +32,7 @@ import httpx
 from eda_agent.agent.memory import AgentMemory, Message, search_similar_cases
 from eda_agent.agent.tools import TOOL_SCHEMAS, execute_tool
 from eda_agent.config import settings
+from eda_agent.tracing import is_tracing_enabled, trace_chat
 
 logger = logging.getLogger(__name__)
 
@@ -270,7 +271,17 @@ class Planner:
         with httpx.Client(timeout=120, transport=transport) as client:
             resp = client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
-            return resp.json()
+            raw_response = resp.json()
+
+        # Trace the LLM call if enabled
+        if is_tracing_enabled():
+            raw_response = trace_chat(
+                messages=payload["messages"],
+                response=raw_response,
+                model=self._model,
+            )
+
+        return raw_response
 
     def _extract_and_store_context(
         self,

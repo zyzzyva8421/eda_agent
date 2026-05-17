@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO")
 
+    # ── LangSmith ────────────────────────────────────────────────────────────
+    langsmith_api_key: str = Field(default="")
+    langsmith_endpoint: str = Field(default="https://api.smith.langchain.com")
+    langsmith_project: str = Field(default="eda-agent-dev")
+    langsmith_enabled: bool = Field(default=False)
+
     @model_validator(mode="after")
     def _warn_insecure_defaults(self) -> "Settings":
         import warnings

@@ -47,6 +47,7 @@ from eda_agent.backends.base import DesignSpec
 from eda_agent.config import settings
 from eda_agent.db.session import get_db
 from eda_agent.parsers import get_parser
+from eda_agent.tracing import is_tracing_enabled, trace_chat
 
 logger = logging.getLogger(__name__)
 
@@ -1862,8 +1863,17 @@ def _llm_suggest_params(
     with httpx.Client(timeout=60, proxy=None) as client:
         resp = client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
-        data = resp.json()
+        raw_response = resp.json()
 
+    # Trace the LLM call if enabled
+    if is_tracing_enabled():
+        raw_response = trace_chat(
+            messages=payload["messages"],
+            response=raw_response,
+            model=model,
+        )
+
+    data = raw_response
     content = data["choices"][0]["message"]["content"]
     # Strip possible markdown code fence
     content = content.strip()
