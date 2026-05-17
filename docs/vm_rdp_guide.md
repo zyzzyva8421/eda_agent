@@ -1,4 +1,4 @@
-# Connecting to Cadence VM via RDP
+# Connecting to Cadence VM
 
 ## Prerequisites
 
@@ -10,9 +10,33 @@
    ping -c 1 192.168.58.10
    ```
 
-2. **VRDE is enabled** on port `3389`
+## Option 1: Using SSH (Recommended for CLI)
 
-## Option 1: Using Remmina (GUI)
+SSH is recommended for running Innovus and automated flows.
+
+```bash
+# Using sshpass (with password)
+sshpass -p linuxserver ssh -o StrictHostKeyChecking=no host@192.168.58.10
+
+# Or set up passwordless SSH
+ssh-copy-id host@192.168.58.10  # Run once to configure
+ssh host@192.168.58.10
+```
+
+To transfer files:
+```bash
+# Copy to VM
+scp design.gds host@192.168.58.10:/home/host/designs/
+
+# Copy from VM
+scp host@192.168.58.10:/home/host/designs/output.tar.gz .
+```
+
+## Option 2: Using RDP (GUI)
+
+RDP requires VRDE enabled on port `3389`. Use for desktop GUI access only.
+
+### Using Remmina (GUI)
 
 ```bash
 remmina
@@ -27,7 +51,7 @@ Then:
    - **Password**: `linuxserver`
 3. Click **Connect**
 
-## Option 2: Using xfreerdp (command line)
+### Using xfreerdp (command line)
 
 ```bash
 xfreerdp /u:host /p:linuxserver /v:192.168.58.10
@@ -38,7 +62,7 @@ Or with compression:
 xfreerdp /u:host /p:linuxserver /v:192.168.58.10 /compression +clipboard
 ```
 
-## Option 3: Using rdesktop
+### Using rdesktop
 
 ```bash
 rdesktop -u host -p linuxserver 192.168.58.10

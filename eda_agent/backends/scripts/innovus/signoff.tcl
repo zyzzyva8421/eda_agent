@@ -63,7 +63,7 @@ if {[file exists $prev_db]} {
     puts "ERROR: No design found to restore from $prev_db"
     exit 1
 }
-}
+
 
 setDrawView place
 puts "Design loaded: $design_name"

@@ -1175,7 +1175,8 @@ def _query_congestion_summary(run_id: int) -> dict[str, Any]:
                 FROM artifacts
                 WHERE run_id = :run_id
                   AND artifact_type IN ('innovus_congestion', 'congestion')
-                ORDER BY id DESC
+                  AND file_path NOT LIKE '%_map.rpt'
+                ORDER BY id ASC
                 LIMIT 1
                 """
             ),
@@ -1858,7 +1859,7 @@ def _llm_suggest_params(
         "Content-Type": "application/json",
     }
 
-    with httpx.Client(timeout=60) as client:
+    with httpx.Client(timeout=60, proxy=None) as client:
         resp = client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
