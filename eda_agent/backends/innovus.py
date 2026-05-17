@@ -257,15 +257,41 @@ class InnovusBackend(AbstractEDABackend):
             prev_agent_args = str(params.get("prev_agent_args", "")).strip()
             
             if prev_agent_args:
-                # Inherit previous injection
-                self._ssh_run(
-                    f"cp {shlex.quote(prev_agent_args)} {shlex.quote(job_workdir)}/scripts/agent_args_inherited.tcl",
-                    timeout=10
-                )
+                # Determine previous run's scripts directory
+                if "/scripts/agent_args_" in prev_agent_args:
+                    # prev_agent_args points to agent_args_{run_id}.tcl
+                    prev_scripts_dir = prev_agent_args.replace("/scripts/agent_args_", "/scripts/").rsplit("/", 1)[0]
+                elif "/scripts/agent_args.tcl" in prev_agent_args:
+                    # prev_agent_args points to agent_args.tcl (base)
+                    prev_scripts_dir = prev_agent_args.replace("/scripts/agent_args.tcl", "/scripts")
+                else:
+                    prev_scripts_dir = None
+                
+                if prev_scripts_dir:
+                    # Copy all agent_args files from previous run
+                    self._ssh_run(
+                        f"cp {shlex.quote(prev_scripts_dir)}/agent_args_*.tcl {shlex.quote(job_workdir)}/scripts/ 2>/dev/null || true",
+                        timeout=10
+                    )
+                    # Also copy agent_args.tcl (base, may be empty)
+                    self._ssh_run(
+                        f"cp {shlex.quote(prev_scripts_dir)}/agent_args.tcl {shlex.quote(job_workdir)}/scripts/ 2>/dev/null || true",
+                        timeout=10
+                    )
             
             agent_args_tcl = f"{job_workdir}/scripts/agent_args_{run_id}.tcl"
             if prev_agent_args:
-                # Source inherited file
+                # Create agent_args_inherited.tcl that sources the previous run's agent_args
+                inherited_src = prev_agent_args.replace("/scripts/agent_args.tcl", "/scripts/agent_args_*.tcl").rsplit("/", 1)[0]
+                # Find the actual previous agent_args file (pattern: agent_args_{uuid}.tcl)
+                create_inherited = (
+                    f'prev_scripts=$(ls {inherited_src}/agent_args_*.tcl 2>/dev/null | tail -1) && '
+                    f'if [ -n "$prev_scripts" ]; then '
+                    f'echo "source $prev_scripts" > {job_workdir}/scripts/agent_args_inherited.tcl; '
+                    f'else echo "# no previous agent_args" > {job_workdir}/scripts/agent_args_inherited.tcl; fi'
+                )
+                self._ssh_run(create_inherited, timeout=10)
+                # Source inherited file in new agent_args
                 self._ssh_run(
                     f'echo "source {job_workdir}/scripts/agent_args_inherited.tcl" > {shlex.quote(agent_args_tcl)}',
                     timeout=10
@@ -312,7 +338,7 @@ class InnovusBackend(AbstractEDABackend):
 
         status = StageStatus.FAILED
         error_message = ""
-        # report_dir is the local directory where reports will be copied to
+        probe_ok, probe_msg = self._wait_for_connectivity()
         # Use job-specific workdir for reports
         use_workdir = str(params.get("workdir", job_workdir)).strip()
         remote_rpt_dir = str(params.get("report_dir", "")).strip() or (
@@ -342,7 +368,10 @@ class InnovusBackend(AbstractEDABackend):
             )
 
         result = self._ssh_run(remote_cmd, timeout=timeout_sec)
-        log_path.write_text((result.stdout or "") + (result.stderr or ""))
+        # Ensure stdout/stderr are strings (defensive)
+        stdout_str = result.stdout.decode() if isinstance(result.stdout, bytes) else (result.stdout or "")
+        stderr_str = result.stderr.decode() if isinstance(result.stderr, bytes) else (result.stderr or "")
+        log_path.write_text(stdout_str + stderr_str)
         if result.returncode == 0:
             status = StageStatus.SUCCESS
             # Copy reports from remote to local
@@ -423,7 +452,8 @@ class InnovusBackend(AbstractEDABackend):
         if run_id and not job_workdir:
             remote_workdir = f"{self._workdir}/runs/{run_id}"
         
-        scripts_dir = f"{remote_workdir}/FPR/scripts"
+        # Use job-specific scripts dir (consistent with run_stage)
+        scripts_dir = f"{remote_workdir}/scripts"
         
         # Generate run_id if not provided
         if not run_id:
@@ -432,18 +462,30 @@ class InnovusBackend(AbstractEDABackend):
         # Job-specific agent_args file
         agent_args_tcl = f"{scripts_dir}/agent_args_{run_id}.tcl"
         
-        # Inherit from previous if provided
-        inherited_cmds = []
+        # Inherit from previous if provided - extract actual commands
+        inherited_blockages: list[str] = []  # List of individual blockage commands from previous run
+        inherited_cmds: list[str] = []
+        prev_blockage_count = 0
         if prev_agent_args:
-            # Read previous agent_args.tcl to extract commands
+            # Read previous agent_args.tcl to extract INJECT_PLACEDESIGN_BEFORE content
             read_prev = self._ssh_run(f"cat {prev_agent_args}", timeout=10)
             if read_prev.returncode == 0 and read_prev.stdout:
-                inherited_cmds.append(f"# Inherited from previous run")
-                inherited_cmds.append(f"source {shlex.quote(prev_agent_args)}")
+                prev_content = read_prev.stdout
+                # Extract the content between { and } in set ::INJECT_PLACEDESIGN_BEFORE { ... }
+                import re
+                match = re.search(
+                    r"set ::INJECT_PLACEDESIGN_BEFORE \{(.*?)\}",
+                    prev_content,
+                    re.DOTALL
+                )
+                if match:
+                    inherited_blockages.append(match.group(1).strip())
+                    # Count inherited blockages by counting createPlaceBlockage calls
+                    prev_blockage_count = match.group(1).count("createPlaceBlockage")
         
         # Generate injection commands for each blockage spec
-        cmds: list[str] = inherited_cmds + []
-        for idx, spec in enumerate(blockage_specs, start=1):
+        all_cmds = inherited_blockages + []
+        for idx, spec in enumerate(blockage_specs, start=prev_blockage_count + 1):
             btype = str(spec.get("type", "soft")).strip().lower()
             if btype not in {"soft", "hard", "partial"}:
                 raise ValueError(f"Unsupported blockage type at index {idx}: {btype}")
@@ -457,17 +499,18 @@ class InnovusBackend(AbstractEDABackend):
             if x2 <= x1 or y2 <= y1:
                 raise ValueError(f"Invalid blockage bbox at index {idx}: ({x1},{y1})-({x2},{y2})")
             reason = spec.get("reason", f"llm_blockage_{idx}")
-            cmds.append(
+            all_cmds.append(
                 f'    puts "== INJECTED blockage {idx}: {reason} =="\n'
                 f'    createPlaceBlockage -box {int(x1)} {int(y1)} {int(x2)} {int(y2)} -type {btype}'
             )
 
-        # Generate agent_args.tcl with INJECT_PLACEDESIGN_BEFORE variable
+        # Generate agent_args.tcl with all cumulative INJECT_PLACEDESIGN_BEFORE content
         script_body = (
             f"# Auto-generated agent_args.tcl for run {run_id}\n"
             "# This file is sourced by place.tcl before inject_hook.tcl\n"
+            "# Contains cumulative blockages from all previous runs\n"
             "set ::INJECT_PLACEDESIGN_BEFORE {\n"
-            + "\n".join(cmds) + "\n"
+            + "\n".join(all_cmds) + "\n"
             "}\n"
         )
 
@@ -485,7 +528,7 @@ class InnovusBackend(AbstractEDABackend):
             "workdir": remote_workdir,
             "stage": stage,
             "injection_file": agent_args_tcl,
-            "injection_commands": cmds,
+            "injection_commands": all_cmds,
             "prev_agent_args": prev_agent_args,
             "mechanism": "inject_hook",
             "blockage_count": len(blockage_specs),

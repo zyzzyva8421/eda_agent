@@ -28,5 +28,9 @@ proc __inject_hook {cmd} {
 # 支持的命令列表，可扩展
 set ::INJECT_HOOK_COMMANDS {placeDesign optDesign routeDesign ccopt_design}
 foreach cmd $::INJECT_HOOK_COMMANDS {
+    puts "DEBUG: Setting up hook for: $cmd"
     __inject_hook $cmd
 }
+
+# Verify hooks are set up
+puts "DEBUG: INJECT_HOOK_COMMANDS loaded"

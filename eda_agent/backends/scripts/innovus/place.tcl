@@ -31,12 +31,48 @@ set saved_dir "$design_dir/saved"
 set work_dir "$job_workdir/FPR/work"
 set prev_work_dir "$prev_job_dir/FPR/work"
 
-# agent注入参数（如有）- use job-specific dir
-if {[file exists "$job_workdir/scripts/agent_args.tcl"]} {
-    source $job_workdir/scripts/agent_args.tcl
+# agent注入参数（如有）
+# 加载策略：当前job -> 上一个job (通过last_job_id) -> inherited -> base
+set job_scripts "$job_workdir/scripts"
+
+# 1. First try current job's scripts directory
+set job_files [glob -nocomplain -directory $job_scripts agent_args_*.tcl]
+
+# 2. If no files, try previous job (via JOB_WORKDIR of previous run)
+# Get previous job from environment or check parent directory
+if {[llength $job_files] == 0 && [info exists ::env(PREV_JOB_DIR)] && $::env(PREV_JOB_DIR) ne ""} {
+    set prev_job_scripts "$::env(PREV_JOB_DIR)/scripts"
+    if {[file exists $prev_job_scripts]} {
+        set job_files [glob -nocomplain -directory $prev_job_scripts agent_args_*.tcl]
+    }
 }
-if {[file exists "$job_workdir/scripts/inject_hook.tcl"]} {
-    source $job_workdir/scripts/inject_hook.tcl
+
+# 1. Initialize the variable first (avoid "no such variable" error)
+if {![info exists ::INJECT_PLACEDESIGN_BEFORE]} {
+    set ::INJECT_PLACEDESIGN_BEFORE ""
+}
+
+if {[llength $job_files] > 0} {
+    # Sort to get the latest (UUID sort order)
+    set job_files [lsort -dictionary $job_files]
+    set latest_job_args [lindex $job_files end]
+    puts "DEBUG: Sourcing latest job agent_args: $latest_job_args"
+    puts "DEBUG: Contents before source: INJECT_PLACEDESIGN_BEFORE = '$::INJECT_PLACEDESIGN_BEFORE'"
+    source $latest_job_args
+    puts "DEBUG: Contents after source: INJECT_PLACEDESIGN_BEFORE = '$::INJECT_PLACEDESIGN_BEFORE'"
+}
+# 2. Then source inherited agent_args (contains cumulative source from previous runs)
+if {[file exists "$job_scripts/agent_args_inherited.tcl"]} {
+    puts "Sourcing inherited agent_args: $job_scripts/agent_args_inherited.tcl"
+    source $job_scripts/agent_args_inherited.tcl
+}
+# 3. Finally source base agent_args.tcl (empty by default, as fallback)
+if {[file exists "$job_scripts/agent_args.tcl"]} {
+    source $job_scripts/agent_args.tcl
+}
+# 4. Load inject_hook.tcl (wraps commands for injection)
+if {[file exists "$job_scripts/inject_hook.tcl"]} {
+    source $job_scripts/inject_hook.tcl
 }
 
 # Output directory for this stage in job workdir
