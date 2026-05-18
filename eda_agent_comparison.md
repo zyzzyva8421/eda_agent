@@ -343,6 +343,183 @@ flowchart LR
 3. **PostGIS** — 拥塞热点空间查询
 4. **Parquet** — 大规模历史数据归档
 
+## 14. Congestion 优化完整工作流
+
+### 场景：通过 CLI 修复 Innovus Place 阶段拥塞
+
+**用户命令示例**：
+```
+eda-agent> Fix the congestion issues in my design after place stage
+```
+
+### 完整流程图
+
+```mermaid
+flowchart TD
+    subgraph "1. 用户输入"
+        U[用户: Fix congestion]
+    end
+    
+    subgraph "2. ReAct Planner"
+        P1[Reason: 分析问题]
+        P2[Act: 选择工具]
+        P3[Execute: 执行]
+        P4[Observe: 解析结果]
+        P5{收敛?}
+    end
+    
+    subgraph "3. 工具层"
+        T1[run_eda_stage<br/>place]
+        T2[query_congestion_summary]
+        T3[suggest_params]
+        T4[tune_congestion_with_blockage]
+    end
+    
+    subgraph "4. 后端层"
+        B[Innovus Backend<br/>SSH + TCL]
+    end
+    
+    subgraph "5. 解析层"
+        PS[innovus_congestion.py]
+        HS[提取热点]
+    end
+    
+    subgraph "6. 数据层"
+        DB[(PostgreSQL<br/>PostGIS)]
+        KB[(Case Memory<br/>知识库)]
+    end
+    
+    U --> P1
+    P1 --> P2
+    P2 --> T1
+    T1 --> B
+    B --> T2
+    T2 --> PS
+    PS --> HS
+    HS --> DB
+    DB --> P4
+    P4 --> P1
+    P1 --> P5
+    P5 -->|未收敛| T3
+    T3 --> T4
+```
+
+### LLM 工作原理
+
+#### 步骤 1: Reason（推理）
+
+LLM 分析当前拥塞报告，生成诊断结论：
+
+```
+prompt: "分析以下拥塞报告，识别热点区域和原因"
+- 输入: congestion_summary (total_overflow, max_overflow, hotspot_count)
+- 热点坐标: congestion_hotspots (PostGIS polygon)
+- 输出: "热点集中在右上角区域，overflow=15%，建议降低PLACE_DENSITY"
+```
+
+#### 步骤 2: Act（行动）
+
+选择并调用工具：
+
+| 工具 | 用途 |
+|---|---|
+| `run_eda_stage` | 运行 place 阶段 |
+| `query_congestion_summary` | 查询拥塞汇总 |
+| `suggest_params` | 生成参数建议 |
+| `add_placement_blockage` | 添加placement block |
+
+#### 步骤 3: Execute（执行）
+
+工具调用后端层：
+
+```python
+# 实际执行流程示例
+result = be.run_stage("place", design, params)
+run_db_id = _upsert_run(result, design)
+# 解析报告
+parser = get_parser("innovus_congestion")
+records = parser.parse_file(report_path)
+_ingest_records(records, run_db_id, "place")
+```
+
+#### 步骤 4: Observe（观察）
+
+解析结果存入数据库：
+
+| 表 | 数据 |
+|---|---|
+| `runs` | stage, status, params |
+| `congestion_hotspots` | polygon, overflow, layer |
+| `utilization_summary` | design_area, utilization_pct |
+
+### 迭代收敛逻辑
+
+```python
+def tune_congestion_with_blockage(
+    max_iterations: int = 5,
+    congestion_threshold_pct: float = 5.0,
+) -> dict:
+    for i in range(max_iterations):
+        # 1. 运行 place
+        run_result = run_eda_stage(...)
+        
+        # 2. 查询拥塞
+        congestion = query_congestion_summary(run_result.run_id)
+        
+        # 3. 检查是否收敛
+        if congestion["max_overflow"] <= congestion_threshold_pct:
+            return {"status": "converged", "iterations": i + 1}
+        
+        # 4. LLM 生成 blockages
+        hotspots = _query_congestion(run_id, bbox=...)
+        suggestions = llm.analyze(hotspots)
+        
+        # 5. 应用 blockages
+        add_placement_blockage(run_id, suggestions.blockages)
+    
+    return {"status": "max_iterations"}
+```
+
+### 与数据库结合
+
+```sql
+-- 查询拥塞热点
+SELECT id, run_id, overflow, layer,
+       ST_AsText(geom) AS geom_wkt
+FROM congestion_hotspots
+WHERE run_id = :run_id
+  AND ST_Intersects(geom, ST_GeomFromText(:bbox, 0))
+ORDER BY overflow DESC
+```
+
+### 与知识库结合
+
+```python
+# 保存调试案例到知识库
+save_case(
+    design_name="gcd",
+    pdk="tsmc18",
+    symptoms="15% overflow in corner area",
+    root_cause="PLACE_DENSITY too high (0.7)",
+    actions=["降低PLACE_DENSITY到0.5", "添加partial blockage"],
+    result_metrics={"overflow_before": 15, "overflow_after": 3}
+)
+
+# 下次遇到类似问题，从知识库检索
+case = query_case_memory(symptoms="overflow in corner")
+# 结果: "之前用PLACE_DENSITY=0.5解决过"
+```
+
+### 关键工具 Schema
+
+| 工具 | 参数 | 返回 |
+|---|---|---|
+| `run_eda_stage` | backend, stage, design_name, params | run_id, status |
+| `query_congestion_summary` | run_id | total_overflow, max_overflow |
+| `suggest_params` | run_id, target_spec | {PLACE_DENSITY: 0.5} |
+| `add_placement_blockage` | run_id, blockages | applied_count |
+| `tune_congestion_with_blockage` | backend, design_name, max_iterations | iteration_history |
+
 ## 13. 技术壁垒与卖点
 
 ### 核心卖点
