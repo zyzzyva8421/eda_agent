@@ -233,3 +233,112 @@ flowchart TD
 
 ### 低优先级
 - 可视化面板（展示用）
+
+## 12. 数据库架构
+
+### 核心表结构
+
+| 表名 | 说明 |
+|---|---|
+| `backends` | EDA 后端注册 (ORFS/Innovus/ICC2) |
+| `designs` | RTL 设计元数据 |
+| `runs` | 流程执行记录 |
+| `timing_summary` | 时序汇总 (WNS/TNS/FEP) |
+| `timing_paths` | 时序违例路径 |
+| `congestion_hotspots` | 拥塞热点 (PostGIS) |
+| `utilization_summary` | 利用率汇总 |
+| `power_summary` | 功耗分解 |
+| `drc_violations` | DRC 违例 |
+| `artifacts` | 产物文件 |
+| `agent_sessions` | Agent 对话历史 |
+
+### ER 关系图
+
+```mermaid
+erDiagram
+    BACKEND ||--o{ RUN : has
+    DESIGN ||--o{ RUN : has
+    RUN ||--o{ TIMING_SUMMARY : contains
+    RUN ||--o{ TIMING_PATH : contains
+    RUN ||--o{ CONGESTION_HOTSPOT : contains
+    RUN ||--o{ UTILIZATION_SUMMARY : contains
+    RUN ||--o{ POWER_SUMMARY : contains
+    RUN ||--o{ DRC_VIOLATION : contains
+    RUN ||--o{ ARTIFACT : produces
+    
+    BACKEND {
+        int id PK
+        string name UK
+        string version
+        bool is_active
+    }
+    
+    DESIGN {
+        int id PK
+        string name
+        string pdk
+        string config_path
+    }
+    
+    RUN {
+        bigint id PK
+        string run_uuid UK
+        int backend_id FK
+        int design_id FK
+        string stage
+        string status
+        json params
+    }
+    
+    TIMING_SUMMARY {
+        int id PK
+        int run_id FK
+        float wns
+        float tns
+        int fep
+    }
+    
+    CONGESTION_HOTSPOT {
+        int id PK
+        int run_id FK
+        geometry polygon
+        int congestion_level
+    }
+```
+
+### 读写流程
+
+```mermaid
+flowchart LR
+    subgraph "写流程 (Ingest)"
+        W1[EDA Tool]
+        W2[执行 Run]
+        W3[解析 Report]
+        W4[写入 DB]
+        
+        W1 --> W2 --> W3 --> W4
+    end
+    
+    subgraph "读流程 (Query)"
+        R1[User Query]
+        R2[Agent Tools]
+        R3[SQL Query]
+        R4[Return Result]
+        
+        R1 --> R2 --> R3 --> R4
+    end
+    
+    subgraph "归档 (Archive)"
+        A1[Parquet Export]
+        A2[历史分析]
+        
+        W4 --> A1 --> A2
+    end
+```
+
+### 关键技术点
+
+1. **SQLAlchemy ORM** — 声明式数据模型
+2. **JSONB** — 灵活存储 params 配置
+3. **PostGIS** — 拥塞热点空间查询
+4. **Parquet** — 大规模历史数据归档
