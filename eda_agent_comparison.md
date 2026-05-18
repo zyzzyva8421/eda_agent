@@ -360,19 +360,22 @@ flowchart TD
         U[用户: Fix congestion]
     end
     
-    subgraph "2. ReAct Planner"
-        P1[Reason: 分析问题]
-        P2[Act: 选择工具]
+    subgraph "2. ReAct Planner [LLM]"
+        P1["🤖 Reason<br/>(推理分析)"]
+        P2["🤖 Act<br/>(选择工具)"]
         P3[Execute: 执行]
         P4[Observe: 解析结果]
-        P5{收敛?}
+        P5{"🤖 收敛判断?"}
+    end
+    
+    subgraph "3. 工具层 [LLM]"
+        T1["🤖 suggest_params<br/>(生成参数建议)"]
+        T2["🤖 add_placement_blockage<br/>(生成blockage建议)"]
     end
     
     subgraph "3. 工具层"
-        T1[run_eda_stage<br/>place]
-        T2[query_congestion_summary]
-        T3[suggest_params]
-        T4[tune_congestion_with_blockage]
+        T3[run_eda_stage<br/>place]
+        T4[query_congestion_summary]
     end
     
     subgraph "4. 后端层"
@@ -391,134 +394,158 @@ flowchart TD
     
     U --> P1
     P1 --> P2
-    P2 --> T1
-    T1 --> B
-    B --> T2
-    T2 --> PS
+    P2 --> T3
+    T3 --> B
+    B --> T4
+    T4 --> PS
     PS --> HS
     HS --> DB
     DB --> P4
-    P4 --> P1
-    P1 --> P5
-    P5 -->|未收敛| T3
-    T3 --> T4
+    P4 --> P5
+    P5 -->|未收敛| P1
+    P1 --> T1
+    T1 --> T2
+    
+    style P1 fill:#ff9900
+    style P2 fill:#ff9900
+    style P5 fill:#ff9900
+    style T1 fill:#ffcc00
+    style T2 fill:#ffcc00
 ```
 
 ### LLM 工作原理
 
-#### 步骤 1: Reason（推理）
+#### 1. Reason（推理分析）
 
 LLM 分析当前拥塞报告，生成诊断结论：
 
 ```
-prompt: "分析以下拥塞报告，识别热点区域和原因"
-- 输入: congestion_summary (total_overflow, max_overflow, hotspot_count)
-- 热点坐标: congestion_hotspots (PostGIS polygon)
-- 输出: "热点集中在右上角区域，overflow=15%，建议降低PLACE_DENSITY"
+prompt: """
+Based on the following congestion report:
+- total_overflow: 15%
+- max_overflow: 23%
+- hotspot_count: 5
+- hotspot locations: [(100,100)-(150,150)], [(200,200)-(250,250)]
+
+分析热点分布和原因，给出诊断结论。
+"""
 ```
 
-#### 步骤 2: Act（行动）
-
-选择并调用工具：
-
-| 工具 | 用途 |
-|---|---|
-| `run_eda_stage` | 运行 place 阶段 |
-| `query_congestion_summary` | 查询拥塞汇总 |
-| `suggest_params` | 生成参数建议 |
-| `add_placement_blockage` | 添加placement block |
-
-#### 步骤 3: Execute（执行）
-
-工具调用后端层：
-
-```python
-# 实际执行流程示例
-result = be.run_stage("place", design, params)
-run_db_id = _upsert_run(result, design)
-# 解析报告
-parser = get_parser("innovus_congestion")
-records = parser.parse_file(report_path)
-_ingest_records(records, run_db_id, "place")
+**LLM 输出**：
+```
+诊断结论:
+- 热点集中在右上角区域 (200,200)-(250,250)
+- overflow 达到 23%，表明 routing 资源不足
+- 可能原因:
+  1. PLACE_DENSITY 过高 (当前 0.7)
+  2. 局部 cell 密度过高
+建议: 降低 PLACE_DENSITY 到 0.5，添加 partial blockage
 ```
 
-#### 步骤 4: Observe（观察）
+#### 2. Act（选择工具）
 
-解析结果存入数据库：
+LLM 决策下一步行动：
 
-| 表 | 数据 |
+| 当前状态 | 策略 |
 |---|---|
-| `runs` | stage, status, params |
-| `congestion_hotspots` | polygon, overflow, layer |
-| `utilization_summary` | design_area, utilization_pct |
+| 拥塞 > 15% | 运行 place → query → 分析 |
+| 拥塞 5-15% | suggest_params 调参 |
+| 拥塞 < 5% | 收敛，停止 |
 
-### 迭代收敛逻辑
+**策略选择 Prompt**：
+```
+当前拥塞: max_overflow=23%
+目标: max_overflow < 5%
+
+可选行动:
+1. add_placement_blockage - 添加 blockage
+2. suggest_params - 调整参数
+3. tune_congestion_with_blockage - 自动迭代
+
+决策: 选择 suggest_params
+```
+
+#### 3. 参数建议生成
+
+LLM 根据历史案例和知识库生成参数：
 
 ```python
-def tune_congestion_with_blockage(
-    max_iterations: int = 5,
-    congestion_threshold_pct: float = 5.0,
-) -> dict:
-    for i in range(max_iterations):
-        # 1. 运行 place
-        run_result = run_eda_stage(...)
-        
-        # 2. 查询拥塞
-        congestion = query_congestion_summary(run_result.run_id)
-        
-        # 3. 检查是否收敛
-        if congestion["max_overflow"] <= congestion_threshold_pct:
-            return {"status": "converged", "iterations": i + 1}
-        
-        # 4. LLM 生成 blockages
-        hotspots = _query_congestion(run_id, bbox=...)
-        suggestions = llm.analyze(hotspots)
-        
-        # 5. 应用 blockages
-        add_placement_blockage(run_id, suggestions.blockages)
+def _suggest_params(run_id: int, target_spec: str) -> dict:
+    # 1. 查询历史案例
+    cases = query_case_memory(symptoms="congestion")
     
-    return {"status": "max_iterations"}
+    # 2. 查询当前运行数据
+    current = query_congestion_summary(run_id)
+    
+    # 3. LLM 生成建议
+    prompt = f"""
+    当前拥塞: {current}
+    历史案例: {cases[:3]}
+    目标: {target_spec}
+    
+    请建议Innovus place参数来降低拥塞。
+    返回JSON: {{"PLACE_DENSITY": 0.5, "CELL_PAD_IN_SITES": 2}}
+    """
+    
+    return llm.generate(prompt)
 ```
 
-### 与数据库结合
+#### 4. 收敛判断
 
-```sql
--- 查询拥塞热点
-SELECT id, run_id, overflow, layer,
-       ST_AsText(geom) AS geom_wkt
-FROM congestion_hotspots
-WHERE run_id = :run_id
-  AND ST_Intersects(geom, ST_GeomFromText(:bbox, 0))
-ORDER BY overflow DESC
-```
-
-### 与知识库结合
+LLM 判断是否达到目标：
 
 ```python
-# 保存调试案例到知识库
+# 收敛判断逻辑
+def check_convergence(congestion: dict, threshold: float = 5.0) -> bool:
+    # 方法1: 数值判断
+    if congestion["max_overflow"] <= threshold:
+        return True
+    
+    # 方法2: LLM 判断趋势
+    prompt = f"""
+    当前: max_overflow={congestion['max_overflow']}%
+    之前: max_overflow=23%
+    趋势: 下降中 (23% → 15% → 8%)
+    
+    是否应该收敛? 返回 YES 或 NO
+    """
+    
+    result = llm.generate(prompt)
+    return result.upper() == "YES"
+```
+
+#### 5. 与知识库结合
+
+```python
+# 保存调试案例
 save_case(
     design_name="gcd",
     pdk="tsmc18",
-    symptoms="15% overflow in corner area",
-    root_cause="PLACE_DENSITY too high (0.7)",
+    symptoms="右上角区域拥塞23%",
+    root_cause="PLACE_DENSITY=0.7过高",
     actions=["降低PLACE_DENSITY到0.5", "添加partial blockage"],
-    result_metrics={"overflow_before": 15, "overflow_after": 3}
+    result_metrics={"overflow_before": 23, "overflow_after": 3}
 )
 
-# 下次遇到类似问题，从知识库检索
-case = query_case_memory(symptoms="overflow in corner")
-# 结果: "之前用PLACE_DENSITY=0.5解决过"
+# 检索相似案例
+case = query_case_memory(
+    symptoms="corner congestion",
+    design="gcd",
+    pdk="tsmc18"
+)
+# 返回: "之前用PLACE_DENSITY=0.5 + blockage解决过"
 ```
 
-### 关键工具 Schema
+### LLM 工作流程总结
 
-| 工具 | 参数 | 返回 |
+| 步骤 | LLM 参与 | 产出 |
 |---|---|---|
-| `run_eda_stage` | backend, stage, design_name, params | run_id, status |
-| `query_congestion_summary` | run_id | total_overflow, max_overflow |
-| `suggest_params` | run_id, target_spec | {PLACE_DENSITY: 0.5} |
-| `add_placement_blockage` | run_id, blockages | applied_count |
-| `tune_congestion_with_blockage` | backend, design_name, max_iterations | iteration_history |
+| 1. Reason | ✅ | 诊断结论 |
+| 2. Act | ✅ | 策略选择 |
+| 3. suggest_params | ✅ | 参数建议 |
+| 4. add_placement_blockage | ✅ | blockage 坐标 |
+| 5. 收敛判断 | ✅ | YES/NO |
+| 6. 知识库检索 | ✅ | 历史案例 |
 
 ## 13. 技术壁垒与卖点
 
