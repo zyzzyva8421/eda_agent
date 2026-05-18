@@ -192,7 +192,7 @@ graph TD
 ```mermaid
 flowchart TD
     subgraph "User Input"
-        U[用户请求\n"优化 gcd design 的 timing"]
+        U[用户请求\n优化 gcd design 的 timing]
     end
     
     subgraph "ReAct Planner Loop"
