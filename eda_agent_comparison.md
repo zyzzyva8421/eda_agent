@@ -598,3 +598,208 @@ eda_agent/parsers/
 | **SQLAlchemy ORM** | 标准化模型定义 |
 | **PostGIS** | 拥塞热点空间存储 |
 | **Parquet Archive** | 大规模历史数据归档 |
+
+## 15. 数据库架构详解
+
+### 技术选型
+
+| 组件 | 选型 | 理由 |
+|---|---|---|
+| **OLTP** | PostgreSQL | 结构化 PPA 指标存储，ACID 事务 |
+| **空间** | PostGIS | 拥塞热点空间查询 |
+| **ORM** | SQLAlchemy 2.0 | 声明式模型，类型安全 |
+| **归档** | Parquet | 大规模分析查询 |
+| **迁移** | Alembic | 版本控制 |
+
+### 核心架构
+
+```mermaid
+flowchart TB
+    subgraph "Client Layer"
+        CLI[CLI Tool]
+        API[REST API]
+        AG[Agent]
+    end
+    
+    subgraph "DB Layer"
+        PG[PostgreSQL]
+        S[SQLAlchemy]
+    end
+    
+    subgraph "Storage"
+        T[(Tables)]
+        SP[PostGIS<br/>空间索引]
+        PQ[Parquet<br/>归档]
+    end
+    
+    CLI --> S
+    API --> S
+    AG --> S
+    S --> PG
+    PG --> T
+    T --> SP
+    T --> PQ
+```
+
+### 表结构详解
+
+```python
+# eda_agent/db/schema.py
+
+class Backend(Base):
+    """EDA 后端注册"""
+    id: int = mapped_column(Integer, primary_key=True)
+    name: str = mapped_column(String(64), unique=True)  # orfs, innovus, icc2
+    version: str = mapped_column(String(128))
+    is_active: bool = mapped_column(Boolean, default=True)
+
+class Design(Base):
+    """RTL 设计"""
+    id: int = mapped_column(Integer, primary_key=True)
+    name: str = mapped_column(String(256))  # gcd, aes, etc.
+    pdk: str = mapped_column(String(128))  # tsmc18, sky130hd
+    config_path: str
+    rtl_hash: str  # design version
+
+class Run(Base):
+    """流程执行"""
+    id: int = mapped_column(BigInteger, primary_key=True)
+    run_uuid: str = mapped_column(String(36), unique=True)
+    backend_id: int = mapped_column(ForeignKey("backends.id"))
+    design_id: int = mapped_column(ForeignKey("designs.id"))
+    stage: str  # place, cts, route, finish
+    status: str  # pending, running, success, failed
+    params: dict = mapped_column(JSONB)  # EDA parameters
+    log_path: str
+    report_dir: str
+
+class TimingSummary(Base):
+    """时序汇总"""
+    run_id: int = mapped_column(ForeignKey("runs.id"))
+    wns_ns: float  # Worst Negative Slack
+    tns_ns: float  # Total Negative Slack
+    failing_endpoints: int
+    fmax_mhz: float
+
+class CongestionHotspot(Base):
+    """拥塞热点"""
+    run_id: int = mapped_column(ForeignKey("runs.id"))
+    geom: Geometry  # PostGIS POLYGON
+    overflow: int  # overflow percentage
+    layer: str  # routing layer
+```
+
+### 可扩展性设计
+
+#### 1. 连接池配置
+
+```python
+# eda_agent/db/session.py
+
+_engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_size=10,      # 基础连接数
+    max_overflow=20,    # 最大溢出
+)
+```
+
+#### 2. 索引策略
+
+```sql
+-- runs 表索引
+CREATE INDEX ix_runs_backend_design_stage ON runs(backend_id, design_id, stage);
+CREATE INDEX ix_runs_status ON runs(status);
+CREATE INDEX ix_runs_created_at ON runs(created_at);
+
+-- PostGIS 空间索引
+CREATE INDEX ix_congestion_geom_gist ON congestion_hotspots USING GIST(geom);
+
+-- JSONB 索引
+CREATE INDEX ix_runs_params_gin ON runs USING GIN(params);
+```
+
+#### 3. 分区策略
+
+```sql
+-- 按时间分区（推荐）
+CREATE TABLE runs_new (
+    ...
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE runs_2024 PARTITION OF runs_new
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+-- 按 design 分区
+CREATE TABLE runs_design gcd PARTITION OF runs_new
+    FOR VALUES IN ('gcd');
+```
+
+### 与 JedAI 对比
+
+| 维度 | EDA Agent | JedAI Platform |
+|---|---|---|
+| **数据模型** | PPA 专用 | 通用数据集 |
+| **存储格式** | PostgreSQL + Parquet | NFS + Database Catalog |
+| **空间查询** | PostGIS 内置 | 需额外配置 |
+| **归档** | 自动 Parquet | 手动导出 |
+| **权限模型** | 基础 JWT | 完整 RBAC |
+| **API** | SQLAlchemy | Catalog API |
+
+### 大规模扩展方案
+
+#### 方案 1: 读写分离
+
+```python
+# 只读副本
+_engine_read = create_engine(settings.replica_url, pool_size=20)
+
+def get_db_read():
+    return Session(engine=_engine_read)
+
+# 写入主库
+def get_db_write():
+    return Session(engine=_engine)
+```
+
+#### 方案 2: 分库分表
+
+```
+# 水平分片按 design
+shard_1: runs_gcd, runs_aes
+shard_2: runs_picorv32, runs_ibex
+
+# 按时间分表
+runs_2024Q1, runs_2024Q2, runs_2024Q3
+```
+
+#### 方案 3: 异步归档
+
+```python
+# 后台任务异步归档
+from eda_agent.db.archiver import archive_run
+
+# 避免阻塞主流程
+asyncio.create_task(archive_run(run_id))
+```
+
+#### 方案 4: 多租户
+
+```sql
+-- 添加 tenant_id
+ALTER TABLE runs ADD COLUMN tenant_id UUID;
+ALTER TABLE designs ADD COLUMN tenant_id UUID;
+
+-- RLS 策略
+CREATE POLICY runs_tenant_policy ON runs
+    USING (tenant_id = current_setting('app.tenant_id'));
+```
+
+### 扩展路径总结
+
+| 阶段 | 数据量 | 方案 |
+|---|---|---|
+| MVP | < 10万行 | 单实例 PostgreSQL |
+| 增长 | 10-100万 | 读写分离 + 索引优化 |
+| 规模 | 100-1000万 | 分库分表 + Parquet 归档 |
+| 企业 | > 1000万 | 多租户 + Sharding |
