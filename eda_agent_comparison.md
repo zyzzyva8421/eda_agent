@@ -126,3 +126,110 @@ eda_agent/
 | Phase 2 | CLI Agent MVP (query/compare) | ✅ |
 | Phase 3 | 自主调参闭环 | 🔄 |
 | Phase 4 | FastAPI + 多后端生产 | 📋 |
+
+## 9. 完整架构图
+
+```mermaid
+graph TD
+    subgraph "用户接口层"
+        CLI[CLI Tool<br/>eda_agent/cli.py]
+        API[REST API<br/>eda_agent/api/]
+    end
+    
+    subgraph "核心 Agent 层"
+        AG[Agent Core<br/>agent/]
+        PL[Planner<br/>agent/planner.py]
+        MEM[Memory<br/>agent/memory.py]
+        GR[Guardrails<br/>agent/guardrails.py]
+        TOOLS[Tools<br/>agent/tools.py]
+        INF[Inference<br/>agent/inference/]
+    end
+    
+    subgraph "后端集成层"
+        BE[Backends<br/>backends/]
+        IN[Innovus<br/>backends/innovus.py]
+        IC[ICC2<br/>backends/icc2.py]
+        OR[OpenROADS<br/>backends/orfs.py]
+    end
+    
+    subgraph "解析器层"
+        PS[Parsers<br/>parsers/]
+        TM[Timing Parser<br/>parsers/timing.py]
+        PWR[Power Parser<br/>parsers/power.py]
+        DRC[DRC Parser<br/>parsers/drc.py]
+        CG[Congestion Parser<br/>parsers/congestion.py]
+        UT[Utilization Parser<br/>parsers/utilization.py]
+    end
+    
+    subgraph "数据层"
+        DB[Database<br/>db/]
+        Q[Queue System<br/>queue/]
+    end
+    
+    CLI --> AG
+    API --> AG
+    AG --> PL
+    AG --> MEM
+    AG --> GR
+    AG --> TOOLS
+    TOOLS --> INF
+    INF --> BE
+    BE --> IN
+    BE --> IC
+    BE --> OR
+    IN --> PS
+    PS --> TM
+    PS --> PWR
+    PS --> DRC
+    PS --> CG
+    PS --> UT
+    AG --> DB
+    AG --> Q
+```
+
+## 10. ReAct Planner 工作流程图
+
+```mermaid
+flowchart TD
+    subgraph "User Input"
+        U[用户请求<br/>"优化 gcd design 的 timing"]
+    end
+    
+    subgraph "ReAct Planner Loop"
+        P1[1. Reason<br/>LLM 分析问题]
+        P2[2. Act<br/>选择并调用工具]
+        P3[3. Execute<br/>执行工具<br/>run_eda_stage]
+        P4[4. Observe<br/>解析结果<br/>query_timing]
+        P5{迭代条件<br/>max_iterations?}
+        P6[5. Answer<br/>返回最终结果]
+    end
+    
+    subgraph "Tools"
+        T1[run_eda_stage]
+        T2[query_timing]
+        T3[compare_runs]
+        T4[suggest_params]
+    end
+    
+    U --> P1
+    P1 --> P2
+    P2 --> T1
+    T1 --> P3
+    P3 --> T2
+    T2 --> P4
+    P4 --> P1
+    P1 --> P5
+    P5 -->|未达上限| P1
+    P5 -->|已达上限| P6
+```
+
+## 11. 推荐优先级
+
+### 高优先级
+- Knowledge Graph + Root Cause Inference（核心价值）
+
+### 中优先级
+- 多 Agent 协作 + Recipe Search（扩展能力）
+
+### 低优先级
+- 可视化面板（展示用）
