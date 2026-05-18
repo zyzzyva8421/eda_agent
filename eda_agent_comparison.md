@@ -342,3 +342,55 @@ flowchart LR
 2. **JSONB** — 灵活存储 params 配置
 3. **PostGIS** — 拥塞热点空间查询
 4. **Parquet** — 大规模历史数据归档
+
+## 13. 技术壁垒与卖点
+
+### 核心卖点
+
+| 卖点 | 说明 |
+|---|---|
+| **自动化** | LLM 替代人工编写 TCL 脚本 |
+| **可追溯** | PostgreSQL 全程记录 PPA 指标 |
+| **可扩展** | 后端抽象层支持多 EDA 工具 |
+
+### 技术壁垒
+
+#### 1. 解析器层（高壁垒）
+
+| 壁垒 | 说明 |
+|---|---|
+| **多格式解析** | Innovus timing/power/drc/congestion 报告解析需大量正则工程 |
+| **结构化输出** | 解析结果直接入库，需精确的数据模型映射 |
+| **容错能力** | 报告格式变化时的鲁棒性 |
+
+```
+eda_agent/parsers/
+├── innovus_timing.py      # timing 报告解析
+├── innovus_power.py       # power 报告解析
+├── innovus_drc.py         # DRC 解析
+└── innovus_congestion_map.py  # 拥塞热点解析
+```
+
+#### 2. ReAct Planner（中壁垒）
+
+| 壁垒 | 说明 |
+|---|---|
+| **Tool Schema** | 工具调用需精确定义 JSON Schema |
+| **Context 管理** | Session Memory 记忆上下文 |
+| **迭代收敛** | max_iterations 策略控制 |
+
+#### 3. 后端抽象层（中壁垒）
+
+| 壁垒 | 说明 |
+|---|---|
+| **AbstractEDABackend** | 统一接口适配多后端 |
+| **Remote SSH** | 远程调度 + 日志拉回 |
+| **状态机** | StageStatus 状态管理 |
+
+#### 4. 数据模型（低壁垒）
+
+| 壁垒 | 说明 |
+|---|---|
+| **SQLAlchemy ORM** | 标准化模型定义 |
+| **PostGIS** | 拥塞热点空间存储 |
+| **Parquet Archive** | 大规模历史数据归档 |
