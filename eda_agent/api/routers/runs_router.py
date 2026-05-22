@@ -8,11 +8,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from eda_agent.api.auth import get_current_user
 from eda_agent.agent.tools import execute_tool
+from eda_agent.db.repository import EDAQueryRepository
 from eda_agent.db.session import get_db_dependency
 
 logger = logging.getLogger(__name__)
@@ -64,36 +64,32 @@ def list_runs(
     db: Session = Depends(get_db_dependency),
     _user: dict = Depends(get_current_user),
 ):
-    conditions = ["1=1"]
-    params: dict[str, Any] = {"limit": limit}
-    if design_name:
-        conditions.append("d.name = :design_name")
-        params["design_name"] = design_name
-    if stage:
-        conditions.append("r.stage = :stage")
-        params["stage"] = stage
-    if backend:
-        conditions.append("b.name = :backend")
-        params["backend"] = backend
+    return EDAQueryRepository.list_runs(
+        db, design_name=design_name, stage=stage, backend=backend, limit=limit
+    )
 
-    where = " AND ".join(conditions)
-    rows = db.execute(
-        text(
-            f"""
-            SELECT r.id, r.run_uuid, r.stage, r.status, r.params,
-                   r.started_at, r.finished_at, r.error_message,
-                   b.name AS backend, d.name AS design, d.pdk
-            FROM runs r
-            JOIN backends b ON b.id = r.backend_id
-            JOIN designs  d ON d.id = r.design_id
-            WHERE {where}
-            ORDER BY r.created_at DESC
-            LIMIT :limit
-            """
-        ),
-        params,
-    ).mappings().fetchall()
-    return [dict(r) for r in rows]
+
+@router.get("/sessions/{session_id}/trace")
+def get_session_trace(
+    session_id: int,
+    stage: str | None = None,
+    from_seq: int | None = None,
+    to_seq: int | None = None,
+    human_approved: bool | None = None,
+    db: Session = Depends(get_db_dependency),
+    _user: dict = Depends(get_current_user),
+):
+    trace = EDAQueryRepository.get_session_trace(
+        db,
+        session_id,
+        stage=stage,
+        from_seq=from_seq,
+        to_seq=to_seq,
+        human_approved=human_approved,
+    )
+    if isinstance(trace, dict) and "error" in trace:
+        raise HTTPException(status_code=404, detail=trace["error"])
+    return trace
 
 
 @router.get("/{run_id}")
@@ -102,18 +98,7 @@ def get_run(
     db: Session = Depends(get_db_dependency),
     _user: dict = Depends(get_current_user),
 ):
-    row = db.execute(
-        text(
-            """
-            SELECT r.*, b.name AS backend, d.name AS design, d.pdk
-            FROM runs r
-            JOIN backends b ON b.id = r.backend_id
-            JOIN designs  d ON d.id = r.design_id
-            WHERE r.id = :run_id
-            """
-        ),
-        {"run_id": run_id},
-    ).mappings().first()
+    row = EDAQueryRepository.get_run(db, run_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
-    return dict(row)
+    return row

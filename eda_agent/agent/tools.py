@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ import httpx
 from sqlalchemy import text
 
 from eda_agent.agent.param_mapper import PARAM_MAPPER, OptimizationObjective
+from eda_agent.db.repository import EDAQueryRepository
 from eda_agent.backends import get_backend
 from eda_agent.backends.base import DesignSpec
 from eda_agent.config import settings
@@ -728,6 +730,424 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 # ── Tool implementations ──────────────────────────────────────────────────────
 
 
+# ── Transaction-safe save helper ─────────────────────────────────────────
+
+
+def _save_run_and_parse(
+    result: Any,
+    design: DesignSpec,
+    backend: Any = None,
+    run_context: dict[str, Any] | None = None,
+) -> int:
+    """Atomically upsert a run and ingest its parsed reports.
+
+    Unlike separate ``_upsert_run`` + ``_ingest_records`` calls (each in
+    their own transaction), this wraps both operations in **one** transaction
+    so a mid-way crash never produces an orphaned run record.
+
+    Parse errors are caught and logged but do **not** roll back the run:
+    the run is still useful even when some report types fail to parse.
+    """
+    with get_db() as db:
+        run_db_id = _upsert_run(result, design, db=db, run_context=run_context)
+
+        if result.status.value == "success" and backend is not None:
+            reports = backend.collect_reports(result)
+            try:
+                _upsert_artifacts_with_db(run_db_id, reports, db)
+            except Exception:
+                logger.debug(
+                    "Failed to upsert artifacts for run %s", run_db_id, exc_info=True
+                )
+            for rpt in reports:
+                try:
+                    parser = get_parser(rpt.report_type)
+                    records = parser.parse_file(rpt.path)
+                    _ingest_records(records, run_db_id, rpt.stage, db=db)
+                except Exception as e:
+                    # Best-effort: don't fail the run for parse errors
+                    logger.debug("Failed to parse %s: %s", rpt.path, e)
+
+        # Transaction commits here (get_db context manager exit)
+    return run_db_id
+
+
+def _create_flow_session(
+    design: DesignSpec,
+    objective: str = "pnr",
+    notes: str = "",
+) -> int:
+    """Create a flow session row and return its id.
+
+    A session groups one multi-stage flow execution (baseline or variant) so we
+    can detect completion based on the *last stage in that session*.
+    """
+    import sys
+    import json as _json
+    import importlib.metadata as _meta
+
+    def _pkg_version(pkg: str) -> str:
+        try:
+            return _meta.version(pkg)
+        except Exception:
+            return "unknown"
+
+    env_snapshot = {
+        "python": sys.version,
+        "sqlalchemy": _pkg_version("sqlalchemy"),
+        "pdk": design.pdk,
+        "design": design.name,
+        "captured_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+    }
+
+    with get_db() as db:
+        design_row = db.execute(
+            text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
+            {"name": design.name, "pdk": design.pdk},
+        ).first()
+        design_id = design_row[0] if design_row else None
+        if design_id is None:
+            db.execute(
+                text(
+                    "INSERT INTO designs (name, pdk, config_path) "
+                    "VALUES (:name, :pdk, :cfg)"
+                ),
+                {"name": design.name, "pdk": design.pdk, "cfg": str(design.config_path)},
+            )
+            design_id = db.execute(
+                text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
+                {"name": design.name, "pdk": design.pdk},
+            ).scalar()
+
+        session_uuid = str(uuid.uuid4())
+        session_id = db.execute(
+            text(
+                """
+                INSERT INTO flow_sessions
+                    (session_uuid, design_id, objective, status, notes, env_snapshot)
+                VALUES
+                    (:session_uuid, :design_id, :objective, 'active', :notes, :env_snapshot)
+                RETURNING id
+                """
+            ),
+            {
+                "session_uuid": session_uuid,
+                "design_id": design_id,
+                "objective": objective,
+                "notes": notes,
+                "env_snapshot": _json.dumps(env_snapshot),
+            },
+        ).scalar()
+        return int(session_id)
+
+
+def _update_flow_session_status(
+    session_id: int,
+    status: str,
+    baseline_run_id: int | None = None,
+) -> None:
+    """Update flow session lifecycle state (active/completed/failed)."""
+    with get_db() as db:
+        if baseline_run_id is None:
+            db.execute(
+                text(
+                    """
+                    UPDATE flow_sessions
+                    SET status = :status,
+                        updated_at = now()
+                    WHERE id = :sid
+                    """
+                ),
+                {"status": status, "sid": session_id},
+            )
+        else:
+            db.execute(
+                text(
+                    """
+                    UPDATE flow_sessions
+                    SET status = :status,
+                        baseline_run_id = :baseline_run_id,
+                        updated_at = now()
+                    WHERE id = :sid
+                    """
+                ),
+                {
+                    "status": status,
+                    "baseline_run_id": baseline_run_id,
+                    "sid": session_id,
+                },
+            )
+
+
+def _record_stage_outcome(
+    run_id: int,
+    stage_name: str,
+    result: Any,
+    recommendation: str = "",
+    approval_status: str = "pending",
+    root_cause_inference_id: int | None = None,
+) -> None:
+    """Persist per-stage execution snapshot for reproducibility."""
+    output_metrics = {
+        "status": result.status.value,
+        "error": result.error_message,
+        "run_uuid": result.run_id,
+    }
+    artifact_refs: list[str] = []
+    if result.log_path:
+        artifact_refs.append(str(result.log_path))
+
+    with get_db() as db:
+        db.execute(
+            text(
+                """
+                INSERT INTO stage_outcomes
+                    (run_id, stage_name, status, started_at, finished_at,
+                     input_params_snapshot, output_metrics_snapshot, artifact_refs,
+                     root_cause_inference_id, recommendation, approval_status)
+                VALUES
+                    (:run_id, :stage_name, :status, :started_at, :finished_at,
+                     :input_params_snapshot::jsonb, :output_metrics_snapshot::jsonb,
+                     :artifact_refs::jsonb, :root_cause_inference_id,
+                     :recommendation, :approval_status)
+                """
+            ),
+            {
+                "run_id": run_id,
+                "stage_name": stage_name,
+                "status": result.status.value,
+                "started_at": result.started_at,
+                "finished_at": result.finished_at,
+                "input_params_snapshot": json.dumps(result.params or {}),
+                "output_metrics_snapshot": json.dumps(output_metrics),
+                "artifact_refs": json.dumps(artifact_refs),
+                "root_cause_inference_id": root_cause_inference_id,
+                "recommendation": recommendation,
+                "approval_status": approval_status,
+            },
+        )
+
+
+def _decision_reason_from_suggestion(suggestion: dict[str, Any], prefix: str = "") -> str:
+    """Build a compact textual rationale for decision_trace from suggestion output."""
+    parts: list[str] = []
+    if prefix:
+        parts.append(prefix)
+
+    reasoning = suggestion.get("reasoning")
+    if isinstance(reasoning, list):
+        parts.extend(str(item) for item in reasoning[:3])
+    elif isinstance(reasoning, str):
+        parts.append(reasoning)
+
+    suggested = suggestion.get("suggested_params")
+    if isinstance(suggested, dict) and suggested:
+        parts.append(f"suggested_params={suggested}")
+
+    source = suggestion.get("source")
+    if source:
+        parts.append(f"source={source}")
+
+    return " | ".join(p for p in parts if p)
+
+
+def _decision_reason_structured_from_suggestion(
+    suggestion: dict[str, Any],
+    prefix: str = "",
+) -> dict[str, Any]:
+    """Build a structured rationale payload for decision_trace."""
+    payload: dict[str, Any] = {"kind": "suggestion"}
+    if prefix:
+        payload["prefix"] = prefix
+
+    reasoning = suggestion.get("reasoning")
+    if isinstance(reasoning, list):
+        payload["reasoning"] = [str(item) for item in reasoning[:3]]
+    elif isinstance(reasoning, str) and reasoning.strip():
+        payload["reasoning"] = [reasoning]
+
+    suggested = suggestion.get("suggested_params")
+    if isinstance(suggested, dict) and suggested:
+        payload["suggested_params"] = suggested
+
+    source = suggestion.get("source")
+    if source:
+        payload["source"] = str(source)
+
+    return payload
+
+
+def _record_decision_trace(
+    session_id: int,
+    source_run_id: int,
+    target_run_id: int,
+    *,
+    llm_reason: str = "",
+    llm_reason_structured: dict[str, Any] | None = None,
+    inference_id: int | None = None,
+    case_id: int | None = None,
+    rule_id: str | None = None,
+    human_approved: bool = False,
+) -> None:
+    """Persist lineage from diagnosis/suggestion to the next rerun."""
+    with get_db() as db:
+        db.execute(
+            text(
+                """
+                INSERT INTO decision_trace
+                    (session_id, source_run_id, target_run_id,
+                     inference_id, case_id, rule_id,
+                     llm_reason, llm_reason_structured, human_approved)
+                VALUES
+                    (:session_id, :source_run_id, :target_run_id,
+                     :inference_id, :case_id, :rule_id,
+                     :llm_reason, :llm_reason_structured::jsonb, :human_approved)
+                """
+            ),
+            {
+                "session_id": session_id,
+                "source_run_id": source_run_id,
+                "target_run_id": target_run_id,
+                "inference_id": inference_id,
+                "case_id": case_id,
+                "rule_id": rule_id,
+                "llm_reason": llm_reason,
+                "llm_reason_structured": json.dumps(
+                    llm_reason_structured
+                    if llm_reason_structured is not None
+                    else ({"kind": "text", "text": llm_reason} if llm_reason else None)
+                ),
+                "human_approved": human_approved,
+            },
+        )
+
+
+def _set_flow_session_inference_context(
+    session_id: int,
+    *,
+    inference_id: int | None = None,
+    case_id: int | None = None,
+    rule_id: str | None = None,
+) -> None:
+    """Persist latest inference/case/rule context on a flow session."""
+    if inference_id is None and case_id is None and rule_id is None:
+        return
+    with get_db() as db:
+        db.execute(
+            text(
+                """
+                UPDATE flow_sessions
+                SET last_inference_id = COALESCE(:inference_id, last_inference_id),
+                    last_case_id = COALESCE(:case_id, last_case_id),
+                    last_rule_id = COALESCE(:rule_id, last_rule_id),
+                    updated_at = now()
+                WHERE id = :sid
+                """
+            ),
+            {
+                "sid": session_id,
+                "inference_id": inference_id,
+                "case_id": case_id,
+                "rule_id": rule_id,
+            },
+        )
+
+
+def _set_flow_session_context_from_run(
+    run_id: int,
+    *,
+    inference_id: int | None = None,
+    case_id: int | None = None,
+    rule_id: str | None = None,
+) -> None:
+    """Resolve session_id by run_id and update session inference context."""
+    with get_db() as db:
+        row = db.execute(
+            text("SELECT session_id FROM runs WHERE id = :run_id"),
+            {"run_id": run_id},
+        ).first()
+        if not row or row[0] is None:
+            return
+        sid = int(row[0])
+    _set_flow_session_inference_context(
+        sid,
+        inference_id=inference_id,
+        case_id=case_id,
+        rule_id=rule_id,
+    )
+
+
+def _latest_inference_context_for_run(run_id: int) -> dict[str, Any]:
+    """Best-effort lookup for inference/case context linked to *run_id*.
+
+    Returns a dict with keys: inference_id, case_id, rule_id.  Missing values
+    are returned as None so callers can pass through directly.
+    """
+    with get_db() as db:
+        session_ctx = db.execute(
+            text(
+                """
+                SELECT fs.last_inference_id, fs.last_case_id, fs.last_rule_id
+                FROM runs r
+                JOIN flow_sessions fs ON fs.id = r.session_id
+                WHERE r.id = :run_id
+                """
+            ),
+            {"run_id": run_id},
+        ).first()
+        if session_ctx and any(v is not None for v in session_ctx):
+            return {
+                "inference_id": int(session_ctx[0]) if session_ctx[0] is not None else None,
+                "case_id": int(session_ctx[1]) if session_ctx[1] is not None else None,
+                "rule_id": session_ctx[2],
+            }
+
+        inf = db.execute(
+            text(
+                """
+                SELECT id, chosen_cause, hypotheses
+                FROM root_cause_inferences
+                WHERE run_id = :run_id
+                ORDER BY confirmed_at DESC NULLS LAST, created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"run_id": run_id},
+        ).mappings().first()
+
+        if not inf:
+            return {"inference_id": None, "case_id": None, "rule_id": None}
+
+        inference_id = int(inf["id"])
+        rule_id: str | None = inf.get("chosen_cause")
+        if not rule_id:
+            hypotheses = inf.get("hypotheses") or []
+            if isinstance(hypotheses, list) and hypotheses:
+                first = hypotheses[0]
+                if isinstance(first, dict):
+                    rule_id = first.get("cause_id")
+
+        case_row = db.execute(
+            text(
+                """
+                SELECT id
+                FROM case_memory
+                WHERE result_metrics->>'inference_id' = :inference_id
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"inference_id": str(inference_id)},
+        ).first()
+
+        case_id = int(case_row[0]) if case_row else None
+        return {
+            "inference_id": inference_id,
+            "case_id": case_id,
+            "rule_id": rule_id,
+        }
+
+
 def _run_eda_stage(
     backend: str,
     stage: str,
@@ -735,6 +1155,7 @@ def _run_eda_stage(
     design_config: str | None = None,
     pdk: str | None = None,
     params: dict[str, Any] | None = None,
+    run_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # 对于 innovus，可以从 settings 自动获取配置
     if not backend:
@@ -764,26 +1185,26 @@ def _run_eda_stage(
     )
     result = be.run_stage(stage, design, params or {})
 
-    # Persist run to DB
-    run_db_id = _upsert_run(result, design)
+    # Atomically persist run + ingest reports (single transaction)
+    run_db_id = _save_run_and_parse(result, design, backend=be, run_context=run_context)
 
-    # Parse and ingest reports if the stage succeeded
+    root_cause_inference_id = None
+    if run_context:
+        root_cause_inference_id = run_context.get("root_cause_inference_id")
+
+    # Best-effort stage snapshot for reproducibility.
+    try:
+        _record_stage_outcome(
+            run_db_id,
+            stage,
+            result,
+            root_cause_inference_id=root_cause_inference_id,
+        )
+    except Exception:
+        logger.warning("Failed to persist stage_outcome for run %d", run_db_id)
+
+    # Archive the run data to Parquet (best-effort; never fails the main flow)
     if result.status.value == "success":
-        reports = be.collect_reports(result)
-        try:
-            _upsert_artifacts(run_db_id, reports)
-        except Exception:
-            logger.debug("Failed to upsert artifacts for run %s", run_db_id, exc_info=True)
-        for rpt in reports:
-            try:
-                parser = get_parser(rpt.report_type)
-                records = parser.parse_file(rpt.path)
-                _ingest_records(records, run_db_id, rpt.stage)
-            except Exception as e:
-                # Best-effort: don't fail the run for parse errors
-                logger.debug("Failed to parse %s: %s", rpt.path, e)
-
-        # Archive the run data to Parquet (best-effort; never fails the main flow)
         try:
             from eda_agent.db.archiver import archive_run
 
@@ -860,30 +1281,63 @@ def _run_eda_flow_sync(
             }
         stages_to_run = [stage_start.lower()]
 
-    # Run stages sequentially
+    # Run stages sequentially. The session is considered completed when the
+    # final stage in this *specific* session range is done (not hardcoded to postroute).
+    final_stage = stages_to_run[-1]
+    session_id = _create_flow_session(
+        design,
+        objective=str((params or {}).get("_objective", "pnr")),
+        notes=f"flow:{stage_start}->{stage_end or stage_start}",
+    )
+
     results = []
-    for stage in stages_to_run:
+    prev_run_id: int | None = None
+    for stage_seq, stage in enumerate(stages_to_run, start=1):
         stage_result = be.run_stage(stage, design, params or {})
-        run_db_id = _upsert_run(stage_result, design)
 
-        # Parse reports if successful
-        if stage_result.status.value == "success":
-            reports = be.collect_reports(stage_result)
+        # Atomically persist run + ingest reports (single transaction)
+        source_run_id = prev_run_id
+        run_db_id = _save_run_and_parse(
+            stage_result,
+            design,
+            backend=be,
+            run_context={
+                "session_id": session_id,
+                "stage_seq": stage_seq,
+                "variant_tag": "baseline",
+                "rerun_reason": f"flow:{stage_start}->{stage_end or stage_start}",
+                "is_baseline": True,
+                "is_selected": False,
+                "parent_run_id": source_run_id,
+            },
+        )
+        prev_run_id = run_db_id
+
+        if source_run_id is not None:
             try:
-                _upsert_artifacts(run_db_id, reports)
+                _record_decision_trace(
+                    session_id=session_id,
+                    source_run_id=source_run_id,
+                    target_run_id=run_db_id,
+                    llm_reason=f"session stage progression: {source_run_id}->{run_db_id}",
+                    llm_reason_structured={
+                        "kind": "session_stage_progression",
+                        "source_run_id": source_run_id,
+                        "target_run_id": run_db_id,
+                        "stage": stage,
+                    },
+                )
             except Exception:
-                logger.debug("Failed to upsert artifacts for run %s", run_db_id, exc_info=True)
-            for rpt in reports:
-                try:
-                    parser = get_parser(rpt.report_type)
-                    records = parser.parse_file(rpt.path)
-                    _ingest_records(records, run_db_id, rpt.stage)
-                except Exception as e:
-                    # Best-effort: don't fail the flow for parse errors
-                    # (some stages like floorplan may not have certain report types)
-                    logger.debug("Failed to parse %s: %s", rpt.path, e)
+                logger.warning("Failed to persist decision_trace %s->%s", source_run_id, run_db_id)
 
-            # Archive to Parquet (best-effort)
+        # Best-effort lineage snapshot; never block main flow.
+        try:
+            _record_stage_outcome(run_db_id, stage, stage_result)
+        except Exception:
+            logger.warning("Failed to persist stage_outcome for run %d", run_db_id)
+
+        # Archive to Parquet (best-effort)
+        if stage_result.status.value == "success":
             try:
                 from eda_agent.db.archiver import archive_run
                 archive_run(run_db_id)
@@ -892,6 +1346,7 @@ def _run_eda_flow_sync(
 
         results.append({
             "stage": stage,
+            "is_session_final_stage": stage == final_stage,
             "status": stage_result.status.value,
             "run_id": run_db_id,
             "run_uuid": stage_result.run_id,
@@ -899,12 +1354,31 @@ def _run_eda_flow_sync(
             "log_path": str(stage_result.log_path) if stage_result.log_path else None,
         })
 
+        if stage_result.status.value != "success":
+            try:
+                _update_flow_session_status(session_id, status="failed")
+            except Exception:
+                logger.warning("Failed to mark flow_session %s failed", session_id)
+            break
+
     # Determine overall status
     all_success = all(r["status"] == "success" for r in results)
     overall_status = "success" if all_success else "partial_failure"
 
+    try:
+        if all_success and results and results[-1]["stage"] == final_stage:
+            _update_flow_session_status(
+                session_id,
+                status="completed",
+                baseline_run_id=results[-1]["run_id"],
+            )
+    except Exception:
+        logger.warning("Failed to finalize flow_session %s", session_id)
+
     return {
         "overall_status": overall_status,
+        "session_id": session_id,
+        "session_final_stage": final_stage,
         "stages_run": len(results),
         "design_name": design_name,
         "pdk": pdk,
@@ -1068,58 +1542,9 @@ def _query_timing(
     limit: int = 10,
 ) -> dict[str, Any]:
     with get_db() as db:
-        conditions = ["d.name = :design_name"]
-        params: dict[str, Any] = {"design_name": design_name, "limit": limit}
-        if stage:
-            conditions.append("r.stage = :stage")
-            params["stage"] = stage
-        if run_id:
-            conditions.append("r.id = :run_id")
-            params["run_id"] = run_id
-        where = " AND ".join(conditions)
-        summary_rows = db.execute(
-            text(
-                f"""
-                SELECT ts.id, r.id AS run_id, r.stage, b.name AS backend,
-                       ts.view, ts.wns_ns, ts.tns_ns, ts.failing_endpoints,
-                       ts.fmax_mhz, ts.clock_skew_ns,
-                       ts.max_slew_violations, ts.max_fanout_violations,
-                       ts.max_cap_violations, ts.setup_violations, ts.hold_violations,
-                       ts.critical_path_delay_ns, ts.slack_cpd_ratio_pct,
-                       r.params, r.created_at
-                FROM timing_summary ts
-                JOIN runs r    ON r.id  = ts.run_id
-                JOIN designs d ON d.id  = r.design_id
-                JOIN backends b ON b.id = r.backend_id
-                WHERE {where}
-                ORDER BY r.created_at DESC
-                LIMIT :limit
-                """
-            ),
-            params,
-        ).mappings().fetchall()
-
-        # Query individual timing paths (worst slack paths)
-        path_rows = db.execute(
-            text(
-                f"""
-                SELECT tp.id, tp.run_id, tp.startpoint, tp.endpoint,
-                       tp.path_group, tp.slack_ns
-                FROM timing_paths tp
-                JOIN runs r ON r.id = tp.run_id
-                JOIN designs d ON d.id = r.design_id
-                WHERE {where}
-                ORDER BY tp.slack_ns ASC
-                LIMIT :limit
-                """
-            ),
-            params,
-        ).mappings().fetchall()
-
-    return {
-        "summary": [dict(r) for r in summary_rows],
-        "paths": [dict(r) for r in path_rows],
-    }
+        return EDAQueryRepository.get_timing(
+            db, design_name, stage=stage, run_id=run_id, limit=limit
+        )
 
 
 def _query_congestion(
@@ -1130,36 +1555,9 @@ def _query_congestion(
     y2: float | None = None,
 ) -> list[dict[str, Any]]:
     with get_db() as db:
-        if all(v is not None for v in [x1, y1, x2, y2]):
-            bbox_wkt = f"POLYGON(({x1} {y1},{x2} {y1},{x2} {y2},{x1} {y2},{x1} {y1}))"
-            rows = db.execute(
-                text(
-                    """
-                    SELECT id, run_id, overflow, layer,
-                           ST_AsText(geom) AS geom_wkt
-                    FROM congestion_hotspots
-                    WHERE run_id = :run_id
-                      AND ST_Intersects(geom, ST_GeomFromText(:bbox, 0))
-                    ORDER BY overflow DESC
-                    """
-                ),
-                {"run_id": run_id, "bbox": bbox_wkt},
-            ).mappings().fetchall()
-        else:
-            rows = db.execute(
-                text(
-                    """
-                    SELECT id, run_id, overflow, layer,
-                           ST_AsText(geom) AS geom_wkt
-                    FROM congestion_hotspots
-                    WHERE run_id = :run_id
-                    ORDER BY overflow DESC
-                    LIMIT 20
-                    """
-                ),
-                {"run_id": run_id},
-            ).mappings().fetchall()
-    return [dict(r) for r in rows]
+        return EDAQueryRepository.get_congestion(
+            db, run_id, x1=x1, y1=y1, x2=x2, y2=y2,
+        )
 
 
 def _query_congestion_summary(run_id: int) -> dict[str, Any]:
@@ -1232,35 +1630,7 @@ def _query_congestion_summary(run_id: int) -> dict[str, Any]:
 
 def _compare_runs(run_id_a: int, run_id_b: int) -> dict[str, Any]:
     with get_db() as db:
-        def _fetch(rid: int) -> dict:
-            row = db.execute(
-                text(
-                    """
-                    SELECT r.id, r.stage, r.params, r.status,
-                           b.name AS backend, d.name AS design,
-                           ts.wns_ns, ts.tns_ns, ts.failing_endpoints
-                    FROM runs r
-                    JOIN backends b ON b.id = r.backend_id
-                    JOIN designs d ON d.id = r.design_id
-                    LEFT JOIN timing_summary ts ON ts.run_id = r.id
-                    WHERE r.id = :rid
-                    ORDER BY ts.wns_ns ASC
-                    LIMIT 1
-                    """
-                ),
-                {"rid": rid},
-            ).mappings().first()
-            return dict(row) if row else {}
-
-        a = _fetch(run_id_a)
-        b = _fetch(run_id_b)
-
-    diff: dict[str, Any] = {"run_a": a, "run_b": b, "delta": {}}
-    for metric in ("wns_ns", "tns_ns", "failing_endpoints"):
-        va, vb = a.get(metric), b.get(metric)
-        if va is not None and vb is not None:
-            diff["delta"][metric] = round(vb - va, 6)
-    return diff
+        return EDAQueryRepository.compare_runs(db, run_id_a, run_id_b)
 
 
 def _infer_objective_from_target_spec(
@@ -1368,33 +1738,9 @@ def _query_utilization(
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     with get_db() as db:
-        conditions = ["d.name = :design_name"]
-        params: dict[str, Any] = {"design_name": design_name, "limit": limit}
-        if stage:
-            conditions.append("r.stage = :stage")
-            params["stage"] = stage
-        if run_id:
-            conditions.append("r.id = :run_id")
-            params["run_id"] = run_id
-        where = " AND ".join(conditions)
-        rows = db.execute(
-            text(
-                f"""
-                SELECT us.id, r.id AS run_id, r.stage, b.name AS backend,
-                       us.design_area_um2, us.utilization_pct,
-                       us.num_cells, us.num_registers, r.created_at
-                FROM utilization_summary us
-                JOIN runs r    ON r.id  = us.run_id
-                JOIN designs d ON d.id  = r.design_id
-                JOIN backends b ON b.id = r.backend_id
-                WHERE {where}
-                ORDER BY r.created_at DESC
-                LIMIT :limit
-                """
-            ),
-            params,
-        ).mappings().fetchall()
-    return [dict(r) for r in rows]
+        return EDAQueryRepository.get_utilization(
+            db, design_name, stage=stage, run_id=run_id, limit=limit
+        )
 
 
 def _query_power(
@@ -1404,70 +1750,15 @@ def _query_power(
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     with get_db() as db:
-        conditions = ["d.name = :design_name"]
-        params: dict[str, Any] = {"design_name": design_name, "limit": limit}
-        if stage:
-            conditions.append("r.stage = :stage")
-            params["stage"] = stage
-        if run_id:
-            conditions.append("r.id = :run_id")
-            params["run_id"] = run_id
-        where = " AND ".join(conditions)
-        rows = db.execute(
-            text(
-                f"""
-                SELECT ps.id, r.id AS run_id, r.stage, b.name AS backend,
-                       ps.internal_power_w, ps.switching_power_w,
-                       ps.leakage_power_w, ps.total_power_w, r.created_at
-                FROM power_summary ps
-                JOIN runs r    ON r.id  = ps.run_id
-                JOIN designs d ON d.id  = r.design_id
-                JOIN backends b ON b.id = r.backend_id
-                WHERE {where}
-                ORDER BY r.created_at DESC
-                LIMIT :limit
-                """
-            ),
-            params,
-        ).mappings().fetchall()
-    return [dict(r) for r in rows]
+        return EDAQueryRepository.get_power(
+            db, design_name, stage=stage, run_id=run_id, limit=limit
+        )
 
 
 def _get_run_log(run_id: int, lines: int = 50) -> dict[str, Any]:
     """Read the log file from a run and return the last N lines."""
     with get_db() as db:
-        row = db.execute(
-            text(
-                "SELECT r.log_path, r.stage, r.status, d.name AS design_name "
-                "FROM runs r JOIN designs d ON d.id = r.design_id WHERE r.id = :rid"
-            ),
-            {"rid": run_id},
-        ).mappings().first()
-
-    if not row:
-        return {"error": f"Run {run_id} not found"}
-
-    log_path = row["log_path"]
-    if not log_path:
-        return {"error": f"No log_path for run {run_id}"}
-
-    log_file = Path(log_path)
-    if not log_file.is_file():
-        return {"error": f"Log file not found: {log_path}"}
-
-    try:
-        all_lines = log_file.read_text().splitlines()
-        last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
-        return {
-            "run_id": run_id,
-            "stage": row["stage"],
-            "status": row["status"],
-            "design_name": row["design_name"],
-            "log_path": str(log_path),
-            "log_content": "\n".join(last_lines),
-        }
-    except Exception as e:
-        return {"error": f"Failed to read log: {e}"}
+        return EDAQueryRepository.get_run_log(db, run_id, lines=lines)
 
 
 def _add_placement_blockage(
@@ -2146,25 +2437,38 @@ def _tune_ppa(
 ) -> dict[str, Any]:
     """Autonomous PPA tuning loop with hill-climbing direction memory.
 
-    For each iteration:
-    1. Run the EDA stage with current parameters.
-    2. Query timing metrics from the DB.
-    3. Check whether the target spec is satisfied.
-    4. If WNS regressed vs the previous best, note this so the LLM can pick
-       a different direction.
-    5. Call ``suggest_params`` to get the next set of parameters.
-    6. Repeat until the target is met or ``max_iterations`` is exhausted.
-
-    Only concrete numeric parameter values (int / float / numeric-string)
-    are passed to the EDA tool; advisory strings are discarded to prevent
-    silently re-running with unchanged parameters.
+    This variant also persists lineage in flow_sessions / decision_trace so the
+    fix process is reproducible across iterations.
     """
     history: list[dict[str, Any]] = []
     current_params: dict[str, Any] = {}
     best_wns: float | None = None
 
+    design = DesignSpec(name=design_name, config_path=Path(design_config), pdk=pdk)
+    session_id = _create_flow_session(
+        design,
+        objective="tune_ppa",
+        notes=f"tune_ppa:{stage}:{target_spec}",
+    )
+
+    prev_run_id: int | None = None
+    pending_decision: dict[str, Any] | None = None
+    session_stage_seq = 0
+    target_reached = False
+    session_failed = False
+
     for iteration in range(1, max_iterations + 1):
         logger.info("tune_ppa iteration %d/%d params=%s", iteration, max_iterations, current_params)
+
+        session_stage_seq += 1
+        rerun_reason = (
+            str(pending_decision.get("reason", ""))
+            if pending_decision
+            else f"tune_ppa iteration {iteration}"
+        )
+        pending_inference_id = (
+            pending_decision.get("inference_id") if pending_decision else None
+        )
 
         # Step 1 – run the stage
         run_result = _run_eda_stage(
@@ -2174,6 +2478,16 @@ def _tune_ppa(
             design_config=design_config,
             pdk=pdk,
             params=current_params,
+            run_context={
+                "session_id": session_id,
+                "stage_seq": session_stage_seq,
+                "variant_tag": f"iter_{iteration}",
+                "rerun_reason": rerun_reason,
+                "is_baseline": iteration == 1,
+                "is_selected": False,
+                "parent_run_id": prev_run_id,
+                "root_cause_inference_id": pending_inference_id,
+            },
         )
 
         run_db_id = run_result.get("run_id")
@@ -2191,7 +2505,36 @@ def _tune_ppa(
         if status != "success" or run_db_id is None:
             iteration_record["error"] = run_result.get("error")
             history.append(iteration_record)
+            session_failed = True
+            try:
+                _update_flow_session_status(session_id, status="failed")
+            except Exception:
+                logger.warning("Failed to mark tune_ppa flow_session %s failed", session_id)
             break
+
+        # Link prior suggestion decision to the newly created run.
+        if pending_decision is not None:
+            try:
+                _record_decision_trace(
+                    session_id=session_id,
+                    source_run_id=int(pending_decision["source_run_id"]),
+                    target_run_id=run_db_id,
+                    llm_reason=str(pending_decision.get("reason", "")),
+                    llm_reason_structured=pending_decision.get("reason_structured"),
+                    inference_id=pending_decision.get("inference_id"),
+                    case_id=pending_decision.get("case_id"),
+                    rule_id=pending_decision.get("rule_id"),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist decision_trace %s->%s",
+                    pending_decision.get("source_run_id"),
+                    run_db_id,
+                )
+            finally:
+                pending_decision = None
+
+        prev_run_id = run_db_id
 
         # Step 2 – query timing
         timing = _query_timing(design_name, stage=stage, run_id=run_db_id, limit=1)
@@ -2224,6 +2567,15 @@ def _tune_ppa(
 
         if target_met:
             logger.info("tune_ppa: target met at iteration %d", iteration)
+            target_reached = True
+            try:
+                _update_flow_session_status(
+                    session_id,
+                    status="completed",
+                    baseline_run_id=run_db_id,
+                )
+            except Exception:
+                logger.warning("Failed to finalize tune_ppa flow_session %s", session_id)
             break
 
         if iteration < max_iterations:
@@ -2248,8 +2600,31 @@ def _tune_ppa(
                     iteration,
                 )
             current_params = filtered
+            infer_ctx = _latest_inference_context_for_run(run_db_id)
+            reason_prefix = f"tune_ppa iteration {iteration} -> {iteration + 1}"
+            pending_decision = {
+                "source_run_id": run_db_id,
+                "reason": _decision_reason_from_suggestion(
+                    suggestion,
+                    prefix=reason_prefix,
+                ),
+                "reason_structured": _decision_reason_structured_from_suggestion(
+                    suggestion,
+                    prefix=reason_prefix,
+                ),
+                "inference_id": infer_ctx.get("inference_id"),
+                "case_id": infer_ctx.get("case_id"),
+                "rule_id": infer_ctx.get("rule_id"),
+            }
+
+    if not target_reached and not session_failed:
+        try:
+            _update_flow_session_status(session_id, status="failed")
+        except Exception:
+            logger.warning("Failed to close tune_ppa flow_session %s", session_id)
 
     return {
+        "session_id": session_id,
         "iterations_run": len(history),
         "target_spec": target_spec,
         "target_met": any(r.get("target_met") for r in history),
@@ -2420,20 +2795,24 @@ def _tune_ppa_multistage(
     start_stage: str = "place",
     max_iterations: int = 5,
 ) -> dict[str, Any]:
-    """Multi-stage autonomous PPA tuning loop.
-
-    Each iteration:
-    1. Run all stages from ``rerun_from`` through ``finish``.
-    2. Collect PPA metrics (timing, congestion, utilization).
-    3. Check whether the target is met.
-    4. Identify the bottleneck stage from the violation profile.
-    5. Suggest parameters for that stage via ``suggest_params``.
-    6. Re-run from the bottleneck stage in the next iteration.
-    """
+    """Multi-stage autonomous PPA tuning loop with lineage persistence."""
     history: list[dict[str, Any]] = []
     stage_params: dict[str, dict[str, Any]] = {}  # per-stage param overrides
     rerun_from: str = start_stage
     best_wns: float | None = None
+
+    design = DesignSpec(name=design_name, config_path=Path(design_config), pdk=pdk)
+    session_id = _create_flow_session(
+        design,
+        objective="tune_ppa_multistage",
+        notes=f"tune_ppa_multistage:{start_stage}:{target_spec}",
+    )
+
+    prev_run_id: int | None = None
+    pending_decision: dict[str, Any] | None = None
+    session_stage_seq = 0
+    target_reached = False
+    session_failed = False
 
     # Determine the terminal stage index
     try:
@@ -2464,9 +2843,21 @@ def _tune_ppa_multistage(
 
         last_run_id: int | None = None
         last_timing: dict[str, Any] = {}
+        decision_consumed = False
 
         for stage in stages_to_run:
             params = stage_params.get(stage, {})
+            session_stage_seq += 1
+            rerun_reason = (
+                str(pending_decision.get("reason", ""))
+                if pending_decision and not decision_consumed
+                else f"tune_ppa_multistage iter={iteration} stage={stage}"
+            )
+            pending_inference_id = (
+                pending_decision.get("inference_id")
+                if pending_decision and not decision_consumed
+                else None
+            )
             run_result = _run_eda_stage(
                 backend=backend,
                 stage=stage,
@@ -2474,6 +2865,16 @@ def _tune_ppa_multistage(
                 design_config=design_config,
                 pdk=pdk,
                 params=params,
+                run_context={
+                    "session_id": session_id,
+                    "stage_seq": session_stage_seq,
+                    "variant_tag": f"iter_{iteration}",
+                    "rerun_reason": rerun_reason,
+                    "is_baseline": iteration == 1,
+                    "is_selected": False,
+                    "parent_run_id": prev_run_id,
+                    "root_cause_inference_id": pending_inference_id,
+                },
             )
             stage_record: dict[str, Any] = {
                 "stage": stage,
@@ -2484,9 +2885,38 @@ def _tune_ppa_multistage(
             if run_result.get("status") != "success":
                 stage_record["error"] = run_result.get("error")
                 iteration_record["stages_run"].append(stage_record)
+                session_failed = True
+                try:
+                    _update_flow_session_status(session_id, status="failed")
+                except Exception:
+                    logger.warning("Failed to mark tune_ppa_multistage flow_session %s failed", session_id)
                 break
 
             last_run_id = run_result.get("run_id")
+            if isinstance(last_run_id, int):
+                if pending_decision is not None and not decision_consumed:
+                    try:
+                        _record_decision_trace(
+                            session_id=session_id,
+                            source_run_id=int(pending_decision["source_run_id"]),
+                            target_run_id=last_run_id,
+                            llm_reason=str(pending_decision.get("reason", "")),
+                            llm_reason_structured=pending_decision.get("reason_structured"),
+                            inference_id=pending_decision.get("inference_id"),
+                            case_id=pending_decision.get("case_id"),
+                            rule_id=pending_decision.get("rule_id"),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist decision_trace %s->%s",
+                            pending_decision.get("source_run_id"),
+                            last_run_id,
+                        )
+                    decision_consumed = True
+                    pending_decision = None
+
+                prev_run_id = last_run_id
+
             # Query timing after each stage for progress tracking
             timing = _query_timing(design_name, stage=stage, run_id=last_run_id, limit=1)
             ts = timing.get("summary", [{}])[0] if timing.get("summary") else {}
@@ -2528,6 +2958,15 @@ def _tune_ppa_multistage(
 
         if target_met:
             logger.info("tune_ppa_multistage: target met at iteration %d", iteration)
+            target_reached = True
+            try:
+                _update_flow_session_status(
+                    session_id,
+                    status="completed",
+                    baseline_run_id=last_run_id,
+                )
+            except Exception:
+                logger.warning("Failed to finalize tune_ppa_multistage flow_session %s", session_id)
             break
 
         if iteration < max_iterations and last_run_id is not None:
@@ -2555,7 +2994,34 @@ def _tune_ppa_multistage(
                 # No actionable suggestions; retry from the same stage
                 rerun_from = bottleneck
 
+            infer_ctx = _latest_inference_context_for_run(last_run_id)
+            reason_prefix = (
+                f"tune_ppa_multistage iteration {iteration} "
+                f"rerun_from={rerun_from}"
+            )
+            pending_decision = {
+                "source_run_id": last_run_id,
+                "reason": _decision_reason_from_suggestion(
+                    suggestion,
+                    prefix=reason_prefix,
+                ),
+                "reason_structured": _decision_reason_structured_from_suggestion(
+                    suggestion,
+                    prefix=reason_prefix,
+                ),
+                "inference_id": infer_ctx.get("inference_id"),
+                "case_id": infer_ctx.get("case_id"),
+                "rule_id": infer_ctx.get("rule_id"),
+            }
+
+    if not target_reached and not session_failed:
+        try:
+            _update_flow_session_status(session_id, status="failed")
+        except Exception:
+            logger.warning("Failed to close tune_ppa_multistage flow_session %s", session_id)
+
     return {
+        "session_id": session_id,
         "iterations_run": len(history),
         "target_spec": target_spec,
         "target_met": any(r.get("target_met") for r in history),
@@ -2590,7 +3056,24 @@ def _infer_root_cause_tool(run_id: int, symptoms: str = "") -> dict[str, Any]:
     """Invoke the rule-based inference engine and return ranked hypotheses."""
     from eda_agent.agent.inference.engine import infer
 
-    return infer(run_id=run_id, symptoms=symptoms)
+    result = infer(run_id=run_id, symptoms=symptoms)
+    inference_id = result.get("inference_id")
+    rule_id = None
+    hypotheses = result.get("hypotheses") or []
+    if isinstance(hypotheses, list) and hypotheses:
+        top = hypotheses[0]
+        if isinstance(top, dict):
+            rule_id = top.get("cause_id")
+    if isinstance(inference_id, int) and inference_id > 0:
+        try:
+            _set_flow_session_context_from_run(
+                run_id,
+                inference_id=inference_id,
+                rule_id=rule_id,
+            )
+        except Exception:
+            logger.warning("Failed to persist flow-session inference context", exc_info=True)
+    return result
 
 
 def _confirm_root_cause_tool(
@@ -2599,7 +3082,26 @@ def _confirm_root_cause_tool(
     """Confirm the engineer-approved root cause and save to case memory."""
     from eda_agent.agent.inference.engine import confirm
 
-    return confirm(inference_id=inference_id, confirmed_cause_id=confirmed_cause_id)
+    result = confirm(inference_id=inference_id, confirmed_cause_id=confirmed_cause_id)
+
+    try:
+        with get_db() as db:
+            row = db.execute(
+                text("SELECT run_id FROM root_cause_inferences WHERE id = :id"),
+                {"id": inference_id},
+            ).first()
+        run_id = int(row[0]) if row and row[0] is not None else None
+        if run_id is not None:
+            _set_flow_session_context_from_run(
+                run_id,
+                inference_id=inference_id,
+                case_id=result.get("case_id"),
+                rule_id=confirmed_cause_id,
+            )
+    except Exception:
+        logger.warning("Failed to persist confirmed inference context", exc_info=True)
+
+    return result
 
 
 # ── Dispatch table ────────────────────────────────────────────────────────────
@@ -2669,81 +3171,132 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> str:
 
 # ── Internal DB helpers ───────────────────────────────────────────────────────
 
-def _upsert_run(result: Any, design: DesignSpec) -> int:
-    """Insert the RunResult into the DB and return the integer PK."""
+def _upsert_run(
+    result: Any,
+    design: DesignSpec,
+    db: Any = None,
+    run_context: dict[str, Any] | None = None,
+) -> int:
+    """Insert the RunResult into the DB and return the integer PK.
 
-    with get_db() as db:
-        # Ensure backend exists
-        backend_row = db.execute(
+    If *db* is provided the caller manages the transaction; otherwise a new
+    session is created and committed independently (backward-compatible path).
+    """
+    if db is not None:
+        return _upsert_run_impl(result, design, db, run_context=run_context)
+
+    with get_db() as session:
+        return _upsert_run_impl(result, design, session, run_context=run_context)
+
+
+def _upsert_run_impl(
+    result: Any,
+    design: DesignSpec,
+    db: Any,
+    run_context: dict[str, Any] | None = None,
+) -> int:
+    """Persist a RunResult using an active *db* session."""
+    # Ensure backend exists
+    backend_row = db.execute(
+        text("SELECT id FROM backends WHERE name = :name"),
+        {"name": result.backend_name},
+    ).first()
+    backend_id = backend_row[0] if backend_row else None
+    if backend_id is None:
+        db.execute(
+            text("INSERT INTO backends (name, version) VALUES (:name, :ver)"),
+            {"name": result.backend_name, "ver": "unknown"},
+        )
+        backend_id = db.execute(
             text("SELECT id FROM backends WHERE name = :name"),
             {"name": result.backend_name},
-        ).first()
-        backend_id = backend_row[0] if backend_row else None
-        if backend_id is None:
-            db.execute(
-                text("INSERT INTO backends (name, version) VALUES (:name, :ver)"),
-                {"name": result.backend_name, "ver": "unknown"},
-            )
-            backend_id = db.execute(
-                text("SELECT id FROM backends WHERE name = :name"),
-                {"name": result.backend_name},
-            ).scalar()
+        ).scalar()
 
-        # Ensure design exists
-        design_row = db.execute(
-            text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
-            {"name": design.name, "pdk": design.pdk},
-        ).first()
-        design_id = design_row[0] if design_row else None
-        if design_id is None:
-            db.execute(
-                text(
-                    "INSERT INTO designs (name, pdk, config_path) "
-                    "VALUES (:name, :pdk, :cfg)"
-                ),
-                {"name": design.name, "pdk": design.pdk, "cfg": str(design.config_path)},
-            )
-            design_id = db.execute(
-                text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
-                {"name": design.name, "pdk": design.pdk},
-            ).scalar()
-
+    # Ensure design exists
+    design_row = db.execute(
+        text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
+        {"name": design.name, "pdk": design.pdk},
+    ).first()
+    design_id = design_row[0] if design_row else None
+    if design_id is None:
         db.execute(
             text(
-                """
-                INSERT INTO runs
-                    (run_uuid, backend_id, design_id, stage, status, params,
-                     log_path, report_dir, error_message, started_at, finished_at)
-                VALUES
-                    (:uuid, :bid, :did, :stage, :status, :params,
-                     :log_path, :report_dir, :error, :started, :finished)
-                """
+                "INSERT INTO designs (name, pdk, config_path) "
+                "VALUES (:name, :pdk, :cfg)"
             ),
-            {
-                "uuid": result.run_id,
-                "bid": backend_id,
-                "did": design_id,
-                "stage": result.stage,
-                "status": result.status.value,
-                "params": json.dumps(result.params),
-                "log_path": str(result.log_path or ""),
-                "report_dir": str(result.report_dir or ""),
-                "error": result.error_message,
-                "started": result.started_at,
-                "finished": result.finished_at,
-            },
+            {"name": design.name, "pdk": design.pdk, "cfg": str(design.config_path)},
         )
-        run_id = db.execute(
-            text("SELECT id FROM runs WHERE run_uuid = :uuid"),
-            {"uuid": result.run_id},
+        design_id = db.execute(
+            text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
+            {"name": design.name, "pdk": design.pdk},
         ).scalar()
+
+    ctx = run_context or {}
+
+    db.execute(
+        text(
+            """
+            INSERT INTO runs
+                (run_uuid, backend_id, design_id, session_id, stage, stage_seq,
+                 variant_tag, rerun_reason, is_baseline, is_selected,
+                 parent_run_id, status, params, log_path, report_dir,
+                 error_message, started_at, finished_at)
+            VALUES
+                (:uuid, :bid, :did, :sid, :stage, :stage_seq,
+                 :variant_tag, :rerun_reason, :is_baseline, :is_selected,
+                 :parent_run_id, :status, :params, :log_path, :report_dir,
+                 :error, :started, :finished)
+            """
+        ),
+        {
+            "uuid": result.run_id,
+            "bid": backend_id,
+            "did": design_id,
+            "sid": ctx.get("session_id"),
+            "stage": result.stage,
+            "stage_seq": int(ctx.get("stage_seq", 0) or 0),
+            "variant_tag": str(ctx.get("variant_tag", "") or ""),
+            "rerun_reason": str(ctx.get("rerun_reason", "") or ""),
+            "is_baseline": bool(ctx.get("is_baseline", False)),
+            "is_selected": bool(ctx.get("is_selected", False)),
+            "parent_run_id": ctx.get("parent_run_id"),
+            "status": result.status.value,
+            "params": json.dumps(result.params),
+            "log_path": str(result.log_path or ""),
+            "report_dir": str(result.report_dir or ""),
+            "error": result.error_message,
+            "started": result.started_at,
+            "finished": result.finished_at,
+        },
+    )
+    run_id = db.execute(
+        text("SELECT id FROM runs WHERE run_uuid = :uuid"),
+        {"uuid": result.run_id},
+    ).scalar()
     return run_id
 
 
-def _upsert_artifacts(run_id: int, reports: list[Any]) -> None:
-    """Persist collected report files into artifacts table (best effort)."""
-    with get_db() as db:
-        for rpt in reports:
+def _upsert_artifacts(run_id: int, reports: list[Any], db: Any = None) -> None:
+    """Persist collected report files into artifacts table (best effort).
+
+    If *db* is provided the caller manages the transaction; otherwise a new
+    session is created independently.
+    """
+    if db is not None:
+        _upsert_artifacts_impl(run_id, reports, db)
+        return
+    with get_db() as session:
+        _upsert_artifacts_impl(run_id, reports, session)
+
+
+def _upsert_artifacts_with_db(run_id: int, reports: list[Any], db: Any) -> None:
+    """Backward-compat alias — delegates to _upsert_artifacts."""
+    _upsert_artifacts_impl(run_id, reports, db)
+
+
+def _upsert_artifacts_impl(run_id: int, reports: list[Any], db: Any) -> None:
+    """Internal: persist artifacts using an active *db* session."""
+    for rpt in reports:
             path = Path(str(rpt.path))
             file_size = path.stat().st_size if path.exists() else None
             db.execute(
@@ -2762,139 +3315,152 @@ def _upsert_artifacts(run_id: int, reports: list[Any]) -> None:
             )
 
 
-def _ingest_records(records: list[dict], run_id: int, stage: str) -> None:
-    """Fan out parsed records into the appropriate DB tables."""
-    with get_db() as db:
-        for rec in records:
-            kind = rec.get("kind")
-            if kind == "summary" and "wns_ns" in rec:
-                db.execute(
-                    text(
-                        "INSERT INTO timing_summary "
-                        "(run_id, view, wns_ns, tns_ns, failing_endpoints, "
-                        " fmax_mhz, clock_skew_ns, max_slew_violations, "
-                        " max_fanout_violations, max_cap_violations, "
-                        " setup_violations, hold_violations, "
-                        " critical_path_delay_ns, slack_cpd_ratio_pct) "
-                        "VALUES (:run_id, :view, :wns, :tns, :fep, "
-                        " :fmax, :skew, :slew_vio, :fanout_vio, :cap_vio, "
-                        " :setup_vio, :hold_vio, :cpd, :ratio)"
-                    ),
-                    {
-                        "run_id": run_id,
-                        "view": rec.get("view", "default"),
-                        "wns": rec.get("wns_ns"),
-                        "tns": rec.get("tns_ns"),
-                        "fep": rec.get("failing_endpoints"),
-                        "fmax": rec.get("fmax_mhz"),
-                        "skew": rec.get("clock_skew_ns"),
-                        "slew_vio": rec.get("max_slew_violations"),
-                        "fanout_vio": rec.get("max_fanout_violations"),
-                        "cap_vio": rec.get("max_cap_violations"),
-                        "setup_vio": rec.get("setup_violations"),
-                        "hold_vio": rec.get("hold_violations"),
-                        "cpd": rec.get("critical_path_delay_ns"),
-                        "ratio": rec.get("slack_cpd_ratio_pct"),
-                    },
-                )
-            elif kind == "path":
-                db.execute(
-                    text(
-                        "INSERT INTO timing_paths "
-                        "(run_id, startpoint, endpoint, path_group, slack_ns) "
-                        "VALUES (:run_id, :sp, :ep, :pg, :slack)"
-                    ),
-                    {
-                        "run_id": run_id,
-                        "sp": rec.get("startpoint", ""),
-                        "ep": rec.get("endpoint", ""),
-                        "pg": rec.get("path_group"),
-                        "slack": rec.get("slack_ns", 0.0),
-                    },
-                )
-            elif kind == "hotspot":
-                db.execute(
-                    text(
-                        "INSERT INTO congestion_hotspots "
-                        "(run_id, geom, overflow) "
-                        "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow)"
-                    ),
-                    {
-                        "run_id": run_id,
-                        "wkt": rec["wkt"],
-                        "overflow": rec.get("overflow", 0),
-                    },
-                )
-            elif kind == "orfs_violation":
-                # ORFS violation records from congestion-*.rpt files
-                wkt = rec.get("wkt")
-                if not wkt:
-                    continue  # Skip violations without bounding box
-                db.execute(
-                    text(
-                        "INSERT INTO congestion_hotspots "
-                        "(run_id, geom, overflow, layer) "
-                        "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow, :layer)"
-                    ),
-                    {
-                        "run_id": run_id,
-                        "wkt": wkt,
-                        "overflow": rec.get("overflow", 0),
-                        "layer": rec.get("layer"),
-                    },
-                )
-            elif kind == "summary" and "design_area_um2" in rec:
-                db.execute(
-                    text(
-                        "INSERT INTO utilization_summary "
-                        "(run_id, design_area_um2, utilization_pct, num_cells, num_registers) "
-                        "VALUES (:run_id, :area, :util, :cells, :regs)"
-                    ),
-                    {
-                        "run_id": run_id,
-                        "area": rec.get("design_area_um2"),
-                        "util": rec.get("utilization_pct"),
-                        "cells": rec.get("num_cells"),
-                        "regs": rec.get("num_registers"),
-                    },
-                )
-            elif kind == "summary" and "total_power_w" in rec:
-                db.execute(
-                    text(
-                        "INSERT INTO power_summary "
-                        "(run_id, internal_power_w, switching_power_w, "
-                        "leakage_power_w, total_power_w) "
-                        "VALUES (:run_id, :int, :sw, :lk, :tot)"
-                    ),
-                    {
-                        "run_id": run_id,
-                        "int": rec.get("internal_power_w"),
-                        "sw": rec.get("switching_power_w"),
-                        "lk": rec.get("leakage_power_w"),
-                        "tot": rec.get("total_power_w"),
-                    },
-                )
-            elif kind == "summary" and "total_violations" in rec:
-                db.execute(
-                    text(
-                        "INSERT INTO drc_violations "
-                        "(run_id, violation_type, total_violations) "
-                        "VALUES (:run_id, 'SUMMARY', :total)"
-                    ),
-                    {"run_id": run_id, "total": rec.get("total_violations")},
-                )
-            elif kind == "drc_violation":
-                db.execute(
-                    text(
-                        "INSERT INTO drc_violations "
-                        "(run_id, violation_type, layer, nets, bbox_wkt) "
-                        "VALUES (:run_id, :vtype, :layer, :nets, :bbox)"
-                    ),
-                    {
-                        "run_id": run_id,
-                        "vtype": rec.get("violation_type", ""),
-                        "layer": rec.get("layer"),
-                        "nets": json.dumps(rec.get("nets") or []),
-                        "bbox": rec.get("bbox_wkt"),
-                    },
-                )
+def _ingest_records(records: list[dict], run_id: int, stage: str, db: Any = None) -> None:
+    """Fan out parsed records into the appropriate DB tables.
+
+    If *db* is provided the caller manages the transaction; otherwise a new
+    session is created and committed independently.
+    """
+    if db is not None:
+        _ingest_records_impl(records, run_id, stage, db)
+        return
+
+    with get_db() as session:
+        _ingest_records_impl(records, run_id, stage, session)
+
+
+def _ingest_records_impl(records: list[dict], run_id: int, stage: str, db: Any) -> None:
+    """Fan out parsed records using an active *db* session."""
+    for rec in records:
+        kind = rec.get("kind")
+        if kind == "summary" and "wns_ns" in rec:
+            db.execute(
+                text(
+                    "INSERT INTO timing_summary "
+                    "(run_id, view, wns_ns, tns_ns, failing_endpoints, "
+                    " fmax_mhz, clock_skew_ns, max_slew_violations, "
+                    " max_fanout_violations, max_cap_violations, "
+                    " setup_violations, hold_violations, "
+                    " critical_path_delay_ns, slack_cpd_ratio_pct) "
+                    "VALUES (:run_id, :view, :wns, :tns, :fep, "
+                    " :fmax, :skew, :slew_vio, :fanout_vio, :cap_vio, "
+                    " :setup_vio, :hold_vio, :cpd, :ratio)"
+                ),
+                {
+                    "run_id": run_id,
+                    "view": rec.get("view", "default"),
+                    "wns": rec.get("wns_ns"),
+                    "tns": rec.get("tns_ns"),
+                    "fep": rec.get("failing_endpoints"),
+                    "fmax": rec.get("fmax_mhz"),
+                    "skew": rec.get("clock_skew_ns"),
+                    "slew_vio": rec.get("max_slew_violations"),
+                    "fanout_vio": rec.get("max_fanout_violations"),
+                    "cap_vio": rec.get("max_cap_violations"),
+                    "setup_vio": rec.get("setup_violations"),
+                    "hold_vio": rec.get("hold_violations"),
+                    "cpd": rec.get("critical_path_delay_ns"),
+                    "ratio": rec.get("slack_cpd_ratio_pct"),
+                },
+            )
+        elif kind == "path":
+            db.execute(
+                text(
+                    "INSERT INTO timing_paths "
+                    "(run_id, startpoint, endpoint, path_group, slack_ns) "
+                    "VALUES (:run_id, :sp, :ep, :pg, :slack)"
+                ),
+                {
+                    "run_id": run_id,
+                    "sp": rec.get("startpoint", ""),
+                    "ep": rec.get("endpoint", ""),
+                    "pg": rec.get("path_group"),
+                    "slack": rec.get("slack_ns", 0.0),
+                },
+            )
+        elif kind == "hotspot":
+            db.execute(
+                text(
+                    "INSERT INTO congestion_hotspots "
+                    "(run_id, geom, overflow) "
+                    "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow)"
+                ),
+                {
+                    "run_id": run_id,
+                    "wkt": rec["wkt"],
+                    "overflow": rec.get("overflow", 0),
+                },
+            )
+        elif kind == "orfs_violation":
+            # ORFS violation records from congestion-*.rpt files
+            wkt = rec.get("wkt")
+            if not wkt:
+                continue  # Skip violations without bounding box
+            db.execute(
+                text(
+                    "INSERT INTO congestion_hotspots "
+                    "(run_id, geom, overflow, layer) "
+                    "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow, :layer)"
+                ),
+                {
+                    "run_id": run_id,
+                    "wkt": wkt,
+                    "overflow": rec.get("overflow", 0),
+                    "layer": rec.get("layer"),
+                },
+            )
+        elif kind == "summary" and "design_area_um2" in rec:
+            db.execute(
+                text(
+                    "INSERT INTO utilization_summary "
+                    "(run_id, design_area_um2, utilization_pct, num_cells, num_registers) "
+                    "VALUES (:run_id, :area, :util, :cells, :regs)"
+                ),
+                {
+                    "run_id": run_id,
+                    "area": rec.get("design_area_um2"),
+                    "util": rec.get("utilization_pct"),
+                    "cells": rec.get("num_cells"),
+                    "regs": rec.get("num_registers"),
+                },
+            )
+        elif kind == "summary" and "total_power_w" in rec:
+            db.execute(
+                text(
+                    "INSERT INTO power_summary "
+                    "(run_id, internal_power_w, switching_power_w, "
+                    "leakage_power_w, total_power_w) "
+                    "VALUES (:run_id, :int, :sw, :lk, :tot)"
+                ),
+                {
+                    "run_id": run_id,
+                    "int": rec.get("internal_power_w"),
+                    "sw": rec.get("switching_power_w"),
+                    "lk": rec.get("leakage_power_w"),
+                    "tot": rec.get("total_power_w"),
+                },
+            )
+        elif kind == "summary" and "total_violations" in rec:
+            db.execute(
+                text(
+                    "INSERT INTO drc_violations "
+                    "(run_id, violation_type, total_violations) "
+                    "VALUES (:run_id, 'SUMMARY', :total)"
+                ),
+                {"run_id": run_id, "total": rec.get("total_violations")},
+            )
+        elif kind == "drc_violation":
+            db.execute(
+                text(
+                    "INSERT INTO drc_violations "
+                    "(run_id, violation_type, layer, nets, bbox_wkt) "
+                    "VALUES (:run_id, :vtype, :layer, :nets, :bbox)"
+                ),
+                {
+                    "run_id": run_id,
+                    "vtype": rec.get("violation_type", ""),
+                    "layer": rec.get("layer"),
+                    "nets": json.dumps(rec.get("nets") or []),
+                    "bbox": rec.get("bbox_wkt"),
+                },
+            )

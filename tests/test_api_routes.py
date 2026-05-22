@@ -253,6 +253,57 @@ class TestRunsRouter:
         resp = unauthed_client.get("/runs/")
         assert resp.status_code == 401
 
+    def test_get_session_trace(self, client):
+        fake_trace = {
+            "session": {"id": 1, "status": "active"},
+            "runs": [],
+            "stage_outcomes": [],
+            "decision_trace": [],
+        }
+
+        with patch(
+            "eda_agent.api.routers.runs_router.EDAQueryRepository.get_session_trace",
+            return_value=fake_trace,
+        ) as mock_trace:
+            resp = client.get("/runs/sessions/1/trace")
+
+        assert resp.status_code == 200
+        assert resp.json()["session"]["id"] == 1
+        mock_trace.assert_called_once()
+
+    def test_get_session_trace_with_filters(self, client):
+        fake_trace = {
+            "session": {"id": 2, "status": "completed"},
+            "runs": [{"id": 10, "stage": "place", "stage_seq": 2}],
+            "stage_outcomes": [],
+            "decision_trace": [],
+        }
+
+        with patch(
+            "eda_agent.api.routers.runs_router.EDAQueryRepository.get_session_trace",
+            return_value=fake_trace,
+        ) as mock_trace:
+            resp = client.get(
+                "/runs/sessions/2/trace?stage=place&from_seq=2&to_seq=4&human_approved=true"
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["runs"][0]["stage"] == "place"
+        _, kwargs = mock_trace.call_args
+        assert kwargs["stage"] == "place"
+        assert kwargs["from_seq"] == 2
+        assert kwargs["to_seq"] == 4
+        assert kwargs["human_approved"] is True
+
+    def test_get_session_trace_not_found(self, client):
+        with patch(
+            "eda_agent.api.routers.runs_router.EDAQueryRepository.get_session_trace",
+            return_value={"error": "Session 999 not found"},
+        ):
+            resp = client.get("/runs/sessions/999/trace")
+
+        assert resp.status_code == 404
+
 
 # ── Agent chat router ─────────────────────────────────────────────────────────
 

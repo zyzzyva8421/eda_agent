@@ -14,6 +14,7 @@ from eda_agent.db.schema import Base
 _engine = create_engine(
     settings.database_url,
     pool_pre_ping=True,
+    pool_recycle=3600,
     pool_size=10,
     max_overflow=20,
     echo=settings.log_level == "DEBUG",
@@ -51,9 +52,17 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def get_db_dependency():
-    """FastAPI dependency that yields a session per request."""
+    """FastAPI dependency that yields a session per request.
+
+    Commits on success, rolls back on exception — consistent with
+    :func:`get_db` behaviour so callers do not need to manage transactions.
+    """
     db = SessionLocal()
     try:
         yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
