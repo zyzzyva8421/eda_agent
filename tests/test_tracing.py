@@ -16,8 +16,9 @@ from eda_agent.config import settings
 
 def test_tracing_disabled_by_default():
     """Tracing should be disabled when no API key is set."""
-    # When LANGSMITH_API_KEY is empty, should not be enabled
-    assert not is_tracing_enabled()
+    with patch.object(settings, "langsmith_enabled", False), \
+         patch.object(settings, "langsmith_api_key", ""):
+        assert not is_tracing_enabled()
 
 
 def test_tracer_wrapper_adds_metadata():

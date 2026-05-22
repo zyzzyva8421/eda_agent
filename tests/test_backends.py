@@ -115,20 +115,27 @@ def test_orfs_is_available_without_install(tmp_path):
 
 
 def test_innovus_stage_scripts_restore_previous_stage_outputs():
+    """Each stage script must (a) call restoreDesign and (b) default to the correct previous stage."""
     from pathlib import Path
 
     base = Path("/home/aliu/eda_agent/eda_agent/backends/scripts/innovus")
+    # Verify the restore call exists and that the default prev_stage is correct.
+    # Scripts use dynamic variable: set prev_db "$work_dir/$prev_stage/${prev_stage}.dat"
+    # then: restoreDesign $prev_db $design_name
     expectations = {
-        "powerplan.tcl": 'restoreDesign $design_dir/work/floorplan/floorplan.dat $design_name',
-        "place.tcl": 'restoreDesign $design_dir/work/powerplan/powerplan.dat $design_name',
-        "prects.tcl": 'restoreDesign $design_dir/work/place/place.dat $design_name',
-        "cts.tcl": 'restoreDesign $design_dir/work/prects/prects.dat $design_name',
-        "postcts.tcl": 'restoreDesign $design_dir/work/cts/cts.dat $design_name',
-        "route.tcl": 'restoreDesign $design_dir/work/postcts/postcts.dat $design_name',
-        "postroute.tcl": 'restoreDesign $design_dir/work/route/route.dat $design_name',
-        "signoff.tcl": 'restoreDesign $postroute_dir/postroute.dat $design_name',
+        "powerplan.tcl": "floorplan",
+        "place.tcl": "powerplan",
+        "prects.tcl": "place",
+        "cts.tcl": "prects",
+        "postcts.tcl": "cts",
+        "route.tcl": "postcts",
+        "postroute.tcl": "route",
+        "signoff.tcl": "postroute",
     }
 
-    for file_name, needle in expectations.items():
+    for file_name, prev_stage in expectations.items():
         text = (base / file_name).read_text()
-        assert needle in text, f"{file_name} must restore from previous stage output"
+        assert 'restoreDesign $prev_db $design_name' in text, \
+            f"{file_name} must call restoreDesign"
+        assert f'set prev_stage "{prev_stage}"' in text, \
+            f"{file_name} must default prev_stage to '{prev_stage}'"

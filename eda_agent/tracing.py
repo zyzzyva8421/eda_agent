@@ -37,8 +37,7 @@ def get_tracer(project_name: str = "eda-agent") -> Client:
         )
     _tracer_client = Client(
         api_key=settings.langsmith_api_key,
-        project_name=project_name,
-        endpoint=settings.langsmith_endpoint,
+        api_url=settings.langsmith_endpoint,
     )
     return _tracer_client
 
