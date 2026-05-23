@@ -15,11 +15,12 @@ import httpx
 import json
 import os
 import re
+import shlex
+import subprocess
 
 import pytest
 
 # Load environment
-from pathlib import Path
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -29,9 +30,12 @@ TESTCASE_ROOT = Path("/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1")
 TESTCASE_CONFIG = TESTCASE_ROOT / "FPR/.test"
 
 from eda_agent.backends import get_backend
-from eda_agent.backends.base import DesignSpec
+from eda_agent.api.routers.runs_router import RunStageRequest, trigger_run
+from eda_agent.db.repository import EDAQueryRepository
+from eda_agent.db.session import get_db
 from eda_agent.parsers import get_parser
 from eda_agent.config import settings
+from tests.vm_resource_guard import ensure_vm_test_resources
 
 
 def extract_congestion_metrics(design_path: Path) -> dict[str, Any]:
@@ -59,6 +63,79 @@ def extract_congestion_metrics(design_path: Path) -> dict[str, Any]:
                 metrics["utilization_error"] = str(e)
     
     return metrics
+
+
+def _trigger_place_run(params: dict[str, Any]) -> dict[str, Any]:
+    """Run place stage through API/tool layer."""
+    req = RunStageRequest(
+        backend="innovus",
+        stage="place",
+        design_name="InnovusBlk_18_1",
+        design_config=str(TESTCASE_CONFIG),
+        pdk="tsmc18",
+        params=params,
+    )
+    return trigger_run(req=req, _user={"username": "vm-test", "is_active": True})
+
+
+def _get_run_row(run_id: int) -> dict[str, Any]:
+    with get_db() as db:
+        row = EDAQueryRepository.get_run(db, run_id)
+    if not row:
+        raise AssertionError(f"Run {run_id} not found in DB")
+    return row
+
+
+def _write_remote_tcl(commands: list[str], remote_workdir: str) -> str:
+    """Write TCL content to remote VM and return remote path."""
+    remote_path = f"{remote_workdir}/scripts/eda_fix_congestion.tcl"
+    escaped_cmds = [c.replace("\\", "\\\\").replace('"', '\\"') for c in commands]
+    wrapped_lines = [
+        "# Auto-generated congestion fix script with best-effort command execution",
+        "set __eda_fix_cmds {",
+    ]
+    for cmd in escaped_cmds:
+        wrapped_lines.append(f'    "{cmd}"')
+    wrapped_lines.extend(
+        [
+            "}",
+            "foreach __cmd $__eda_fix_cmds {",
+            "    if {[catch {eval $__cmd} __err]} {",
+            "        puts \"EDA_FIX_WARN command failed: $__cmd\"",
+            "        puts \"EDA_FIX_WARN error: $__err\"",
+            "    }",
+            "}",
+            "puts \"EDA_FIX finished\"",
+            "exit",
+        ]
+    )
+    content = "\n".join(wrapped_lines) + "\n"
+    quoted = content.replace("'", "'\\''")
+    cmd = (
+        f"mkdir -p {shlex.quote(remote_workdir)}/scripts && "
+        f"cat > {shlex.quote(remote_path)} <<'TCLEOF'\n{quoted}\nTCLEOF"
+    )
+    result = subprocess.run(
+        [
+            "ssh",
+            "-p",
+            "22",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "host@192.168.58.10",
+            cmd,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to upload remote TCL: {result.stderr or result.stdout}"
+        )
+    return remote_path
 
 
 def ask_llm_to_fix_congestion(congestion_data: dict, design_name: str) -> dict[str, Any]:
@@ -114,79 +191,97 @@ Respond in JSON format:
         return {"error": str(e)}
 
 
-def run_place_with_fix(design: DesignSpec, backend, tcl_commands: list[str]) -> dict:
-    """Run place stage with custom TCL commands."""
-    
-    # Combine commands into TCL script
-    tcl_content = "\n".join(tcl_commands)
-    tcl_file = Path("/tmp/eda_fix_congestion.tcl")
-    tcl_file.write_text(tcl_content)
-    
-    params = {
-        "tcl": str(tcl_file),
-        "timeout_sec": 1800,
-    }
-    
-    result = backend.run_stage("place", design, params)
+def run_place_with_fix(tcl_commands: list[str]) -> dict[str, Any]:
+    """Run place stage with a remote TCL script through API/tool layer."""
+    allowed_prefixes = ("set_db ", "set_app_options ")
+    filtered_commands = [
+        cmd.strip()
+        for cmd in tcl_commands
+        if cmd.strip().startswith(allowed_prefixes)
+    ]
+    if not filtered_commands:
+        filtered_commands = [
+            "set_db route.global_violation_threshold 0",
+        ]
+
+    remote_tcl = _write_remote_tcl(filtered_commands, str(TESTCASE_ROOT))
+    try:
+        result = _trigger_place_run(
+            {
+                "tcl": remote_tcl,
+                "timeout_sec": 1800,
+                "workdir": str(TESTCASE_ROOT),
+            }
+        )
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "run_id": None,
+            "log_path": None,
+            "error": str(exc),
+        }
     return {
-        "status": result.status.value,
-        "log_path": str(result.log_path),
-        "error": result.error_message,
+        "status": result.get("status"),
+        "run_id": result.get("run_id"),
+        "log_path": result.get("log_path"),
+        "error": result.get("error"),
     }
 
 
 def test_congestion_fix_iterative():
     """Test iterative congestion fix workflow."""
-    
     backend = get_backend("innovus")
     
     if not backend.is_available():
         print("[SKIP] Innovus not available")
         return
+
+    ensure_vm_test_resources()
     
     print(f"Testing congestion fix workflow on {backend.name}")
     
-    design = DesignSpec(
-        name="InnovusBlk_18_1",
-        config_path=TESTCASE_CONFIG,
-        pdk="unknown",
-    )
-    
     # Step 1: Run place stage (baseline)
     print("\n=== Step 1: Running place stage (baseline) ===")
-    result = backend.run_stage(
-        "place",
-        design,
+    result = _trigger_place_run(
         {
             "timeout_sec": 1800,
             "workdir": str(TESTCASE_ROOT),
-        },
+        }
     )
-    print(f"Status: {result.status.value}")
+    print(f"Status: {result.get('status')}")
     
-    if result.status.value != "success":
-        print(f"[FAIL] Place stage failed: {result.error_message}")
+    if result.get("status") != "success":
+        print(f"[FAIL] Place stage failed: {result.get('error')}")
         return
+
+    baseline_run_id = int(result["run_id"])
+    baseline_run = _get_run_row(baseline_run_id)
+    baseline_report_dir = Path(str(baseline_run["report_dir"]))
     
     # Step 2: Get congestion metrics
     print("\n=== Step 2: Parsing congestion metrics ===")
-    congestion = extract_congestion_metrics(design.config_path)
+    congestion = extract_congestion_metrics(baseline_report_dir)
     print(f"Congestion: {json.dumps(congestion, indent=2)}")
     
     # Step 3: Ask LLM for fix suggestions
     print("\n=== Step 3: Asking LLM for fix suggestions ===")
-    llm_response = ask_llm_to_fix_congestion(congestion, design.name)
+    llm_response = ask_llm_to_fix_congestion(congestion, "InnovusBlk_18_1")
     print(f"LLM Response: {json.dumps(llm_response, indent=2)}")
     
     if "suggested_tcl_commands" in llm_response:
         # Step 4: Apply fixes
         print("\n=== Step 4: Applying fixes ===")
-        fix_result = run_place_with_fix(design, backend, llm_response["suggested_tcl_commands"])
+        fix_result = run_place_with_fix(llm_response["suggested_tcl_commands"])
         print(f"Fix result: {fix_result}")
         
         # Step 5: Compare results
         print("\n=== Step 5: Comparing results ===")
-        new_congestion = extract_congestion_metrics(design.config_path)
+        if fix_result.get("status") == "success" and fix_result.get("run_id") is not None:
+            new_run = _get_run_row(int(fix_result["run_id"]))
+            new_report_dir = Path(str(new_run["report_dir"]))
+            new_congestion = extract_congestion_metrics(new_report_dir)
+        else:
+            new_congestion = {"error": fix_result.get("error", "place fix failed")}
         print(f"New congestion: {json.dumps(new_congestion, indent=2)}")
     
     return {
@@ -196,36 +291,47 @@ def test_congestion_fix_iterative():
 
 
 def test_congestion_vm_baseline_reports():
-    """Run the real VM testcase baseline and assert the generated reports are parsable."""
+    """Run baseline through API/tool layer and assert parsed metrics in DB and reports."""
     backend = get_backend("innovus")
 
     if not backend.is_available():
         pytest.skip("Innovus not available")
 
-    design = DesignSpec(
-        name="InnovusBlk_18_1",
-        config_path=TESTCASE_CONFIG,
-        pdk="unknown",
-    )
+    ensure_vm_test_resources()
 
-    result = backend.run_stage(
-        "place",
-        design,
+    result = _trigger_place_run(
         {
             "timeout_sec": 1800,
             "workdir": str(TESTCASE_ROOT),
-        },
+        }
     )
-    assert result.status.value == "success"
-    assert result.report_dir is not None and result.report_dir.is_dir()
+    assert result.get("status") == "success", json.dumps(result, default=str)
+    run_id = int(result["run_id"])
 
-    reports = backend.collect_reports(result)
-    report_types = {report.report_type for report in reports}
-    assert "innovus_congestion" in report_types
-    assert "innovus_utilization" in report_types
-    assert "innovus_timing" in report_types
+    run_row = _get_run_row(run_id)
+    report_dir = Path(str(run_row["report_dir"]))
+    assert report_dir.is_dir()
 
-    parsed = extract_congestion_metrics(result.report_dir)
+    with get_db() as db:
+        timing = EDAQueryRepository.get_timing(
+            db,
+            design_name="InnovusBlk_18_1",
+            run_id=run_id,
+            limit=20,
+        )
+        utilization = EDAQueryRepository.get_utilization(
+            db,
+            design_name="InnovusBlk_18_1",
+            run_id=run_id,
+            limit=20,
+        )
+        congestion_rows = EDAQueryRepository.get_congestion(db, run_id=run_id, limit=50)
+
+    assert timing.get("summary")
+    assert utilization
+    assert congestion_rows
+
+    parsed = extract_congestion_metrics(report_dir)
     assert "congestion" in parsed
     assert "utilization" in parsed
     assert parsed["congestion"][0]["total_overflow"] >= 0

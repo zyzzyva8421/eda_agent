@@ -11,7 +11,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from eda_agent.api.auth import get_current_user
-from eda_agent.agent.tools import execute_tool
+from eda_agent.agent.tools import _create_flow_session, execute_tool
+from eda_agent.backends.base import DesignSpec
 from eda_agent.db.repository import EDAQueryRepository
 from eda_agent.db.session import get_db_dependency
 
@@ -34,6 +35,17 @@ def trigger_run(
     _user: dict = Depends(get_current_user),
 ):
     """Trigger a backend stage asynchronously (runs inline for now)."""
+    design = DesignSpec(
+        name=req.design_name,
+        config_path=req.design_config,
+        pdk=req.pdk,
+    )
+    session_id = _create_flow_session(
+        design,
+        objective=str((req.params or {}).get("_objective", "pnr")),
+        notes=f"single_stage:{req.stage}",
+    )
+
     result_json = execute_tool(
         "run_eda_stage",
         {
@@ -43,11 +55,22 @@ def trigger_run(
             "design_config": req.design_config,
             "pdk": req.pdk,
             "params": req.params,
+            "run_context": {
+                "session_id": session_id,
+                "stage_seq": 1,
+                "variant_tag": "baseline",
+                "rerun_reason": f"single_stage:{req.stage}",
+                "is_baseline": True,
+                "is_selected": False,
+            },
         },
     )
     data = json.loads(result_json)
-    if isinstance(data, dict) and "error" in data:
-        logger.error("run_eda_stage error: %s", data["error"])
+    error_text = ""
+    if isinstance(data, dict):
+        error_text = str(data.get("error") or "").strip()
+    if isinstance(data, dict) and error_text:
+        logger.error("run_eda_stage error: %s", error_text)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An internal error occurred while running the EDA stage.",

@@ -237,17 +237,72 @@ class TestRunsRouter:
 
     def test_trigger_run_blocked_by_guardrail(self, client):
         """clean=True in params must come back as blocked (guardrail fires)."""
-        resp = client.post("/runs/", json={
-            "backend": "orfs",
-            "stage": "synth",
-            "design_name": "gcd",
-            "design_config": "/tmp/x",
-            "pdk": "sky130hd",
-            "params": {"clean": True},
-        })
+        with patch("eda_agent.api.routers.runs_router._create_flow_session", return_value=1):
+            resp = client.post("/runs/", json={
+                "backend": "orfs",
+                "stage": "synth",
+                "design_name": "gcd",
+                "design_config": "/tmp/x",
+                "pdk": "sky130hd",
+                "params": {"clean": True},
+            })
         # run_eda_stage is a different tool from run_eda_flow; clean is a top-level arg
         # Result depends on tool signature; just verify it doesn't crash
         assert resp.status_code in (200, 202, 400, 422, 500)
+
+    def test_trigger_run_injects_session_context(self, client):
+        fake_result = {
+            "run_id": 101,
+            "status": "success",
+            "stage": "place",
+        }
+        with patch("eda_agent.api.routers.runs_router._create_flow_session", return_value=77), patch(
+            "eda_agent.api.routers.runs_router.execute_tool",
+            return_value=json.dumps(fake_result),
+        ) as mock_tool:
+            resp = client.post(
+                "/runs/",
+                json={
+                    "backend": "innovus",
+                    "stage": "place",
+                    "design_name": "InnovusBlk_18_1",
+                    "design_config": "/tmp/config",
+                    "pdk": "tsmc18",
+                    "params": {},
+                },
+            )
+
+        assert resp.status_code == 202
+        _, args = mock_tool.call_args[0]
+        assert args["run_context"]["session_id"] == 77
+        assert args["run_context"]["stage_seq"] == 1
+        assert args["run_context"]["variant_tag"] == "baseline"
+
+    def test_trigger_run_allows_blank_error_field(self, client):
+        fake_result = {
+            "run_id": 102,
+            "status": "success",
+            "stage": "place",
+            "error": "   ",
+        }
+        with patch("eda_agent.api.routers.runs_router._create_flow_session", return_value=88), patch(
+            "eda_agent.api.routers.runs_router.execute_tool",
+            return_value=json.dumps(fake_result),
+        ):
+            resp = client.post(
+                "/runs/",
+                json={
+                    "backend": "innovus",
+                    "stage": "place",
+                    "design_name": "InnovusBlk_18_1",
+                    "design_config": "/tmp/config",
+                    "pdk": "tsmc18",
+                    "params": {},
+                },
+            )
+
+        assert resp.status_code == 202
+        assert resp.json()["run_id"] == 102
 
     def test_list_runs_requires_auth(self, unauthed_client):
         resp = unauthed_client.get("/runs/")
