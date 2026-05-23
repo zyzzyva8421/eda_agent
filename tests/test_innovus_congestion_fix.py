@@ -16,12 +16,17 @@ import json
 import os
 import re
 
+import pytest
+
 # Load environment
 from pathlib import Path
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / ".env")
+
+TESTCASE_ROOT = Path("/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1")
+TESTCASE_CONFIG = TESTCASE_ROOT / "FPR/.test"
 
 from eda_agent.backends import get_backend
 from eda_agent.backends.base import DesignSpec
@@ -38,7 +43,7 @@ def extract_congestion_metrics(design_path: Path) -> dict[str, Any]:
     if conparser:
         for rpt in design_path.glob("*congestion*.rpt"):
             try:
-                data = conparser.parse(rpt)
+                data = conparser.parse_file(rpt)
                 metrics["congestion"] = data
             except Exception as e:
                 metrics["congestion_error"] = str(e)
@@ -48,7 +53,7 @@ def extract_congestion_metrics(design_path: Path) -> dict[str, Any]:
     if utilparser:
         for rpt in design_path.glob("*area*.rpt"):
             try:
-                data = utilparser.parse(rpt)
+                data = utilparser.parse_file(rpt)
                 metrics["utilization"] = data
             except Exception as e:
                 metrics["utilization_error"] = str(e)
@@ -143,13 +148,20 @@ def test_congestion_fix_iterative():
     
     design = DesignSpec(
         name="InnovusBlk_18_1",
-        config_path=Path("/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1/FPR/.test"),
+        config_path=TESTCASE_CONFIG,
         pdk="unknown",
     )
     
     # Step 1: Run place stage (baseline)
     print("\n=== Step 1: Running place stage (baseline) ===")
-    result = backend.run_stage("place", design, {"timeout_sec": 1800})
+    result = backend.run_stage(
+        "place",
+        design,
+        {
+            "timeout_sec": 1800,
+            "workdir": str(TESTCASE_ROOT),
+        },
+    )
     print(f"Status: {result.status.value}")
     
     if result.status.value != "success":
@@ -181,6 +193,43 @@ def test_congestion_fix_iterative():
         "baseline_congestion": congestion,
         "llm_suggestion": llm_response,
     }
+
+
+def test_congestion_vm_baseline_reports():
+    """Run the real VM testcase baseline and assert the generated reports are parsable."""
+    backend = get_backend("innovus")
+
+    if not backend.is_available():
+        pytest.skip("Innovus not available")
+
+    design = DesignSpec(
+        name="InnovusBlk_18_1",
+        config_path=TESTCASE_CONFIG,
+        pdk="unknown",
+    )
+
+    result = backend.run_stage(
+        "place",
+        design,
+        {
+            "timeout_sec": 1800,
+            "workdir": str(TESTCASE_ROOT),
+        },
+    )
+    assert result.status.value == "success"
+    assert result.report_dir is not None and result.report_dir.is_dir()
+
+    reports = backend.collect_reports(result)
+    report_types = {report.report_type for report in reports}
+    assert "innovus_congestion" in report_types
+    assert "innovus_utilization" in report_types
+    assert "innovus_timing" in report_types
+
+    parsed = extract_congestion_metrics(result.report_dir)
+    assert "congestion" in parsed
+    assert "utilization" in parsed
+    assert parsed["congestion"][0]["total_overflow"] >= 0
+    assert parsed["utilization"][0]["design_area_um2"] > 0
 
 
 if __name__ == "__main__":

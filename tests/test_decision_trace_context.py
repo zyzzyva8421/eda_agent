@@ -153,8 +153,7 @@ def test_record_decision_trace_fallback_structured_reason():
             llm_reason="fallback text",
         )
 
-    execute_args, _ = db.execute.call_args
-    params = execute_args[1]
+    params = db.execute.call_args.args[1]
     structured_raw = params["llm_reason_structured"]
     structured = json.loads(structured_raw)
     assert structured["kind"] == "text"
