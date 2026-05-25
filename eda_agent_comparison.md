@@ -1,31 +1,31 @@
-# EDA Agent 技术对比与现状评估（更新于 2026-05-22）
+# EDA Agent 技术对比与现状评估（更新于 2026-05-25）
 
 ## 1. 项目定位
 
-EDA Agent 是一个面向数字后端优化的 LLM 驱动自动化系统，核心目标是把“诊断 -> 建议 -> 重跑 -> 评估 -> 记录”的闭环标准化、可复现化。
+EDA Agent 是一个面向数字后端优化的 LLM 驱动系统，目标是把“诊断 -> 建议 -> 重跑 -> 评估 -> 沉淀”的工程闭环标准化、可追溯、可复现。
 
-当前系统已经从早期的 run-centric 模式演进到 session-lineage 模式，支持按 session 追踪多阶段执行、决策链与上下文。
+当前实现已形成 **Planner + Tools + Backend + Parser + DB + Session Lineage** 主链路，并具备可运行的推理与调参闭环。
 
 ## 2. 当前架构快照
 
 ```
 eda_agent/
-├── backends/      # ORFS / Innovus / ICC2 backend 适配
-├── parsers/       # timing / power / congestion / drc / utilization
-├── db/            # SQLAlchemy + Alembic + repository + archiver
-├── agent/         # planner / tools / inference / memory / guardrails
+├── backends/      # ORFS / Innovus / ICC2(未实现)
+├── parsers/       # timing / power / congestion / drc / utilization / innovus 扩展解析
+├── db/            # SQLAlchemy + Alembic + repository + lineage schema
+├── agent/         # planner / tools / inference / memory / guardrails / subagents
 ├── api/           # FastAPI + JWT + runs/metrics/agent 路由
-└── queue/         # 异步任务调度
+└── queue/         # 异步任务队列与 worker（本地 SQLite job store）
 ```
 
 ### 闭环主路径
 
-1. Planner/Tools 发起阶段执行或调参迭代
-2. `run_eda_stage` 写入 `runs`
-3. 解析报告并写入指标表（timing/power/congestion/...）
-4. 同步写入 lineage：`stage_outcomes`、`decision_trace`
-5. 按 session 维护上下文与状态（`active/completed/failed`）
-6. 通过 API 拉取 session trace 做回放与分析
+1. Planner/Tools 发起 `run_eda_stage` / `run_eda_flow` / `tune_ppa*`
+2. backend 执行 stage，产出 logs/reports
+3. parser 将报告规范化并写入 metrics 表
+4. 写入 lineage：`flow_sessions`、`stage_outcomes`、`decision_trace`
+5. inference + case memory 提供根因候选与经验复用
+6. API/CLI 查询会话轨迹与 QoR 对比
 
 ### 当前架构示意图
 
@@ -57,54 +57,44 @@ graph TD
 
 | 能力项 | v3 目标 | 当前状态 | 结论 |
 |---|---|---|---|
-| ReAct Planner 闭环 | Reason-Act-Observe 迭代 | 已在工具层形成可执行闭环（含 tune_ppa / multistage） | ✅ |
-| Session 级生命周期 | 非 run 级、可追踪完整会话 | `flow_sessions` + 状态机 + stage_seq 已落地 | ✅ |
-| 决策链可追溯 | 推理/建议/确认可回放 | `decision_trace` + session trace API 已落地 | ✅ |
-| 可复现性 | 过程、参数、环境可复盘 | `stage_outcomes` + `env_snapshot` + structured reason 已落地 | ✅ |
-| Root Cause Inference | 可解释因果诊断 | 已有 inference engine/rules + confirm 流程 | ✅（基础版） |
-| 多 Agent 协作 | 专职 agent 分工 | 仍以单 planner 为主 | ⚠️ |
-| KG/图谱推理 | 参数-现象-结构图谱 | 尚未实现 | ❌ |
-| Recipe Search（Bayes/RL） | 系统化搜索策略 | 当前主要是规则/LLM建议 + 迭代 | ⚠️ |
+| ReAct Planner 闭环 | observe→diagnose→act→learn | `Planner` + `TOOL_SCHEMAS` + memory 已形成闭环 | ✅ |
+| Session 级生命周期 | 会话级追踪与状态管理 | `flow_sessions` + `stage_outcomes` + `decision_trace` 已落地 | ✅ |
+| Root Cause Inference | 可解释根因推断 | `inference engine/rules/weights/confirm` 已实现 | ✅（规则驱动） |
+| Case Memory | 历史案例复用 | `case_memory` 持久化 + `search_similar_cases` 已接入 planner | ✅ |
+| Guardrails + HITL | 风险动作受控执行 | guardrails block/warn + 明确确认流程已实现 | ✅（基础策略） |
+| Multi-Agent 协作 | 专职 agent 实际分工 | 有 subagent 框架，但 PnR/STA/Signoff/Experiment 仍为 skeleton | ⚠️ |
+| Knowledge Graph | 参数-现象-结构图谱推理 | 未见独立图谱存储/查询/推理模块 | ❌ |
+| Recipe Search（Bayes/RL） | 系统化搜索策略 | 当前主要 rule + LLM 建议 + 迭代执行 | ⚠️ |
+| UI 产品层 | dashboard / explorer / tracker | 目前为 API + CLI，未形成独立 UI 产品层 | ⚠️ |
 
-## 4. 本轮关键落地（P1/P2/P3）
+## 4. 本轮关键落地（截至当前实现）
 
-### P1: Session Trace 查询增强
+### P1: 执行与编排能力增强
 
-API 已支持：
+- `run_eda_stage` / `run_eda_flow` 已支持同步与异步提交路径
+- 引入 `submit_job/job_status/job_logs/cancel_job`，支持后台任务跟踪
+- 调参环路覆盖单阶段与多阶段：`tune_ppa` / `tune_ppa_multistage`
 
-- `GET /runs/sessions/{session_id}/trace`
-- 过滤参数：`stage`、`from_seq`、`to_seq`、`human_approved`
+### P2: Session-lineage 可追溯性增强
 
-对应查询在 repository 中统一聚合返回：
+- Session 主表：`flow_sessions`（状态、上下文、环境快照）
+- 阶段快照：`stage_outcomes`
+- 决策链：`decision_trace`（含结构化 reason 字段）
+- 支持 `GET /runs/sessions/{session_id}/trace` 过滤查询
 
-- `session`
-- `runs`
-- `stage_outcomes`
-- `decision_trace`
+### P3: 推理与经验沉淀增强
 
-### P2: Session 生命周期管理
+1. 根因推理链路
+   - `infer_root_cause` 生成 hypotheses + evidence + experiments
+   - `confirm_root_cause` 反馈确认并更新 rule weights
 
-`flow_sessions.status` 已形成真实流转：
+2. Case memory 复用
+   - 推理确认可沉淀 case
+   - planner 会注入相似历史案例辅助后续决策
 
-- 创建 session 时置为 `active`
-- 阶段失败时置为 `failed`
-- 最终阶段成功完成时置为 `completed`
-
-同时支持 `baseline_run_id` 回写，便于固化该 session 的代表结果。
-
-### P3: 可复现性增强
-
-1. `flow_sessions.env_snapshot`（JSONB）
-   - 记录 python/sqlalchemy/pdk/design/captured_at 等环境信息
-
-2. `decision_trace.llm_reason_structured`（JSONB）
-   - 结构化保存建议理由
-   - 保留原 `llm_reason` 文本，兼容旧逻辑
-   - migration 回填 legacy 文本为结构化对象
-
-3. 最新上下文缓存
-   - `flow_sessions.last_inference_id/last_case_id/last_rule_id`
-   - 新决策优先读取 session 上下文，减少 run 级回查歧义
+3. 风险控制
+   - 高风险操作阻断并要求人工确认
+   - 对极端参数给出 warn/block 防护
 
 ### 调参与追踪流程示意图（session-lineage）
 
@@ -129,72 +119,79 @@ flowchart TD
    K --> L[replay session: runs + outcomes + decisions]
 ```
 
-## 5. 数据库能力对比（更新版）
+## 5. 数据平台能力对比（更新版）
 
 ### EDA Agent 当前优势
 
-- 领域模型强：围绕 run/session/metrics/lineage 构建
-- 自动入库：工具执行后自动解析并落库
-- 空间能力：拥塞热点使用 PostGIS
-- 可回放：session 级 trace 可聚合拉取
-- 可复现：参数快照 + 环境快照 + 结构化理由
+- EDA 领域模型明确：design/run/session/lineage 闭环完整
+- 执行后自动解析入库，支持 timing/power/congestion/drc/utilization
+- 具备根因推理、案例记忆、风险拦截与会话回放能力
+- API 与 CLI 双入口，便于自动化集成
 
 ### 与通用数据平台（如 JedAI）差异
 
 | 维度 | JedAI 类平台 | EDA Agent |
 |---|---|---|
-| 目标 | 通用数据治理/分析 | EDA 调参与根因闭环 |
+| 目标 | 通用数据治理/探索/分析 | EDA 调参与根因诊断闭环 |
 | 数据组织 | 数据集/目录中心 | 设计-run-session-lineage |
-| 入库方式 | 手工或 ETL 驱动 | agent 自动执行后入库 |
-| 权限体系 | 完整 RBAC/Policy | JWT + 基础用户模型 |
-| 计算模式 | Spark/大数据优先 | OLTP + 本地分析/归档 |
+| 入库方式 | ETL/作业平台驱动 | backend 执行后自动解析入库 |
+| 权限体系 | 完整 RBAC/组织级治理 | JWT + 基础用户模型 |
+| 计算与调度 | 集群/大数据作业优先 | OLTP + 本地异步队列（SQLite job store） |
 
-## 6. 与传统参数优化（ME/TPE）对比
+## 6. 与传统参数优化（TPE/Bayesian）对比
 
 | 维度 | TPE/Bayesian | EDA Agent（LLM+规则） |
 |---|---|---|
-| 搜索方式 | 数学采样与概率模型 | 语义推理 + 历史上下文 |
-| 可解释性 | 统计可解释 | 决策链可解释（文本+结构化） |
-| 场景适配 | 固定参数空间强 | 非结构化问题更灵活 |
-| 知识复用 | trial 历史 | case memory + decision trace |
+| 搜索方式 | 数学采样与概率建模 | 语义推理 + 规则引导 + 历史案例 |
+| 可解释性 | 统计指标可解释 | 决策链可解释（evidence/reason/trace） |
+| 场景适配 | 固定参数空间强 | 非结构化问题与诊断场景更灵活 |
+| 知识复用 | trial 历史 | case memory + decision trace + session context |
 
-结论：两者不是替代关系，最优形态是“Bayes 搜索器 + Agent 语义编排”协同。
+结论：两者互补，适合演进为“Bayes 候选生成 + Agent 语义筛选与执行”的协同架构。
 
 ## 7. 当前成熟度评估
 
 ### 已成熟
 
-- 多后端抽象 + 工具编排
-- 指标解析和结构化入库
-- session 级 lineage 与回放
-- 非 VM 回归主路径稳定
+- 多 backend 抽象与执行工具链（ORFS + Innovus）
+- 指标解析与结构化入库
+- Session-lineage 回放与过滤查询
+- 根因推理、案例沉淀、guardrails 基础闭环
 
 ### 待增强
 
-- 结构化 reason 的查询维度（按 kind/source 聚合）
-- session trace 的统计视图（例如 stage 耗时、成功率）
-- 多 agent 分工与协作协议
-- KG 与 recipe 搜索能力
+- Multi-agent 从 skeleton 升级为真实职责协作
+- Knowledge Graph/因果图谱与图查询能力
+- Recipe Search 的 Bayes/RL 搜索器
+- API 到 UI 的产品化视图层（dashboard/experiment tracker）
+- `agent/tools.py` 等大文件的模块化拆分与边界收敛
 
 ## 8. 推荐下一阶段优先级
 
-1. 查询增强
-   - 为 session trace 增加基于 `llm_reason_structured.kind/source` 的过滤
+1. 多 Agent 实体化
+   - 让 PnR/STA/Signoff/Experiment 子代理接入真实分析与决策输入输出协议
 
-2. 分析视图
-   - 增加 session 级聚合指标（阶段耗时、失败原因分布、改善幅度）
+2. 搜索策略升级
+   - 在 `suggest_params` 前接入轻量 Bayes/TPE 候选生成，再由 Agent 解释筛选
 
-3. 搜索策略升级
-   - 在 `suggest_params` 前接入轻量 Bayes/TPE 候选生成，再由 Agent 解释和筛选
+3. 图谱层建设
+   - 引入 violation-phenomenon-parameter 的图谱建模与可查询因果链
 
-4. 多 agent 演进
-   - 拆分 diagnosis / execution / evaluation 角色，统一通过 decision trace 交换上下文
+4. 可观测性与产品化
+   - 增加 session 聚合统计视图（阶段耗时、成功率、收益分布）
+   - 在 API 基础上补齐 QoR/实验追踪 UI 面板
+
+5. 工程质量提升
+   - 拆分超大模块（如 `agent/tools.py`）并加强类型化边界
 
 ## 9. 关键结论
 
-相对最初 v3 gap，这个项目已经跨过“概念原型”阶段，进入“可回放、可复现、可持续迭代”的工程化阶段。
+相对 v3 目标，EDA Agent 已从“概念原型”进入“可执行、可追溯、可复盘”的工程化阶段。
 
-当前最值得继续投入的是：
+当前最主要差距在：
 
-- 把已有 lineage 数据变成更强的分析/搜索能力
-- 把单 planner 升级为可协作的多 agent 框架
+- 智能层深度（KG + Recipe Search）
+- 多 Agent 实体化协作
+- 产品层可视化与工程解耦
+
+整体判断：**主干能力已具备，进入“补齐智能层与架构收敛”的阶段。**
