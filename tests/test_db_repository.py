@@ -167,3 +167,92 @@ def test_get_run_not_found():
     db.execute.return_value.mappings.return_value.first.return_value = None
     result = EDAQueryRepository.get_run(db, 999)
     assert result is None
+
+
+# ── get_session_trace ─────────────────────────────────────────────────────────
+
+
+def test_get_session_trace_includes_multi_agent_structured_reason_kind():
+    db = Mock()
+
+    class _Result:
+        def __init__(self, *, first=None, rows=None):
+            self._first = first
+            self._rows = rows or []
+
+        def mappings(self):
+            return self
+
+        def first(self):
+            return self._first
+
+        def fetchall(self):
+            return self._rows
+
+    session_row = {
+        "id": 7,
+        "session_uuid": "sess-7",
+        "design_id": 1,
+        "objective": "tune_ppa",
+        "status": "active",
+        "baseline_run_id": None,
+        "parent_session_id": None,
+        "last_inference_id": None,
+        "last_case_id": None,
+        "last_rule_id": None,
+        "env_snapshot": {},
+        "notes": "",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "design_name": "aes",
+        "pdk": "tsmc18",
+    }
+
+    run_rows = [
+        {
+            "id": 101,
+            "run_uuid": "r-101",
+            "stage": "place",
+            "stage_seq": 1,
+            "variant_tag": "multi_agent_experiment",
+            "rerun_reason": "run_multi_agent_cycle",
+            "is_baseline": False,
+            "is_selected": False,
+            "parent_run_id": 100,
+            "status": "success",
+            "started_at": "2026-01-01T00:00:00Z",
+            "finished_at": "2026-01-01T00:05:00Z",
+            "created_at": "2026-01-01T00:05:00Z",
+        }
+    ]
+
+    decision_rows = [
+        {
+            "id": 1,
+            "session_id": 7,
+            "source_run_id": 100,
+            "target_run_id": 101,
+            "inference_id": None,
+            "case_id": None,
+            "rule_id": None,
+            "llm_reason": "multi_agent_cycle executed experiment innovus:place",
+            "llm_reason_structured": {"kind": "multi_agent_cycle", "agents": ["pnr", "sta"]},
+            "human_approved": False,
+            "created_at": "2026-01-01T00:05:01Z",
+        }
+    ]
+
+    db.execute.side_effect = [
+        _Result(first=session_row),   # session query
+        _Result(rows=run_rows),       # runs query
+        _Result(rows=[]),             # stage_outcomes query
+        _Result(rows=decision_rows),  # decision_trace query
+    ]
+
+    result = EDAQueryRepository.get_session_trace(db, 7)
+
+    assert result["session"]["id"] == 7
+    assert result["decision_trace"]
+    structured = result["decision_trace"][0]["llm_reason_structured"]
+    assert isinstance(structured, dict)
+    assert structured.get("kind") == "multi_agent_cycle"

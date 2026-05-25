@@ -122,39 +122,93 @@ class AgentMemory:
     def get(self, key: str, default: Any = None) -> Any:
         return self._scratchpad.get(key, default)
 
+    _CONTEXT_KEYS = ("design_name", "pdk", "config_path")
+
     def extract_design_context(self) -> dict[str, str]:
-        """Extract design context from conversation history.
-        
-        Looks for design_name, pdk, and config_path from previous tool calls.
-        Returns a dict with available context.
+        """Extract design context from the session scratchpad.
+
+        The scratchpad is populated by the planner's
+        ``_extract_and_store_context()`` whenever a stage/flow tool is
+        executed.  This method reads only the scratchpad – no fragile JSON
+        parsing of serialised tool-result strings.
+
+        Returns a dict of non-empty context entries (may be empty).
         """
-        context: dict[str, str] = {}
-        
-        # Look through tool results for design info
-        for msg in self._history:
-            if msg.role == "tool" and msg.tool_name in ("run_eda_stage", "run_eda_flow"):
-                try:
-                    import json
-                    # Parse the tool result to extract design info
-                    result = json.loads(msg.content)
-                    if isinstance(result, dict):
-                        # Try to extract from result
-                        if "design_name" not in context:
-                            context["design_name"] = result.get("design_name", "")
-                        if "pdk" not in context:
-                            context["pdk"] = result.get("pdk", "")
-                except Exception:
-                    pass
-        
-        # Also check scratchpad
-        for key in ("design_name", "pdk", "config_path"):
-            if key not in context:
-                val = self.get(key)
-                if val:
-                    context[key] = val
-        
-        # Remove empty values
-        return {k: v for k, v in context.items() if v}
+        return {
+            k: v
+            for k in self._CONTEXT_KEYS
+            if (v := self._scratchpad.get(k))
+        }
+
+    # ------------------------------------------------------------------
+    # Full-state serialisation (for DB persistence across HTTP requests)
+    # ------------------------------------------------------------------
+
+    def get_state(self) -> dict[str, Any]:
+        """Return the full serialisable state (messages + scratchpad).
+
+        The returned dict can be round-tripped through :meth:`from_state`
+        to preserve both message history and design context across API
+        requests.  Uses ``get_messages()`` for the message portion so the
+        format is OpenAI-compatible.
+
+        Example::
+
+            state = memory.get_state()
+            db.execute("INSERT ...", {"state": json.dumps(state)})
+        """
+        return {
+            "messages": self.get_messages(),
+            "scratchpad": dict(self._scratchpad),
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        state: dict[str, Any] | list[dict[str, Any]],
+        max_messages: int = 40,
+    ) -> "AgentMemory":
+        """Reconstruct from *state* (produced by :meth:`get_state`).
+
+        Handles both the current dict format
+        ``{"messages": [...], "scratchpad": {...}}`` and the legacy list
+        format (plain message array) for backward compatibility.
+        """
+        mem = cls(max_messages=max_messages)
+
+        if isinstance(state, dict):
+            messages = state.get("messages", [])
+            scratchpad = state.get("scratchpad", {})
+            if isinstance(scratchpad, dict):
+                mem._scratchpad.update(scratchpad)
+        elif isinstance(state, list):
+            messages = state  # legacy format
+        else:
+            messages = []
+
+        for m in messages:
+            if not isinstance(m, dict):
+                logger.warning(
+                    "Skipping non-dict entry in session state: %s",
+                    type(m).__name__,
+                )
+                continue
+            role = m.get("role", "")
+            content = m.get("content") or ""
+            if role == "system":
+                continue
+            if role == "user":
+                mem.add_user(content)
+            elif role == "assistant":
+                mem.add_assistant(content, tool_calls=m.get("tool_calls"))
+            elif role == "tool":
+                mem.add_tool_result(
+                    m.get("name", ""),
+                    content,
+                    tool_call_id=m.get("tool_call_id"),
+                )
+
+        return mem
 
     def __len__(self) -> int:
         return len(self._history)

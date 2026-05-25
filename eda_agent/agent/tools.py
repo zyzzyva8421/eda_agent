@@ -112,11 +112,31 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "design_config": {
                         "type": "string",
-                        "description": "Absolute path to the design config file.",
+                        "description": (
+                            "Backend config path. For ORFS this is DESIGN_CONFIG; "
+                            "for Innovus this is treated as remote workdir root."
+                        ),
                     },
                     "pdk": {
                         "type": "string",
-                        "description": "PDK identifier (e.g. 'sky130hd').",
+                        "description": (
+                            "Technology/profile label. For Innovus this is metadata "
+                            "used for traceability (default: tsmc18)."
+                        ),
+                    },
+                    "innovus_workdir": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for remote workdir root. If provided "
+                            "and design_config is empty, this value is used."
+                        ),
+                    },
+                    "tech_profile": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for pdk/technology profile label. "
+                            "If provided and pdk is empty, this value is used."
+                        ),
                     },
                     "params": {
                         "type": "object",
@@ -157,11 +177,31 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "design_config": {
                         "type": "string",
-                        "description": "Absolute path to the design config file.",
+                        "description": (
+                            "Backend config path. For ORFS this is DESIGN_CONFIG; "
+                            "for Innovus this is treated as remote workdir root."
+                        ),
                     },
                     "pdk": {
                         "type": "string",
-                        "description": "PDK identifier (e.g. 'sky130hd').",
+                        "description": (
+                            "Technology/profile label. For Innovus this is metadata "
+                            "used for traceability (default: tsmc18)."
+                        ),
+                    },
+                    "innovus_workdir": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for remote workdir root. If provided "
+                            "and design_config is empty, this value is used."
+                        ),
+                    },
+                    "tech_profile": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for pdk/technology profile label. "
+                            "If provided and pdk is empty, this value is used."
+                        ),
                     },
                     "params": {
                         "type": "object",
@@ -173,6 +213,58 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["backend", "stage_start", "design_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_multi_agent_cycle",
+            "description": (
+                "Run one multi-agent orchestration cycle (pnr/sta/signoff/experiment) "
+                "and optionally execute an experiment stage when gate status is auto_execute."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "description": "Cycle objective, e.g. 'WNS >= -0.1 and overflow_h_pct <= 2.0'.",
+                    },
+                    "session_id": {
+                        "type": "integer",
+                        "description": "Optional flow session id for lineage.",
+                    },
+                    "run_id": {
+                        "type": "integer",
+                        "description": "Optional baseline run id for diagnosis context.",
+                    },
+                    "constraints": {
+                        "type": "object",
+                        "description": "Optional constraints such as risk_level/max_runtime_sec.",
+                    },
+                    "inputs": {
+                        "type": "object",
+                        "description": "Optional cycle inputs for sub-agent skeletons.",
+                    },
+                    "agents": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional ordered sub-agent list, default pnr/sta/signoff/experiment.",
+                    },
+                    "execute_experiment": {
+                        "type": "boolean",
+                        "description": "If true and gate allows, execute experiment_request via run_eda_stage.",
+                    },
+                    "experiment_request": {
+                        "type": "object",
+                        "description": (
+                            "Stage execution payload. Expected fields: backend, stage, design_name, "
+                            "design_config/pdk or innovus_workdir/tech_profile, params."
+                        ),
+                    },
+                },
+                "required": ["objective"],
             },
         },
     },
@@ -295,9 +387,32 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "design_name": {"type": "string"},
                     "design_config": {
                         "type": "string",
-                        "description": "Absolute path to design config.",
+                        "description": (
+                            "Backend config path. For ORFS this is DESIGN_CONFIG; "
+                            "for Innovus this is treated as remote workdir root."
+                        ),
                     },
-                    "pdk": {"type": "string"},
+                    "pdk": {
+                        "type": "string",
+                        "description": (
+                            "Technology/profile label. For Innovus this is metadata "
+                            "used for traceability (default: tsmc18)."
+                        ),
+                    },
+                    "innovus_workdir": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for remote workdir root. If provided "
+                            "and design_config is empty, this value is used."
+                        ),
+                    },
+                    "tech_profile": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for pdk/technology profile label. "
+                            "If provided and pdk is empty, this value is used."
+                        ),
+                    },
                     "target_spec": {
                         "type": "string",
                         "description": "Natural language PPA target, e.g. 'WNS >= -0.1ns'.",
@@ -308,7 +423,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": [
-                    "backend", "stage", "design_name", "design_config", "pdk", "target_spec",
+                    "backend", "stage", "design_name", "target_spec",
                 ],
             },
         },
@@ -369,8 +484,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "backend": {"type": "string"},
                     "design_name": {"type": "string"},
-                    "design_config": {"type": "string"},
-                    "pdk": {"type": "string"},
+                    "design_config": {
+                        "type": "string",
+                        "description": (
+                            "Backend config path. For ORFS this is DESIGN_CONFIG; "
+                            "for Innovus this is treated as remote workdir root."
+                        ),
+                    },
+                    "pdk": {
+                        "type": "string",
+                        "description": (
+                            "Technology/profile label. For Innovus this is metadata "
+                            "used for traceability (default: tsmc18)."
+                        ),
+                    },
+                    "innovus_workdir": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for remote workdir root. If provided "
+                            "and design_config is empty, this value is used."
+                        ),
+                    },
+                    "tech_profile": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for pdk/technology profile label. "
+                            "If provided and pdk is empty, this value is used."
+                        ),
+                    },
                     "congestion_threshold_pct": {
                         "type": "number",
                         "description": "Target max of horizontal/vertical overflow percentage.",
@@ -473,9 +614,32 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "design_name": {"type": "string"},
                     "design_config": {
                         "type": "string",
-                        "description": "Absolute path to design config.",
+                        "description": (
+                            "Backend config path. For ORFS this is DESIGN_CONFIG; "
+                            "for Innovus this is treated as remote workdir root."
+                        ),
                     },
-                    "pdk": {"type": "string"},
+                    "pdk": {
+                        "type": "string",
+                        "description": (
+                            "Technology/profile label. For Innovus this is metadata "
+                            "used for traceability (default: tsmc18)."
+                        ),
+                    },
+                    "innovus_workdir": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for remote workdir root. If provided "
+                            "and design_config is empty, this value is used."
+                        ),
+                    },
+                    "tech_profile": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for pdk/technology profile label. "
+                            "If provided and pdk is empty, this value is used."
+                        ),
+                    },
                     "target_spec": {
                         "type": "string",
                         "description": "Natural language PPA target, e.g. 'WNS >= -0.1ns'.",
@@ -494,7 +658,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": [
-                    "backend", "design_name", "design_config", "pdk", "target_spec",
+                    "backend", "design_name", "target_spec",
                 ],
             },
         },
@@ -526,11 +690,31 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "design_config": {
                         "type": "string",
-                        "description": "Absolute path to the design config file.",
+                        "description": (
+                            "Backend config path. For ORFS this is DESIGN_CONFIG; "
+                            "for Innovus this is treated as remote workdir root."
+                        ),
                     },
                     "pdk": {
                         "type": "string",
-                        "description": "PDK identifier (e.g. 'sky130hd').",
+                        "description": (
+                            "Technology/profile label. For Innovus this is metadata "
+                            "used for traceability (default: tsmc18)."
+                        ),
+                    },
+                    "innovus_workdir": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for remote workdir root. If provided "
+                            "and design_config is empty, this value is used."
+                        ),
+                    },
+                    "tech_profile": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for pdk/technology profile label. "
+                            "If provided and pdk is empty, this value is used."
+                        ),
                     },
                     "params": {
                         "type": "object",
@@ -721,6 +905,82 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["inference_id", "confirmed_cause_id"],
+            },
+        },
+    },
+    # ── Inference-guided optimisation loop ─────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "optimize_with_inference",
+            "description": (
+                "Run a closed-loop optimisation cycle: infer root cause from "
+                "the current run, pick the best experiment suggested by the rule "
+                "engine, apply it, re-run the stage, verify whether the root cause "
+                "was mitigated, and repeat until convergence or max iterations. "
+                "Phase B (rule weight learning) is triggered automatically on "
+                "convergence."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "integer",
+                        "description": "DB run id (runs.id) of the baseline run.",
+                    },
+                    "target_spec": {
+                        "type": "string",
+                        "description": (
+                            "Natural-language PPA target, e.g. "
+                            "'WNS >= -0.1 and overflow_h_pct <= 2.0'."
+                        ),
+                    },
+                    "backend": {
+                        "type": "string",
+                        "description": "Backend name: 'orfs', 'innovus', 'icc2'.",
+                    },
+                    "stage": {
+                        "type": "string",
+                        "description": "Flow stage to tune (e.g. 'place').",
+                    },
+                    "design_name": {"type": "string"},
+                    "design_config": {
+                        "type": "string",
+                        "description": (
+                            "Backend config path. For ORFS this is DESIGN_CONFIG; "
+                            "for Innovus this is treated as remote workdir root."
+                        ),
+                    },
+                    "pdk": {
+                        "type": "string",
+                        "description": (
+                            "Technology/profile label. For Innovus this is metadata "
+                            "used for traceability (default: tsmc18)."
+                        ),
+                    },
+                    "innovus_workdir": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for remote workdir root. If provided "
+                            "and design_config is empty, this value is used."
+                        ),
+                    },
+                    "tech_profile": {
+                        "type": "string",
+                        "description": (
+                            "Innovus-only alias for pdk/technology profile label. "
+                            "If provided and pdk is empty, this value is used."
+                        ),
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "description": "Maximum loop iterations (default 5).",
+                    },
+                },
+                "required": [
+                    "run_id", "target_spec", "backend", "stage",
+                    "design_name",
+                ],
             },
         },
     },
@@ -1154,28 +1414,26 @@ def _run_eda_stage(
     design_name: str,
     design_config: str | None = None,
     pdk: str | None = None,
+    innovus_workdir: str | None = None,
+    tech_profile: str | None = None,
     params: dict[str, Any] | None = None,
     run_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # 对于 innovus，可以从 settings 自动获取配置
+    # 对于 innovus，可以从 settings 或别名参数自动获取配置
     if not backend:
         # 根据 stage 名称自动推断 backend
         if stage in ("place", "cts", "route", "floorplan", "powerplan", "prects", "postcts", "postroute", "signoff"):
             backend = "innovus"
         else:
             backend = "orfs"
-    
-    if backend.lower() == "innovus":
-        from eda_agent.config import settings
-        if not design_config:
-            design_config = settings.innovus_remote_workdir
-        if not pdk:
-            pdk = "tsmc18"
-    
-    if not design_config:
-        raise ValueError("design_config is required. For innovus, set INNOVUS_REMOTE_WORKDIR in config.")
-    if not pdk:
-        raise ValueError("pdk is required. For innovus, default is tsmc18.")
+
+    design_config, pdk = _resolve_backend_design_identity(
+        backend=backend,
+        design_config=design_config,
+        pdk=pdk,
+        innovus_workdir=innovus_workdir,
+        tech_profile=tech_profile,
+    )
 
     be = get_backend(backend)
     design = DesignSpec(
@@ -1390,8 +1648,10 @@ def _run_eda_flow(
     backend: str,
     stage_start: str,
     design_name: str,
-    design_config: str,
-    pdk: str,
+    design_config: str | None = None,
+    pdk: str | None = None,
+    innovus_workdir: str | None = None,
+    tech_profile: str | None = None,
     stage_end: str | None = None,
     params: dict[str, Any] | None = None,
     clean: bool = False,
@@ -1405,6 +1665,14 @@ def _run_eda_flow(
     if clean:
         params = params or {}
         params["_clean"] = True
+
+    design_config, pdk = _resolve_backend_design_identity(
+        backend=backend,
+        design_config=design_config,
+        pdk=pdk,
+        innovus_workdir=innovus_workdir,
+        tech_profile=tech_profile,
+    )
 
     # Keep tool-facing behavior non-blocking: return job_id immediately.
     return _submit_job(
@@ -1426,8 +1694,10 @@ def _run_eda_flow(
 def _submit_job(
     backend: str,
     design_name: str,
-    design_config: str,
-    pdk: str,
+    design_config: str | None = None,
+    pdk: str | None = None,
+    innovus_workdir: str | None = None,
+    tech_profile: str | None = None,
     stage: str | None = None,
     params: dict[str, Any] | None = None,
     stage_start: str | None = None,
@@ -1442,6 +1712,14 @@ def _submit_job(
 
     if run_mode == "stage" and not stage:
         return {"error": "'stage' is required when run_mode='stage'"}
+
+    design_config, pdk = _resolve_backend_design_identity(
+        backend=backend,
+        design_config=design_config,
+        pdk=pdk,
+        innovus_workdir=innovus_workdir,
+        tech_profile=tech_profile,
+    )
 
     # The queue schema requires a non-null stage. In flow mode we store an
     # informational stage value and use stage_start/stage_end for execution.
@@ -1471,6 +1749,182 @@ def _submit_job(
         "status": "pending",
         "message": f"Job {job_id} submitted ({run_mode} mode). Use job_status to poll.",
     }
+
+
+def _run_multi_agent_cycle_tool(
+    objective: str,
+    session_id: int | None = None,
+    run_id: int | None = None,
+    constraints: dict[str, Any] | None = None,
+    inputs: dict[str, Any] | None = None,
+    agents: list[str] | None = None,
+    execute_experiment: bool = False,
+    experiment_request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Execute one multi-agent cycle and optionally run an experiment stage."""
+    from eda_agent.agent.planner import Planner
+
+    planner = Planner()
+    cycle = planner.run_multi_agent_cycle(
+        objective=objective,
+        session_id=session_id,
+        run_id=run_id,
+        constraints=constraints,
+        inputs=inputs,
+        agents=agents,
+    )
+
+    result: dict[str, Any] = {"multi_agent": cycle}
+    if not execute_experiment:
+        return result
+
+    gate = (cycle or {}).get("gate") or {}
+    if gate.get("status") != "auto_execute":
+        result["experiment_execution"] = {
+            "status": "blocked",
+            "reason": gate.get("reason", "needs approval"),
+        }
+        return result
+
+    if not experiment_request:
+        result["experiment_execution"] = {
+            "status": "skipped",
+            "reason": "experiment_request not provided",
+        }
+        return result
+
+    exp_args = dict(experiment_request)
+    backend = str(exp_args.get("backend") or "")
+    if not backend:
+        return {
+            **result,
+            "experiment_execution": {
+                "status": "error",
+                "error": "experiment_request.backend is required",
+            },
+        }
+
+    try:
+        design_config, pdk = _resolve_backend_design_identity(
+            backend=backend,
+            design_config=exp_args.get("design_config"),
+            pdk=exp_args.get("pdk"),
+            innovus_workdir=exp_args.get("innovus_workdir"),
+            tech_profile=exp_args.get("tech_profile"),
+        )
+    except Exception as exc:
+        result["experiment_execution"] = {
+            "status": "error",
+            "error": str(exc),
+        }
+        return result
+
+    run_context = dict(exp_args.get("run_context") or {})
+    if session_id is not None:
+        run_context.setdefault("session_id", session_id)
+    run_context.setdefault("stage_seq", 1)
+    run_context.setdefault("variant_tag", "multi_agent_experiment")
+    run_context.setdefault("rerun_reason", "run_multi_agent_cycle")
+    run_context.setdefault("is_baseline", False)
+    run_context.setdefault("is_selected", False)
+
+    try:
+        run_result = _run_eda_stage(
+            backend=backend,
+            stage=str(exp_args.get("stage") or ""),
+            design_name=str(exp_args.get("design_name") or ""),
+            design_config=design_config,
+            pdk=pdk,
+            params=exp_args.get("params") or {},
+            run_context=run_context,
+            innovus_workdir=exp_args.get("innovus_workdir"),
+            tech_profile=exp_args.get("tech_profile"),
+        )
+    except Exception as exc:
+        result["experiment_execution"] = {
+            "status": "error",
+            "error": str(exc),
+        }
+        return result
+
+    result["experiment_execution"] = {
+        "status": "success" if run_result.get("status") == "success" else "failed",
+        "result": run_result,
+    }
+
+    # Persist multi-agent decision trace for replayability when lineage ids exist.
+    target_run_id = run_result.get("run_id")
+    if (
+        session_id is not None
+        and run_id is not None
+        and isinstance(target_run_id, int)
+    ):
+        try:
+            gate = (cycle or {}).get("gate") or {}
+            _record_decision_trace(
+                session_id=session_id,
+                source_run_id=run_id,
+                target_run_id=target_run_id,
+                llm_reason=(
+                    "multi_agent_cycle executed experiment "
+                    f"{backend}:{exp_args.get('stage', '')}"
+                ),
+                llm_reason_structured={
+                    "kind": "multi_agent_cycle",
+                    "objective": objective,
+                    "gate_status": gate.get("status"),
+                    "agents": cycle.get("agents", []),
+                    "execute_experiment": True,
+                    "experiment": {
+                        "backend": backend,
+                        "stage": exp_args.get("stage"),
+                        "design_name": exp_args.get("design_name"),
+                    },
+                },
+                human_approved=bool(gate.get("status") == "needs_approval"),
+            )
+        except Exception:
+            logger.warning("Failed to persist multi-agent decision_trace", exc_info=True)
+
+    return result
+
+
+def _resolve_backend_design_identity(
+    backend: str,
+    design_config: str | None,
+    pdk: str | None,
+    *,
+    innovus_workdir: str | None = None,
+    tech_profile: str | None = None,
+) -> tuple[str, str]:
+    """Normalize backend-specific design identity fields.
+
+    Historical API fields are ``design_config`` + ``pdk``. For Innovus these
+    can be provided more explicitly via aliases:
+    - ``innovus_workdir`` -> ``design_config``
+    - ``tech_profile`` -> ``pdk``
+    """
+    backend_l = (backend or "").lower()
+
+    cfg = design_config
+    tech = pdk
+
+    if backend_l == "innovus":
+        cfg = cfg or innovus_workdir or settings.innovus_remote_workdir
+        tech = tech or tech_profile or "tsmc18"
+
+    if not cfg:
+        raise ValueError(
+            "design_config is required. For innovus, you can set "
+            "innovus_workdir or INNOVUS_REMOTE_WORKDIR."
+        )
+    if not tech:
+        raise ValueError(
+            "pdk is required. For innovus, you can set tech_profile "
+            "(default tsmc18)."
+        )
+
+    return cfg, tech
 
 
 def _job_status(job_id: str) -> dict[str, Any]:
@@ -2334,14 +2788,24 @@ def _llm_decide_blockages(
 def _tune_congestion_with_blockage(
     backend: str,
     design_name: str,
-    design_config: str,
-    pdk: str,
+    design_config: str | None = None,
+    pdk: str | None = None,
+    innovus_workdir: str | None = None,
+    tech_profile: str | None = None,
     congestion_threshold_pct: float = 2.0,
     max_iterations: int = 5,
     workdir: str | None = None,
 ) -> dict[str, Any]:
     """Iteratively tune place congestion by adding placement blockages."""
     history: list[dict[str, Any]] = []
+
+    design_config, pdk = _resolve_backend_design_identity(
+        backend=backend,
+        design_config=design_config,
+        pdk=pdk,
+        innovus_workdir=innovus_workdir,
+        tech_profile=tech_profile,
+    )
 
     for iteration in range(1, max_iterations + 1):
         run_result = _run_eda_stage(
@@ -2430,9 +2894,11 @@ def _tune_ppa(
     backend: str,
     stage: str,
     design_name: str,
-    design_config: str,
-    pdk: str,
     target_spec: str,
+    design_config: str | None = None,
+    pdk: str | None = None,
+    innovus_workdir: str | None = None,
+    tech_profile: str | None = None,
     max_iterations: int = 5,
 ) -> dict[str, Any]:
     """Autonomous PPA tuning loop with hill-climbing direction memory.
@@ -2443,6 +2909,14 @@ def _tune_ppa(
     history: list[dict[str, Any]] = []
     current_params: dict[str, Any] = {}
     best_wns: float | None = None
+
+    design_config, pdk = _resolve_backend_design_identity(
+        backend=backend,
+        design_config=design_config,
+        pdk=pdk,
+        innovus_workdir=innovus_workdir,
+        tech_profile=tech_profile,
+    )
 
     design = DesignSpec(name=design_name, config_path=Path(design_config), pdk=pdk)
     session_id = _create_flow_session(
@@ -2789,9 +3263,11 @@ def _pick_bottleneck_stage(
 def _tune_ppa_multistage(
     backend: str,
     design_name: str,
-    design_config: str,
-    pdk: str,
     target_spec: str,
+    design_config: str | None = None,
+    pdk: str | None = None,
+    innovus_workdir: str | None = None,
+    tech_profile: str | None = None,
     start_stage: str = "place",
     max_iterations: int = 5,
 ) -> dict[str, Any]:
@@ -2800,6 +3276,14 @@ def _tune_ppa_multistage(
     stage_params: dict[str, dict[str, Any]] = {}  # per-stage param overrides
     rerun_from: str = start_stage
     best_wns: float | None = None
+
+    design_config, pdk = _resolve_backend_design_identity(
+        backend=backend,
+        design_config=design_config,
+        pdk=pdk,
+        innovus_workdir=innovus_workdir,
+        tech_profile=tech_profile,
+    )
 
     design = DesignSpec(name=design_name, config_path=Path(design_config), pdk=pdk)
     session_id = _create_flow_session(
@@ -3052,6 +3536,41 @@ def _save_case_tool(
     return {"status": "saved", "case_id": case_id}
 
 
+def _optimize_with_inference_tool(
+    run_id: int,
+    target_spec: str,
+    backend: str,
+    stage: str,
+    design_name: str,
+    design_config: str | None = None,
+    pdk: str | None = None,
+    innovus_workdir: str | None = None,
+    tech_profile: str | None = None,
+    max_iterations: int = 5,
+) -> dict[str, Any]:
+    """Run inference-guided optimisation loop as an LLM tool."""
+    from eda_agent.agent.optimization_loop import optimize_with_inference
+
+    design_config, pdk = _resolve_backend_design_identity(
+        backend=backend,
+        design_config=design_config,
+        pdk=pdk,
+        innovus_workdir=innovus_workdir,
+        tech_profile=tech_profile,
+    )
+
+    return optimize_with_inference(
+        run_id=run_id,
+        target_spec=target_spec,
+        backend=backend,
+        stage=stage,
+        design_name=design_name,
+        design_config=design_config,
+        pdk=pdk,
+        max_iterations=max_iterations,
+    )
+
+
 def _infer_root_cause_tool(run_id: int, symptoms: str = "") -> dict[str, Any]:
     """Invoke the rule-based inference engine and return ranked hypotheses."""
     from eda_agent.agent.inference.engine import infer
@@ -3109,6 +3628,7 @@ def _confirm_root_cause_tool(
 _TOOL_DISPATCH = {
     "run_eda_stage": _run_eda_stage,
     "run_eda_flow": _run_eda_flow,
+    "run_multi_agent_cycle": _run_multi_agent_cycle_tool,
     "get_run_log": _get_run_log,
     "query_timing": _query_timing,
     "query_congestion": _query_congestion,
@@ -3129,6 +3649,7 @@ _TOOL_DISPATCH = {
     "save_case": _save_case_tool,
     "infer_root_cause": _infer_root_cause_tool,
     "confirm_root_cause": _confirm_root_cause_tool,
+    "optimize_with_inference": _optimize_with_inference_tool,
 }
 
 

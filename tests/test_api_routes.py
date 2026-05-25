@@ -11,13 +11,16 @@ No real PostgreSQL or LLM connection is required.
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from eda_agent.agent.memory import AgentMemory
 from eda_agent.api.main import app
 from eda_agent.api.auth import get_current_user
+from eda_agent.api.routers import agent_router
 from eda_agent.db.session import get_db_dependency
 
 
@@ -304,6 +307,47 @@ class TestRunsRouter:
         assert resp.status_code == 202
         assert resp.json()["run_id"] == 102
 
+    def test_trigger_run_accepts_innovus_alias_fields(self, client):
+        fake_result = {
+            "run_id": 103,
+            "status": "success",
+            "stage": "place",
+        }
+        with patch("eda_agent.api.routers.runs_router._create_flow_session", return_value=99), patch(
+            "eda_agent.api.routers.runs_router.execute_tool",
+            return_value=json.dumps(fake_result),
+        ) as mock_tool:
+            resp = client.post(
+                "/runs/",
+                json={
+                    "backend": "innovus",
+                    "stage": "place",
+                    "design_name": "InnovusBlk_18_1",
+                    "innovus_workdir": "/remote/innovus/workdir",
+                    "tech_profile": "n5_profile",
+                    "params": {},
+                },
+            )
+
+        assert resp.status_code == 202
+        _, args = mock_tool.call_args[0]
+        assert args["design_config"] == "/remote/innovus/workdir"
+        assert args["pdk"] == "n5_profile"
+
+    def test_trigger_run_orfs_missing_design_config_returns_422(self, client):
+        resp = client.post(
+            "/runs/",
+            json={
+                "backend": "orfs",
+                "stage": "route",
+                "design_name": "aes",
+                "pdk": "sky130hd",
+                "params": {},
+            },
+        )
+
+        assert resp.status_code == 422
+
     def test_list_runs_requires_auth(self, unauthed_client):
         resp = unauthed_client.get("/runs/")
         assert resp.status_code == 401
@@ -408,6 +452,61 @@ class TestAgentChatRouter:
             resp = client.post("/agent/chat", json={"message": ""})
         assert resp.status_code == 200
 
+    def test_chat_scratchpad_survives_across_requests(self, client):
+        """Scratchpad set in one request is visible in the next (same session).
+
+        Regression guard: ``extract_design_context`` now reads only the
+        scratchpad (no JSON-parsing fallback), so the scratchpad must
+        survive the ``_save_session`` → DB → ``_load_session`` round-trip.
+        """
+        storage: dict[str, Any] = {}
+
+        def mock_load(sid: str, db: Any) -> AgentMemory:
+            raw = storage.get(sid)
+            return AgentMemory.from_state(raw) if raw else AgentMemory()
+
+        def mock_save(sid: str, uname: str, mem: AgentMemory, db: Any) -> None:
+            storage[sid] = mem.get_state()
+
+        with (
+            patch.object(agent_router, "_load_session", side_effect=mock_load),
+            patch.object(agent_router, "_save_session", side_effect=mock_save),
+            patch("eda_agent.api.routers.agent_router.Planner") as MockPlanner,
+        ):
+            instance = MockPlanner.return_value
+
+            # ── Request 1: planner stores design context ──
+            def run1(msg: str, memory: AgentMemory | None = None) -> str:
+                if memory is not None:
+                    memory.set("design_name", "aes")
+                    memory.set("pdk", "sky130hd")
+                return f"running {msg}"
+            instance.run.side_effect = run1
+
+            resp1 = client.post(
+                "/agent/chat",
+                json={"message": "run place on aes", "session_id": "sess-x"},
+            )
+            assert resp1.status_code == 200
+
+            # ── Request 2: same session, scratchpad must be restored ──
+            def run2(msg: str, memory: AgentMemory | None = None) -> str:
+                ctx = memory.extract_design_context() if memory is not None else {}
+                if ctx.get("design_name") == "aes" and ctx.get("pdk") == "sky130hd":
+                    return f"context restored: {ctx}"
+                return "context lost"
+            instance.run.side_effect = run2
+
+            resp2 = client.post(
+                "/agent/chat",
+                json={"message": "what is WNS?", "session_id": "sess-x"},
+            )
+            assert resp2.status_code == 200
+            reply = resp2.json()["reply"]
+            assert "context restored" in reply, (
+                f"Expected 'context restored' in reply, got: {reply}"
+            )
+
 
 # ── OpenAPI schema ────────────────────────────────────────────────────────────
 
@@ -424,3 +523,18 @@ def test_openapi_schema_accessible(client):
     assert any(p.startswith("/metrics") for p in paths)
     assert any(p.startswith("/runs") for p in paths)
     assert any(p.startswith("/agent") for p in paths)
+
+
+def test_openapi_runs_request_exposes_innovus_alias_fields(client):
+    resp = client.get("/openapi.json")
+    assert resp.status_code == 200
+    schema = resp.json()
+
+    run_req = schema["components"]["schemas"].get("RunStageRequest")
+    assert run_req is not None
+    props = run_req.get("properties", {})
+
+    assert "innovus_workdir" in props
+    assert "tech_profile" in props
+    assert "description" in props["innovus_workdir"]
+    assert "description" in props["tech_profile"]

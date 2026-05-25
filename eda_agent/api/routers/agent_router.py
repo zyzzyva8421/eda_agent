@@ -40,13 +40,13 @@ def _load_session(session_id: str, db: Session) -> AgentMemory:
         {"sid": session_id},
     ).mappings().first()
     if row and row["messages"]:
-        return AgentMemory.from_messages(row["messages"])
+        return AgentMemory.from_state(row["messages"])
     return AgentMemory()
 
 
 def _save_session(session_id: str, username: str, memory: AgentMemory, db: Session) -> None:
-    """Upsert the serialised session into the DB."""
-    messages = memory.get_messages()
+    """Upsert the serialised session (messages + scratchpad) into the DB."""
+    state = memory.get_state()
     db.execute(
         text(
             """
@@ -57,7 +57,7 @@ def _save_session(session_id: str, username: str, memory: AgentMemory, db: Sessi
                   updated_at = now()
             """
         ),
-        {"sid": session_id, "uname": username, "msgs": json.dumps(messages)},
+        {"sid": session_id, "uname": username, "msgs": json.dumps(state)},
     )
     db.commit()
 

@@ -170,8 +170,8 @@ class Planner:
                     if maybe_job is not None:
                         async_submission_job = maybe_job
 
-                # Extract and store design context from tool results
-                self._extract_and_store_context(fn_name, arguments, tool_result, mem)
+                # Extract and store design context from structured tool arguments
+                self._extract_and_store_context(fn_name, arguments, mem)
 
             if async_submission_job is not None:
                 return self._format_async_submission_reply(async_submission_job)
@@ -181,6 +181,45 @@ class Planner:
 
         # Safety net: return whatever is in the last assistant turn
         return mem.get("last_assistant_text", "Agent reached max iterations.")
+
+    def run_multi_agent_cycle(
+        self,
+        objective: str,
+        *,
+        session_id: int | None = None,
+        run_id: int | None = None,
+        constraints: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,
+        agents: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Run a minimal multi-agent orchestration cycle.
+
+        This is an M1 skeleton entry that does not alter the existing ReAct
+        chat loop. It can be called by future tools/endpoints to orchestrate
+        specialized sub-agents in a consistent envelope format.
+        """
+        task = {
+            "task_id": str(uuid.uuid4()),
+            "objective": objective,
+            "session_id": session_id,
+            "run_id": run_id,
+            "constraints": constraints or {},
+            "inputs": inputs or {},
+            "agents": agents or ["pnr", "sta", "signoff", "experiment"],
+        }
+        envelopes = self._dispatch_subagents(task)
+        merged = self._merge_agent_outputs(envelopes)
+        gate = self._apply_hitl_gate(merged)
+        return {
+            "task_id": task["task_id"],
+            "session_id": session_id,
+            "run_id": run_id,
+            "objective": objective,
+            "agents": [e["agent"] for e in envelopes],
+            "envelopes": envelopes,
+            "merged": merged,
+            "gate": gate,
+        }
 
     @staticmethod
     def _extract_job_submission(tool_result: str) -> dict[str, Any] | None:
@@ -208,6 +247,110 @@ class Planner:
             f"- next: 可用 job_status 查询进度，job_logs 查看日志。\\n"
             f"- note: {message}"
         )
+
+    @staticmethod
+    def _dispatch_subagents(task: dict[str, Any]) -> list[dict[str, Any]]:
+        """Dispatch a task to selected specialized sub-agents.
+
+        Returns a list of serializable envelope dicts.
+        """
+        from eda_agent.agent.subagents import (
+            AgentEnvelope,
+            ExperimentAgent,
+            PnRAgent,
+            STAAgent,
+            SignoffAgent,
+        )
+
+        registry = {
+            "pnr": PnRAgent(),
+            "sta": STAAgent(),
+            "signoff": SignoffAgent(),
+            "experiment": ExperimentAgent(),
+        }
+
+        selected = task.get("agents") or ["pnr", "sta", "signoff", "experiment"]
+        envelopes: list[dict[str, Any]] = []
+
+        for name in selected:
+            agent = registry.get(name)
+            if agent is None:
+                envelopes.append(
+                    AgentEnvelope.error_result(
+                        task_id=task["task_id"],
+                        agent=name,
+                        objective=str(task.get("objective", "")),
+                        session_id=task.get("session_id"),
+                        run_id=task.get("run_id"),
+                        constraints=task.get("constraints") or {},
+                        inputs=task.get("inputs") or {},
+                        error=f"Unknown sub-agent '{name}'",
+                    ).__dict__
+                )
+                continue
+
+            envelope = AgentEnvelope(
+                task_id=task["task_id"],
+                agent=name,
+                session_id=task.get("session_id"),
+                run_id=task.get("run_id"),
+                objective=str(task.get("objective", "")),
+                constraints=task.get("constraints") or {},
+                inputs=task.get("inputs") or {},
+            )
+
+            try:
+                result = agent.run(envelope)
+                envelopes.append(result.__dict__)
+            except Exception as exc:
+                logger.warning("Sub-agent %s failed", name, exc_info=True)
+                envelopes.append(
+                    AgentEnvelope.error_result(
+                        task_id=task["task_id"],
+                        agent=name,
+                        objective=str(task.get("objective", "")),
+                        session_id=task.get("session_id"),
+                        run_id=task.get("run_id"),
+                        constraints=task.get("constraints") or {},
+                        inputs=task.get("inputs") or {},
+                        error=str(exc),
+                    ).__dict__
+                )
+
+        return envelopes
+
+    @staticmethod
+    def _merge_agent_outputs(envelopes: list[dict[str, Any]]) -> dict[str, Any]:
+        """Merge sub-agent outputs into a single structure for arbitration."""
+        by_agent: dict[str, Any] = {}
+        has_error = False
+        for env in envelopes:
+            agent = str(env.get("agent", "unknown"))
+            by_agent[agent] = {
+                "status": env.get("status", "error"),
+                "outputs": env.get("outputs") or {},
+                "error": env.get("error", ""),
+            }
+            if env.get("status") == "error":
+                has_error = True
+        return {
+            "by_agent": by_agent,
+            "has_error": has_error,
+        }
+
+    @staticmethod
+    def _apply_hitl_gate(merged: dict[str, Any]) -> dict[str, Any]:
+        """Apply minimal human-in-the-loop gate based on merged outputs."""
+        exp = (merged.get("by_agent") or {}).get("experiment") or {}
+        exp_out = exp.get("outputs") or {}
+        risk_level = str(exp_out.get("risk_level", "low"))
+        requires_approval = bool(exp_out.get("requires_approval", False))
+        blocked = requires_approval or risk_level == "high"
+        return {
+            "blocked": blocked,
+            "status": "needs_approval" if blocked else "auto_execute",
+            "reason": "high risk experiment" if blocked else "",
+        }
 
     # ------------------------------------------------------------------
     # Internal
@@ -287,30 +430,20 @@ class Planner:
         self,
         fn_name: str,
         arguments: dict[str, Any],
-        tool_result: str,
         mem: AgentMemory,
     ) -> None:
-        """Extract design context from tool calls and store in memory scratchpad."""
+        """Extract design context from structured tool arguments → scratchpad.
+
+        Uses only the *arguments* dict (already a structured Python dict from
+        the LLM's function call).  No JSON parsing of serialised tool results.
+        """
         if fn_name not in ("run_eda_stage", "run_eda_flow"):
             return
-        
-        # Extract from arguments (the user's request)
-        if "design_name" in arguments:
-            mem.set("design_name", arguments["design_name"])
-        if "pdk" in arguments:
-            mem.set("pdk", arguments["pdk"])
-        if "design_config" in arguments:
-            mem.set("config_path", arguments["design_config"])
-        
-        # Also try to extract from tool result
-        try:
-            import json
-            result = json.loads(tool_result)
-            if isinstance(result, dict):
-                # Use result values if not already set
-                if not mem.get("design_name") and "design_name" in result:
-                    mem.set("design_name", result["design_name"])
-                if not mem.get("pdk") and "pdk" in result:
-                    mem.set("pdk", result["pdk"])
-        except Exception:
-            pass
+
+        for arg_key, scratch_key in (
+            ("design_name", "design_name"),
+            ("pdk", "pdk"),
+            ("design_config", "config_path"),
+        ):
+            if arg_key in arguments:
+                mem.set(scratch_key, arguments[arg_key])

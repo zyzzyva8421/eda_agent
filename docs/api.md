@@ -271,16 +271,29 @@ Trigger a new EDA run.
 **Request Body**:
 ```json
 {
-  "backend": "orfs",
-  "stage": "finish",
+  "backend": "innovus",
+  "stage": "place",
   "design_name": "aes",
-  "design_config": "/path/to/config.mk",
-  "pdk": "sky130hd",
+  "innovus_workdir": "/home/host/InnovusBlk_18_1.tar/InnovusBlk_18_1",
+  "tech_profile": "tsmc18",
   "params": {
     "PLACE_DENSITY": "0.60"
   }
 }
 ```
+
+Backend-aware parameter semantics:
+
+- For `orfs`:
+  - `design_config` = ORFS `DESIGN_CONFIG` file path
+  - `pdk` = process/library identifier (e.g. `sky130hd`)
+
+- For `innovus`:
+  - `design_config` is interpreted as remote workdir root
+  - `pdk` is interpreted as technology/profile metadata label
+  - You may use aliases:
+    - `innovus_workdir` -> `design_config`
+    - `tech_profile` -> `pdk`
 
 **Response** (202):
 ```json
@@ -374,11 +387,13 @@ class TokenResponse(BaseModel):
 ### RunStageRequest
 ```python
 class RunStageRequest(BaseModel):
-    backend: str  # "orfs"
-    stage: str    # "finish"
+  backend: str  # "orfs" | "innovus"
+  stage: str
     design_name: str
-    design_config: str
-    pdk: str
+  design_config: str | None = None
+  pdk: str | None = None
+  innovus_workdir: str | None = None
+  tech_profile: str | None = None
     params: dict = {}
 ```
 
