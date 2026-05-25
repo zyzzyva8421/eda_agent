@@ -236,7 +236,33 @@ def test_get_session_trace_includes_multi_agent_structured_reason_kind():
             "case_id": None,
             "rule_id": None,
             "llm_reason": "multi_agent_cycle executed experiment innovus:place",
-            "llm_reason_structured": {"kind": "multi_agent_cycle", "agents": ["pnr", "sta"]},
+            "llm_reason_structured": {
+                "kind": "multi_agent_cycle",
+                "agents": ["pnr", "sta"],
+                "multi_agent_contract": {
+                    "contract_version": "v1",
+                    "status_summary": {
+                        "total": 4,
+                        "ok": 3,
+                        "needs_approval": 0,
+                        "error": 1,
+                        "has_error": True,
+                    },
+                    "decision_view": {
+                        "candidate_experiments": [],
+                        "constraint_warnings": [],
+                        "signoff_ready": False,
+                        "next_action": "propose_experiment",
+                        "risk_level": "low",
+                        "requires_approval": False,
+                    },
+                    "gate": {
+                        "status": "auto_execute",
+                        "blocked": False,
+                        "reason": "",
+                    },
+                },
+            },
             "human_approved": False,
             "created_at": "2026-01-01T00:05:01Z",
         }
@@ -256,3 +282,7 @@ def test_get_session_trace_includes_multi_agent_structured_reason_kind():
     structured = result["decision_trace"][0]["llm_reason_structured"]
     assert isinstance(structured, dict)
     assert structured.get("kind") == "multi_agent_cycle"
+    contract = structured.get("multi_agent_contract")
+    assert isinstance(contract, dict)
+    assert contract.get("contract_version") == "v1"
+    assert "decision_view" in contract

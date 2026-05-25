@@ -1875,6 +1875,12 @@ def _run_multi_agent_cycle_tool(
                     "gate_status": gate.get("status"),
                     "agents": cycle.get("agents", []),
                     "execute_experiment": True,
+                    "multi_agent_contract": {
+                        "contract_version": cycle.get("contract_version", "v1"),
+                        "status_summary": cycle.get("status_summary", {}),
+                        "decision_view": cycle.get("decision_view", {}),
+                        "gate": cycle.get("gate", {}),
+                    },
                     "experiment": {
                         "backend": backend,
                         "stage": exp_args.get("stage"),

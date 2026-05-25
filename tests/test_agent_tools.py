@@ -230,6 +230,11 @@ def test_execute_run_multi_agent_cycle_records_decision_trace(
     assert kwargs["source_run_id"] == 34
     assert kwargs["target_run_id"] == 777
     assert kwargs["llm_reason_structured"]["kind"] == "multi_agent_cycle"
+    contract = kwargs["llm_reason_structured"]["multi_agent_contract"]
+    assert contract["contract_version"] == "v1"
+    assert "status_summary" in contract
+    assert "decision_view" in contract
+    assert "gate" in contract
 
 
 @patch("eda_agent.agent.tools._record_decision_trace")
