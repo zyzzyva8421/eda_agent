@@ -12,7 +12,11 @@ def test_run_multi_agent_cycle_default_agents():
     )
 
     assert result["objective"].startswith("WNS")
+    assert result["contract_version"] == "v1"
     assert len(result["envelopes"]) == 4
+    assert "status_summary" in result
+    assert result["status_summary"]["total"] == 4
+    assert "decision_view" in result
     assert result["gate"]["status"] in {"auto_execute", "needs_approval"}
 
 
@@ -38,3 +42,4 @@ def test_run_multi_agent_cycle_unknown_agent_yields_error_envelope():
     env_by_agent = {e["agent"]: e for e in result["envelopes"]}
     assert env_by_agent["pnr"]["status"] == "ok"
     assert env_by_agent["unknown_agent"]["status"] == "error"
+    assert result["status_summary"]["error"] >= 1

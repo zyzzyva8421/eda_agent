@@ -210,7 +210,10 @@ class Planner:
         envelopes = self._dispatch_subagents(task)
         merged = self._merge_agent_outputs(envelopes)
         gate = self._apply_hitl_gate(merged)
+        status_counts = self._status_counts(envelopes)
+        decision_view = self._build_decision_view(merged)
         return {
+            "contract_version": "v1",
             "task_id": task["task_id"],
             "session_id": session_id,
             "run_id": run_id,
@@ -218,7 +221,43 @@ class Planner:
             "agents": [e["agent"] for e in envelopes],
             "envelopes": envelopes,
             "merged": merged,
+            "status_summary": {
+                "total": len(envelopes),
+                "ok": status_counts["ok"],
+                "needs_approval": status_counts["needs_approval"],
+                "error": status_counts["error"],
+                "has_error": merged.get("has_error", False),
+            },
+            "decision_view": decision_view,
             "gate": gate,
+        }
+
+    @staticmethod
+    def _status_counts(envelopes: list[dict[str, Any]]) -> dict[str, int]:
+        counts = {"ok": 0, "needs_approval": 0, "error": 0}
+        for env in envelopes:
+            status = str(env.get("status") or "error")
+            if status not in counts:
+                counts["error"] += 1
+                continue
+            counts[status] += 1
+        return counts
+
+    @staticmethod
+    def _build_decision_view(merged: dict[str, Any]) -> dict[str, Any]:
+        by_agent = merged.get("by_agent") or {}
+        pnr_out = ((by_agent.get("pnr") or {}).get("outputs") or {})
+        sta_out = ((by_agent.get("sta") or {}).get("outputs") or {})
+        signoff_out = ((by_agent.get("signoff") or {}).get("outputs") or {})
+        experiment_out = ((by_agent.get("experiment") or {}).get("outputs") or {})
+
+        return {
+            "candidate_experiments": pnr_out.get("candidate_experiments", []),
+            "constraint_warnings": sta_out.get("constraint_warnings", []),
+            "signoff_ready": bool(signoff_out.get("signoff_ready", False)),
+            "next_action": experiment_out.get("next_action", "propose_experiment"),
+            "risk_level": experiment_out.get("risk_level", "low"),
+            "requires_approval": bool(experiment_out.get("requires_approval", False)),
         }
 
     @staticmethod

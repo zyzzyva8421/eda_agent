@@ -124,8 +124,11 @@ def test_execute_run_multi_agent_cycle_contract():
 
     assert "multi_agent" in result
     cycle = result["multi_agent"]
+    assert cycle["contract_version"] == "v1"
     assert "task_id" in cycle
     assert "envelopes" in cycle
+    assert "status_summary" in cycle
+    assert "decision_view" in cycle
     assert "gate" in cycle
 
 
