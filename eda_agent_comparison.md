@@ -67,7 +67,45 @@ graph TD
 | Recipe Search（Bayes/RL） | 系统化搜索策略 | 当前主要 rule + LLM 建议 + 迭代执行 | ⚠️ |
 | UI 产品层 | dashboard / explorer / tracker | 目前为 API + CLI，未形成独立 UI 产品层 | ⚠️ |
 
-## 4. 本轮关键落地（截至当前实现）
+## 4. Multi-Agent 协作说明（新增）
+
+当前 EDA Agent 的多代理能力定位是“**主规划代理 + 专职子代理**”协作：
+
+- **Planner Agent（主代理）**：接收目标、拆解任务、选择阶段与工具、汇总结果并做下一轮决策
+- **PnR Agent（子代理）**：负责布局布线阶段的参数建议与执行反馈
+- **STA Agent（子代理）**：负责时序分析、关键路径与 violation 归因
+- **Signoff Agent（子代理）**：负责 signoff 指标校验与风险确认
+- **Experiment Agent（子代理）**：负责实验编排、参数对照、结果归档与回放索引
+
+多代理并不是并行“自由对话”，而是围绕同一 `session-lineage` 的结构化协同：所有子代理输出都会回写为可追溯的 decision / outcome，再由主代理统一收敛。
+
+### Multi-Agent 工作流程图
+
+```mermaid
+flowchart TD
+   A[User Goal QoR/Closure Target] --> B[Planner Agent]
+   B --> C{Task Decomposition}
+
+   C --> D[PnR Agent]
+   C --> E[STA Agent]
+   C --> F[Signoff Agent]
+   C --> G[Experiment Agent]
+
+   D --> H[Run Backend and Generate Reports]
+   E --> H
+   F --> H
+   G --> H
+
+   H --> I[Parser and Metrics Ingestion]
+   I --> J[(runs / stage_outcomes / decision_trace)]
+   J --> K[Planner Agent Consolidates Evidence]
+   K --> L{Need Next Iteration?}
+
+   L -- Yes --> C
+   L -- No --> M[Finalize Session and Export Trace]
+```
+
+## 5. 本轮关键落地（截至当前实现）
 
 ### P1: 执行与编排能力增强
 
@@ -119,7 +157,7 @@ flowchart TD
    K --> L[replay session: runs + outcomes + decisions]
 ```
 
-## 5. 数据平台能力对比（更新版）
+## 6. 数据平台能力对比（更新版）
 
 ### EDA Agent 当前优势
 
@@ -138,7 +176,7 @@ flowchart TD
 | 权限体系 | 完整 RBAC/组织级治理 | JWT + 基础用户模型 |
 | 计算与调度 | 集群/大数据作业优先 | OLTP + 本地异步队列（SQLite job store） |
 
-## 6. 与传统参数优化（TPE/Bayesian）对比
+## 7. 与传统参数优化（TPE/Bayesian）对比
 
 | 维度 | TPE/Bayesian | EDA Agent（LLM+规则） |
 |---|---|---|
@@ -149,7 +187,7 @@ flowchart TD
 
 结论：两者互补，适合演进为“Bayes 候选生成 + Agent 语义筛选与执行”的协同架构。
 
-## 7. 当前成熟度评估
+## 8. 当前成熟度评估
 
 ### 已成熟
 
@@ -166,7 +204,7 @@ flowchart TD
 - API 到 UI 的产品化视图层（dashboard/experiment tracker）
 - `agent/tools.py` 等大文件的模块化拆分与边界收敛
 
-## 8. 推荐下一阶段优先级
+## 9. 推荐下一阶段优先级
 
 1. 多 Agent 实体化
    - 让 PnR/STA/Signoff/Experiment 子代理接入真实分析与决策输入输出协议
@@ -184,7 +222,7 @@ flowchart TD
 5. 工程质量提升
    - 拆分超大模块（如 `agent/tools.py`）并加强类型化边界
 
-## 9. 关键结论
+## 10. 关键结论
 
 相对 v3 目标，EDA Agent 已从“概念原型”进入“可执行、可追溯、可复盘”的工程化阶段。
 
