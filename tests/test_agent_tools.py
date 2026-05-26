@@ -190,6 +190,60 @@ def test_execute_run_multi_agent_cycle_blocks_high_risk_experiment():
     assert result["experiment_execution"]["status"] == "blocked"
 
 
+def test_execute_run_multi_agent_cycle_execute_flag_without_request_is_skipped():
+    result = json.loads(
+        execute_tool(
+            "run_multi_agent_cycle",
+            {
+                "objective": "Reduce congestion",
+                "constraints": {"risk_level": "low"},
+                "execute_experiment": True,
+            },
+        )
+    )
+
+    assert result["experiment_execution"]["status"] == "skipped"
+
+
+@patch("eda_agent.agent.tools._record_decision_trace")
+@patch("eda_agent.agent.tools._run_eda_stage")
+def test_execute_run_multi_agent_cycle_experiment_failed_status_preserved(
+    mock_run_stage,
+    mock_record_decision,
+):
+    mock_run_stage.return_value = {
+        "run_id": 889,
+        "status": "failed",
+        "stage": "place",
+        "backend": "innovus",
+        "error": "mock failure",
+    }
+
+    result = json.loads(
+        execute_tool(
+            "run_multi_agent_cycle",
+            {
+                "objective": "Reduce congestion",
+                "session_id": 12,
+                "run_id": 34,
+                "constraints": {"risk_level": "low"},
+                "execute_experiment": True,
+                "experiment_request": {
+                    "backend": "innovus",
+                    "stage": "place",
+                    "design_name": "aes",
+                    "innovus_workdir": "/remote/innovus/work",
+                    "tech_profile": "n5_profile",
+                },
+            },
+        )
+    )
+
+    assert result["experiment_execution"]["status"] == "failed"
+    assert result["experiment_execution"]["result"]["status"] == "failed"
+    mock_record_decision.assert_called_once()
+
+
 @patch("eda_agent.agent.tools._record_decision_trace")
 @patch("eda_agent.agent.tools._run_eda_stage")
 def test_execute_run_multi_agent_cycle_records_decision_trace(

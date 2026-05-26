@@ -30,6 +30,11 @@ from typing import Any
 import httpx
 
 from eda_agent.agent.memory import AgentMemory, Message, search_similar_cases
+from eda_agent.agent.subagents.contracts import (
+    DecisionView,
+    HitlGate,
+    MultiAgentCycleResult,
+)
 from eda_agent.agent.tools import TOOL_SCHEMAS, execute_tool
 from eda_agent.config import settings
 from eda_agent.tracing import is_tracing_enabled, trace_chat
@@ -191,7 +196,7 @@ class Planner:
         constraints: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
         agents: list[str] | None = None,
-    ) -> dict[str, Any]:
+    ) -> MultiAgentCycleResult:
         """Run a minimal multi-agent orchestration cycle.
 
         This is an M1 skeleton entry that does not alter the existing ReAct
@@ -244,7 +249,7 @@ class Planner:
         return counts
 
     @staticmethod
-    def _build_decision_view(merged: dict[str, Any]) -> dict[str, Any]:
+    def _build_decision_view(merged: dict[str, Any]) -> DecisionView:
         by_agent = merged.get("by_agent") or {}
         pnr_out = ((by_agent.get("pnr") or {}).get("outputs") or {})
         sta_out = ((by_agent.get("sta") or {}).get("outputs") or {})
@@ -378,7 +383,7 @@ class Planner:
         }
 
     @staticmethod
-    def _apply_hitl_gate(merged: dict[str, Any]) -> dict[str, Any]:
+    def _apply_hitl_gate(merged: dict[str, Any]) -> HitlGate:
         """Apply minimal human-in-the-loop gate based on merged outputs."""
         exp = (merged.get("by_agent") or {}).get("experiment") or {}
         exp_out = exp.get("outputs") or {}
