@@ -1419,68 +1419,22 @@ def _run_eda_stage(
     params: dict[str, Any] | None = None,
     run_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # 对于 innovus，可以从 settings 或别名参数自动获取配置
-    if not backend:
-        # 根据 stage 名称自动推断 backend
-        if stage in ("place", "cts", "route", "floorplan", "powerplan", "prects", "postcts", "postroute", "signoff"):
-            backend = "innovus"
-        else:
-            backend = "orfs"
+    from eda_agent.agent.tool_impl_run_stage import run_eda_stage_impl
 
-    design_config, pdk = _resolve_backend_design_identity(
+    return run_eda_stage_impl(
         backend=backend,
+        stage=stage,
+        design_name=design_name,
         design_config=design_config,
         pdk=pdk,
         innovus_workdir=innovus_workdir,
         tech_profile=tech_profile,
+        params=params,
+        run_context=run_context,
+        resolve_identity_fn=_resolve_backend_design_identity,
+        save_run_and_parse_fn=_save_run_and_parse,
+        record_stage_outcome_fn=_record_stage_outcome,
     )
-
-    be = get_backend(backend)
-    design = DesignSpec(
-        name=design_name,
-        config_path=Path(design_config),
-        pdk=pdk,
-    )
-    result = be.run_stage(stage, design, params or {})
-
-    # Atomically persist run + ingest reports (single transaction)
-    run_db_id = _save_run_and_parse(result, design, backend=be, run_context=run_context)
-
-    root_cause_inference_id = None
-    if run_context:
-        root_cause_inference_id = run_context.get("root_cause_inference_id")
-
-    # Best-effort stage snapshot for reproducibility.
-    try:
-        _record_stage_outcome(
-            run_db_id,
-            stage,
-            result,
-            root_cause_inference_id=root_cause_inference_id,
-        )
-    except Exception:
-        logger.warning("Failed to persist stage_outcome for run %d", run_db_id)
-
-    # Archive the run data to Parquet (best-effort; never fails the main flow)
-    if result.status.value == "success":
-        try:
-            from eda_agent.db.archiver import archive_run
-
-            archive_run(run_db_id)
-        except Exception:
-            logger.warning("Parquet archival failed for run %d", run_db_id)
-
-    return {
-        "run_id": run_db_id,
-        "run_uuid": result.run_id,
-        "status": result.status.value,
-        "stage": stage,
-        "backend": backend,
-        "design_name": design_name,
-        "pdk": pdk,
-        "error": result.error_message,
-        "log_path": str(result.log_path) if result.log_path else None,
-    }
 
 
 def _run_eda_flow_sync(
@@ -1493,155 +1447,23 @@ def _run_eda_flow_sync(
     params: dict[str, Any] | None = None,
     clean: bool = False,
 ) -> dict[str, Any]:
-    """Run a sequence of EDA flow stages."""
-    # Handle clean flag - run make clean first if requested
-    if clean:
-        be = get_backend(backend)
-        design = DesignSpec(
-            name=design_name,
-            config_path=Path(design_config),
-            pdk=pdk,
-        )
-        # Import and run clean
-        import subprocess
-        subprocess.run(
-            ["make", "clean", "-C", str(be._flow_dir), f"DESIGN_CONFIG={design.config_path}"],
-            capture_output=True,
-        )
+    from eda_agent.agent.tool_impl_run_stage import run_eda_flow_sync_impl
 
-    be = get_backend(backend)
-    design = DesignSpec(
-        name=design_name,
-        config_path=Path(design_config),
+    return run_eda_flow_sync_impl(
+        backend=backend,
+        stage_start=stage_start,
+        design_name=design_name,
+        design_config=design_config,
         pdk=pdk,
+        stage_end=stage_end,
+        params=params,
+        clean=clean,
+        create_flow_session_fn=_create_flow_session,
+        save_run_and_parse_fn=_save_run_and_parse,
+        record_decision_trace_fn=_record_decision_trace,
+        record_stage_outcome_fn=_record_stage_outcome,
+        update_flow_session_status_fn=_update_flow_session_status,
     )
-
-    # Get supported stages and determine which to run
-    supported_stages = be.get_supported_stages()
-
-    # Handle "all" keyword or build stage range
-    if stage_start.lower() == "all":
-        stages_to_run = supported_stages
-    elif stage_end:
-        try:
-            start_idx = supported_stages.index(stage_start.lower())
-            end_idx = supported_stages.index(stage_end.lower())
-            if start_idx > end_idx:
-                return {"error": f"Stage '{stage_start}' comes after '{stage_end}'"}
-            stages_to_run = supported_stages[start_idx : end_idx + 1]
-        except ValueError as e:
-            return {"error": f"Invalid stage name: {e}"}
-    else:
-        # Single stage - just run one
-        if stage_start.lower() not in supported_stages:
-            return {
-                "error": f"Stage '{stage_start}' not supported. Valid: {supported_stages}"
-            }
-        stages_to_run = [stage_start.lower()]
-
-    # Run stages sequentially. The session is considered completed when the
-    # final stage in this *specific* session range is done (not hardcoded to postroute).
-    final_stage = stages_to_run[-1]
-    session_id = _create_flow_session(
-        design,
-        objective=str((params or {}).get("_objective", "pnr")),
-        notes=f"flow:{stage_start}->{stage_end or stage_start}",
-    )
-
-    results = []
-    prev_run_id: int | None = None
-    for stage_seq, stage in enumerate(stages_to_run, start=1):
-        stage_result = be.run_stage(stage, design, params or {})
-
-        # Atomically persist run + ingest reports (single transaction)
-        source_run_id = prev_run_id
-        run_db_id = _save_run_and_parse(
-            stage_result,
-            design,
-            backend=be,
-            run_context={
-                "session_id": session_id,
-                "stage_seq": stage_seq,
-                "variant_tag": "baseline",
-                "rerun_reason": f"flow:{stage_start}->{stage_end or stage_start}",
-                "is_baseline": True,
-                "is_selected": False,
-                "parent_run_id": source_run_id,
-            },
-        )
-        prev_run_id = run_db_id
-
-        if source_run_id is not None:
-            try:
-                _record_decision_trace(
-                    session_id=session_id,
-                    source_run_id=source_run_id,
-                    target_run_id=run_db_id,
-                    llm_reason=f"session stage progression: {source_run_id}->{run_db_id}",
-                    llm_reason_structured={
-                        "kind": "session_stage_progression",
-                        "source_run_id": source_run_id,
-                        "target_run_id": run_db_id,
-                        "stage": stage,
-                    },
-                )
-            except Exception:
-                logger.warning("Failed to persist decision_trace %s->%s", source_run_id, run_db_id)
-
-        # Best-effort lineage snapshot; never block main flow.
-        try:
-            _record_stage_outcome(run_db_id, stage, stage_result)
-        except Exception:
-            logger.warning("Failed to persist stage_outcome for run %d", run_db_id)
-
-        # Archive to Parquet (best-effort)
-        if stage_result.status.value == "success":
-            try:
-                from eda_agent.db.archiver import archive_run
-                archive_run(run_db_id)
-            except Exception:
-                logger.warning("Parquet archival failed for run %d", run_db_id)
-
-        results.append({
-            "stage": stage,
-            "is_session_final_stage": stage == final_stage,
-            "status": stage_result.status.value,
-            "run_id": run_db_id,
-            "run_uuid": stage_result.run_id,
-            "error": stage_result.error_message,
-            "log_path": str(stage_result.log_path) if stage_result.log_path else None,
-        })
-
-        if stage_result.status.value != "success":
-            try:
-                _update_flow_session_status(session_id, status="failed")
-            except Exception:
-                logger.warning("Failed to mark flow_session %s failed", session_id)
-            break
-
-    # Determine overall status
-    all_success = all(r["status"] == "success" for r in results)
-    overall_status = "success" if all_success else "partial_failure"
-
-    try:
-        if all_success and results and results[-1]["stage"] == final_stage:
-            _update_flow_session_status(
-                session_id,
-                status="completed",
-                baseline_run_id=results[-1]["run_id"],
-            )
-    except Exception:
-        logger.warning("Failed to finalize flow_session %s", session_id)
-
-    return {
-        "overall_status": overall_status,
-        "session_id": session_id,
-        "session_final_stage": final_stage,
-        "stages_run": len(results),
-        "design_name": design_name,
-        "pdk": pdk,
-        "results": results,
-    }
 
 
 def _run_eda_flow(
