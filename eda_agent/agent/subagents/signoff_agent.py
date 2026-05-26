@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from eda_agent.agent.services import AgentQueryService
 from eda_agent.agent.subagents.base import AgentEnvelope, BaseSubAgent
+
+
+_QUERY_SERVICE = AgentQueryService()
 
 
 class SignoffAgent(BaseSubAgent):
@@ -18,19 +22,17 @@ class SignoffAgent(BaseSubAgent):
         utilization_summary = []
 
         if task.run_id is not None:
-            from eda_agent.agent.tools import _query_power, _query_utilization
-
             design_name = str(task.inputs.get("design_name") or "")
             stage = task.inputs.get("stage")
             stage_val = stage if isinstance(stage, str) else None
 
-            utilization_summary = _query_utilization(
+            utilization_summary = _QUERY_SERVICE.query_utilization(
                 design_name=design_name,
                 stage=stage_val,
                 run_id=task.run_id,
                 limit=1,
             )
-            power_summary = _query_power(
+            power_summary = _QUERY_SERVICE.query_power(
                 design_name=design_name,
                 stage=stage_val,
                 run_id=task.run_id,

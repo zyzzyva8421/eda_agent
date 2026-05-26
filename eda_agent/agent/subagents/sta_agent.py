@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from eda_agent.agent.services import AgentQueryService
 from eda_agent.agent.subagents.base import AgentEnvelope, BaseSubAgent
+
+
+_QUERY_SERVICE = AgentQueryService()
 
 
 class STAAgent(BaseSubAgent):
@@ -15,11 +19,9 @@ class STAAgent(BaseSubAgent):
         constraint_warnings: list[str] = list(task.inputs.get("constraint_warnings", []))
 
         if task.run_id is not None:
-            from eda_agent.agent.tools import _query_timing
-
             design_name = str(task.inputs.get("design_name") or "")
             stage = task.inputs.get("stage")
-            timing = _query_timing(
+            timing = _QUERY_SERVICE.query_timing(
                 design_name=design_name,
                 stage=stage if isinstance(stage, str) else None,
                 run_id=task.run_id,

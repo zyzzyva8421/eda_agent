@@ -40,7 +40,7 @@ def test_pnr_agent_runs_inference_and_builds_experiments(mock_infer):
     assert env.outputs["candidate_experiments"][0]["cause_id"] == "routing_detour"
 
 
-@patch("eda_agent.agent.tools._query_timing")
+@patch("eda_agent.agent.services.query_service.AgentQueryService.query_timing")
 def test_sta_agent_runs_timing_query_and_generates_warnings(mock_query_timing):
     mock_query_timing.return_value = {
         "summary": [
@@ -65,8 +65,8 @@ def test_sta_agent_runs_timing_query_and_generates_warnings(mock_query_timing):
     assert "hold_violations_detected" in warnings
 
 
-@patch("eda_agent.agent.tools._query_power")
-@patch("eda_agent.agent.tools._query_utilization")
+@patch("eda_agent.agent.services.query_service.AgentQueryService.query_power")
+@patch("eda_agent.agent.services.query_service.AgentQueryService.query_utilization")
 def test_signoff_agent_runs_power_util_queries_and_sets_ready(
     mock_query_util,
     mock_query_power,
