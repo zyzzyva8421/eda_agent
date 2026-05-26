@@ -1661,30 +1661,21 @@ def _run_eda_flow(
     NOTE: Synchronous flow execution is implemented by ``_run_eda_flow_sync``
     and is used by the background worker.
     """
-    # Handle clean flag for forcing rerun
-    if clean:
-        params = params or {}
-        params["_clean"] = True
+    from eda_agent.agent.tool_impl_job import run_eda_flow_async_impl
 
-    design_config, pdk = _resolve_backend_design_identity(
+    return run_eda_flow_async_impl(
         backend=backend,
+        stage_start=stage_start,
+        design_name=design_name,
         design_config=design_config,
         pdk=pdk,
         innovus_workdir=innovus_workdir,
         tech_profile=tech_profile,
-    )
-
-    # Keep tool-facing behavior non-blocking: return job_id immediately.
-    return _submit_job(
-        backend=backend,
-        stage=stage_start,
-        design_name=design_name,
-        design_config=design_config,
-        pdk=pdk,
-        params=params,
-        stage_start=stage_start,
         stage_end=stage_end,
-        run_mode="flow",
+        params=params,
+        clean=clean,
+        resolve_identity_fn=_resolve_backend_design_identity,
+        submit_job_fn=_submit_job,
     )
 
 
@@ -1705,50 +1696,29 @@ def _submit_job(
     run_mode: str = "stage",
 ) -> dict[str, Any]:
     """Submit an async job to the queue (stage or flow mode)."""
-    from eda_agent.queue.store import JobStore
+    from eda_agent.agent.tool_impl_job import submit_job_impl
 
-    if run_mode not in ("stage", "flow"):
-        return {"error": f"Invalid run_mode '{run_mode}'. Use 'stage' or 'flow'."}
-
-    if run_mode == "stage" and not stage:
-        return {"error": "'stage' is required when run_mode='stage'"}
-
-    design_config, pdk = _resolve_backend_design_identity(
+    return submit_job_impl(
         backend=backend,
+        design_name=design_name,
         design_config=design_config,
         pdk=pdk,
         innovus_workdir=innovus_workdir,
         tech_profile=tech_profile,
-    )
-
-    # The queue schema requires a non-null stage. In flow mode we store an
-    # informational stage value and use stage_start/stage_end for execution.
-    effective_stage = stage or stage_start or "all"
-
-    store = JobStore()
-    job_id = store.enqueue(
-        backend=backend,
-        stage=effective_stage,
-        design_name=design_name,
-        design_config=design_config,
-        pdk=pdk,
-        params=params or {},
+        stage=stage,
+        params=params,
         stage_start=stage_start,
         stage_end=stage_end,
         run_mode=run_mode,
+        resolve_identity_fn=_resolve_backend_design_identity,
+        ensure_worker_running_fn=_ensure_worker_running,
+        on_worker_start_error=(
+            lambda _exc: logger.warning(
+                "Failed to auto-start worker after job submission",
+                exc_info=True,
+            )
+        ),
     )
-
-    # Auto-start worker for tool-driven submissions (interactive NL path).
-    try:
-        _ensure_worker_running()
-    except Exception:
-        logger.warning("Failed to auto-start worker after job submission", exc_info=True)
-
-    return {
-        "job_id": job_id,
-        "status": "pending",
-        "message": f"Job {job_id} submitted ({run_mode} mode). Use job_status to poll.",
-    }
 
 
 def _run_multi_agent_cycle_tool(
@@ -1819,64 +1789,23 @@ def _resolve_backend_design_identity(
 
 def _job_status(job_id: str) -> dict[str, Any]:
     """Check async job status."""
-    from eda_agent.queue.store import JobStore, JobStatus
+    from eda_agent.agent.tool_impl_job import job_status_impl
 
-    store = JobStore()
-    job = store.get_job(job_id)
-    if job is None:
-        return {"error": f"Job {job_id} not found"}
-
-    result: dict[str, Any] = {
-        "job_id": job.job_id,
-        "status": job.status.value,
-        "backend": job.backend,
-        "stage": job.stage,
-        "design_name": job.design_name,
-    }
-    if job.run_db_id is not None:
-        result["run_id"] = job.run_db_id
-    if job.status in (JobStatus.SUCCESS, JobStatus.FAILED):
-        result["error_message"] = job.error_message
-        result["log_path"] = job.log_path
-    return result
+    return job_status_impl(job_id)
 
 
 def _job_logs(job_id: str, lines: int = 50) -> dict[str, Any]:
     """Get log file from async job."""
-    from eda_agent.queue.store import JobStore
+    from eda_agent.agent.tool_impl_job import job_logs_impl
 
-    store = JobStore()
-    job = store.get_job(job_id)
-    if job is None:
-        return {"error": f"Job {job_id} not found"}
-    if not job.log_path:
-        return {"error": "No log path available for this job"}
-
-    try:
-        log_content = Path(job.log_path).read_text()
-        log_lines = log_content.splitlines()[-lines:]
-        return {"logs": "\n".join(log_lines)}
-    except OSError as e:
-        return {"error": f"Failed to read log: {e}"}
+    return job_logs_impl(job_id, lines=lines)
 
 
 def _cancel_job(job_id: str) -> dict[str, Any]:
     """Cancel a pending/pending_async job."""
-    from eda_agent.queue.store import JobStore, JobStatus
+    from eda_agent.agent.tool_impl_job import cancel_job_impl
 
-    store = JobStore()
-    job = store.get_job(job_id)
-    if job is None:
-        return {"error": f"Job {job_id} not found"}
-
-    if job.status != JobStatus.PENDING:
-        return {
-            "success": False,
-            "error": f"Cannot cancel job in status '{job.status.value}'",
-        }
-
-    store.mark_done(job_id, status=JobStatus.CANCELLED, error_message="Cancelled by user")
-    return {"success": True, "message": f"Job {job_id} cancelled"}
+    return cancel_job_impl(job_id)
 
 
 def _query_timing(
