@@ -1190,25 +1190,9 @@ def _record_stage_outcome(
 
 def _decision_reason_from_suggestion(suggestion: dict[str, Any], prefix: str = "") -> str:
     """Build a compact textual rationale for decision_trace from suggestion output."""
-    parts: list[str] = []
-    if prefix:
-        parts.append(prefix)
+    from eda_agent.agent.tool_impl_trace import decision_reason_from_suggestion_impl
 
-    reasoning = suggestion.get("reasoning")
-    if isinstance(reasoning, list):
-        parts.extend(str(item) for item in reasoning[:3])
-    elif isinstance(reasoning, str):
-        parts.append(reasoning)
-
-    suggested = suggestion.get("suggested_params")
-    if isinstance(suggested, dict) and suggested:
-        parts.append(f"suggested_params={suggested}")
-
-    source = suggestion.get("source")
-    if source:
-        parts.append(f"source={source}")
-
-    return " | ".join(p for p in parts if p)
+    return decision_reason_from_suggestion_impl(suggestion, prefix=prefix)
 
 
 def _decision_reason_structured_from_suggestion(
@@ -1216,25 +1200,11 @@ def _decision_reason_structured_from_suggestion(
     prefix: str = "",
 ) -> dict[str, Any]:
     """Build a structured rationale payload for decision_trace."""
-    payload: dict[str, Any] = {"kind": "suggestion"}
-    if prefix:
-        payload["prefix"] = prefix
+    from eda_agent.agent.tool_impl_trace import (
+        decision_reason_structured_from_suggestion_impl,
+    )
 
-    reasoning = suggestion.get("reasoning")
-    if isinstance(reasoning, list):
-        payload["reasoning"] = [str(item) for item in reasoning[:3]]
-    elif isinstance(reasoning, str) and reasoning.strip():
-        payload["reasoning"] = [reasoning]
-
-    suggested = suggestion.get("suggested_params")
-    if isinstance(suggested, dict) and suggested:
-        payload["suggested_params"] = suggested
-
-    source = suggestion.get("source")
-    if source:
-        payload["source"] = str(source)
-
-    return payload
+    return decision_reason_structured_from_suggestion_impl(suggestion, prefix=prefix)
 
 
 def _record_decision_trace(
@@ -1274,27 +1244,15 @@ def _set_flow_session_inference_context(
     rule_id: str | None = None,
 ) -> None:
     """Persist latest inference/case/rule context on a flow session."""
-    if inference_id is None and case_id is None and rule_id is None:
-        return
-    with get_db() as db:
-        db.execute(
-            text(
-                """
-                UPDATE flow_sessions
-                SET last_inference_id = COALESCE(:inference_id, last_inference_id),
-                    last_case_id = COALESCE(:case_id, last_case_id),
-                    last_rule_id = COALESCE(:rule_id, last_rule_id),
-                    updated_at = now()
-                WHERE id = :sid
-                """
-            ),
-            {
-                "sid": session_id,
-                "inference_id": inference_id,
-                "case_id": case_id,
-                "rule_id": rule_id,
-            },
-        )
+    from eda_agent.agent.tool_impl_trace import set_flow_session_inference_context_impl
+
+    set_flow_session_inference_context_impl(
+        session_id,
+        inference_id=inference_id,
+        case_id=case_id,
+        rule_id=rule_id,
+        get_db_fn=get_db,
+    )
 
 
 def _set_flow_session_context_from_run(
@@ -1305,19 +1263,15 @@ def _set_flow_session_context_from_run(
     rule_id: str | None = None,
 ) -> None:
     """Resolve session_id by run_id and update session inference context."""
-    with get_db() as db:
-        row = db.execute(
-            text("SELECT session_id FROM runs WHERE id = :run_id"),
-            {"run_id": run_id},
-        ).first()
-        if not row or row[0] is None:
-            return
-        sid = int(row[0])
-    _set_flow_session_inference_context(
-        sid,
+    from eda_agent.agent.tool_impl_trace import set_flow_session_context_from_run_impl
+
+    set_flow_session_context_from_run_impl(
+        run_id,
         inference_id=inference_id,
         case_id=case_id,
         rule_id=rule_id,
+        get_db_fn=get_db,
+        set_flow_session_inference_context_fn=_set_flow_session_inference_context,
     )
 
 
@@ -1327,69 +1281,9 @@ def _latest_inference_context_for_run(run_id: int) -> dict[str, Any]:
     Returns a dict with keys: inference_id, case_id, rule_id.  Missing values
     are returned as None so callers can pass through directly.
     """
-    with get_db() as db:
-        session_ctx = db.execute(
-            text(
-                """
-                SELECT fs.last_inference_id, fs.last_case_id, fs.last_rule_id
-                FROM runs r
-                JOIN flow_sessions fs ON fs.id = r.session_id
-                WHERE r.id = :run_id
-                """
-            ),
-            {"run_id": run_id},
-        ).first()
-        if session_ctx and any(v is not None for v in session_ctx):
-            return {
-                "inference_id": int(session_ctx[0]) if session_ctx[0] is not None else None,
-                "case_id": int(session_ctx[1]) if session_ctx[1] is not None else None,
-                "rule_id": session_ctx[2],
-            }
+    from eda_agent.agent.tool_impl_trace import latest_inference_context_for_run_impl
 
-        inf = db.execute(
-            text(
-                """
-                SELECT id, chosen_cause, hypotheses
-                FROM root_cause_inferences
-                WHERE run_id = :run_id
-                ORDER BY confirmed_at DESC NULLS LAST, created_at DESC
-                LIMIT 1
-                """
-            ),
-            {"run_id": run_id},
-        ).mappings().first()
-
-        if not inf:
-            return {"inference_id": None, "case_id": None, "rule_id": None}
-
-        inference_id = int(inf["id"])
-        rule_id: str | None = inf.get("chosen_cause")
-        if not rule_id:
-            hypotheses = inf.get("hypotheses") or []
-            if isinstance(hypotheses, list) and hypotheses:
-                first = hypotheses[0]
-                if isinstance(first, dict):
-                    rule_id = first.get("cause_id")
-
-        case_row = db.execute(
-            text(
-                """
-                SELECT id
-                FROM case_memory
-                WHERE result_metrics->>'inference_id' = :inference_id
-                ORDER BY created_at DESC
-                LIMIT 1
-                """
-            ),
-            {"inference_id": str(inference_id)},
-        ).first()
-
-        case_id = int(case_row[0]) if case_row else None
-        return {
-            "inference_id": inference_id,
-            "case_id": case_id,
-            "rule_id": rule_id,
-        }
+    return latest_inference_context_for_run_impl(run_id, get_db_fn=get_db)
 
 
 def _run_eda_stage(
@@ -3279,11 +3173,15 @@ def _upsert_run(
     If *db* is provided the caller manages the transaction; otherwise a new
     session is created and committed independently (backward-compatible path).
     """
-    if db is not None:
-        return _upsert_run_impl(result, design, db, run_context=run_context)
+    from eda_agent.agent.tool_impl_persistence import upsert_run
 
-    with get_db() as session:
-        return _upsert_run_impl(result, design, session, run_context=run_context)
+    return upsert_run(
+        result,
+        design,
+        db=db,
+        run_context=run_context,
+        get_db_fn=get_db,
+    )
 
 
 def _upsert_run_impl(
@@ -3293,84 +3191,9 @@ def _upsert_run_impl(
     run_context: dict[str, Any] | None = None,
 ) -> int:
     """Persist a RunResult using an active *db* session."""
-    # Ensure backend exists
-    backend_row = db.execute(
-        text("SELECT id FROM backends WHERE name = :name"),
-        {"name": result.backend_name},
-    ).first()
-    backend_id = backend_row[0] if backend_row else None
-    if backend_id is None:
-        db.execute(
-            text("INSERT INTO backends (name, version) VALUES (:name, :ver)"),
-            {"name": result.backend_name, "ver": "unknown"},
-        )
-        backend_id = db.execute(
-            text("SELECT id FROM backends WHERE name = :name"),
-            {"name": result.backend_name},
-        ).scalar()
+    from eda_agent.agent.tool_impl_persistence import upsert_run_impl
 
-    # Ensure design exists
-    design_row = db.execute(
-        text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
-        {"name": design.name, "pdk": design.pdk},
-    ).first()
-    design_id = design_row[0] if design_row else None
-    if design_id is None:
-        db.execute(
-            text(
-                "INSERT INTO designs (name, pdk, config_path) "
-                "VALUES (:name, :pdk, :cfg)"
-            ),
-            {"name": design.name, "pdk": design.pdk, "cfg": str(design.config_path)},
-        )
-        design_id = db.execute(
-            text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
-            {"name": design.name, "pdk": design.pdk},
-        ).scalar()
-
-    ctx = run_context or {}
-
-    db.execute(
-        text(
-            """
-            INSERT INTO runs
-                (run_uuid, backend_id, design_id, session_id, stage, stage_seq,
-                 variant_tag, rerun_reason, is_baseline, is_selected,
-                 parent_run_id, status, params, log_path, report_dir,
-                 error_message, started_at, finished_at)
-            VALUES
-                (:uuid, :bid, :did, :sid, :stage, :stage_seq,
-                 :variant_tag, :rerun_reason, :is_baseline, :is_selected,
-                 :parent_run_id, :status, :params, :log_path, :report_dir,
-                 :error, :started, :finished)
-            """
-        ),
-        {
-            "uuid": result.run_id,
-            "bid": backend_id,
-            "did": design_id,
-            "sid": ctx.get("session_id"),
-            "stage": result.stage,
-            "stage_seq": int(ctx.get("stage_seq", 0) or 0),
-            "variant_tag": str(ctx.get("variant_tag", "") or ""),
-            "rerun_reason": str(ctx.get("rerun_reason", "") or ""),
-            "is_baseline": bool(ctx.get("is_baseline", False)),
-            "is_selected": bool(ctx.get("is_selected", False)),
-            "parent_run_id": ctx.get("parent_run_id"),
-            "status": result.status.value,
-            "params": json.dumps(result.params),
-            "log_path": str(result.log_path or ""),
-            "report_dir": str(result.report_dir or ""),
-            "error": result.error_message,
-            "started": result.started_at,
-            "finished": result.finished_at,
-        },
-    )
-    run_id = db.execute(
-        text("SELECT id FROM runs WHERE run_uuid = :uuid"),
-        {"uuid": result.run_id},
-    ).scalar()
-    return run_id
+    return upsert_run_impl(result, design, db, run_context=run_context)
 
 
 def _upsert_artifacts(run_id: int, reports: list[Any], db: Any = None) -> None:
@@ -3379,37 +3202,23 @@ def _upsert_artifacts(run_id: int, reports: list[Any], db: Any = None) -> None:
     If *db* is provided the caller manages the transaction; otherwise a new
     session is created independently.
     """
-    if db is not None:
-        _upsert_artifacts_impl(run_id, reports, db)
-        return
-    with get_db() as session:
-        _upsert_artifacts_impl(run_id, reports, session)
+    from eda_agent.agent.tool_impl_persistence import upsert_artifacts
+
+    upsert_artifacts(run_id, reports, db=db, get_db_fn=get_db)
 
 
 def _upsert_artifacts_with_db(run_id: int, reports: list[Any], db: Any) -> None:
     """Backward-compat alias — delegates to _upsert_artifacts."""
-    _upsert_artifacts_impl(run_id, reports, db)
+    from eda_agent.agent.tool_impl_persistence import upsert_artifacts_impl
+
+    upsert_artifacts_impl(run_id, reports, db)
 
 
 def _upsert_artifacts_impl(run_id: int, reports: list[Any], db: Any) -> None:
     """Internal: persist artifacts using an active *db* session."""
-    for rpt in reports:
-            path = Path(str(rpt.path))
-            file_size = path.stat().st_size if path.exists() else None
-            db.execute(
-                text(
-                    """
-                    INSERT INTO artifacts (run_id, file_path, artifact_type, file_size_bytes)
-                    VALUES (:run_id, :file_path, :artifact_type, :file_size_bytes)
-                    """
-                ),
-                {
-                    "run_id": run_id,
-                    "file_path": str(path),
-                    "artifact_type": str(getattr(rpt, "report_type", "generic")),
-                    "file_size_bytes": file_size,
-                },
-            )
+    from eda_agent.agent.tool_impl_persistence import upsert_artifacts_impl
+
+    upsert_artifacts_impl(run_id, reports, db)
 
 
 def _ingest_records(records: list[dict], run_id: int, stage: str, db: Any = None) -> None:
@@ -3418,146 +3227,13 @@ def _ingest_records(records: list[dict], run_id: int, stage: str, db: Any = None
     If *db* is provided the caller manages the transaction; otherwise a new
     session is created and committed independently.
     """
-    if db is not None:
-        _ingest_records_impl(records, run_id, stage, db)
-        return
+    from eda_agent.agent.tool_impl_persistence import ingest_records
 
-    with get_db() as session:
-        _ingest_records_impl(records, run_id, stage, session)
+    ingest_records(records, run_id, stage, db=db, get_db_fn=get_db)
 
 
 def _ingest_records_impl(records: list[dict], run_id: int, stage: str, db: Any) -> None:
     """Fan out parsed records using an active *db* session."""
-    for rec in records:
-        kind = rec.get("kind")
-        if kind == "summary" and "wns_ns" in rec:
-            db.execute(
-                text(
-                    "INSERT INTO timing_summary "
-                    "(run_id, view, wns_ns, tns_ns, failing_endpoints, "
-                    " fmax_mhz, clock_skew_ns, max_slew_violations, "
-                    " max_fanout_violations, max_cap_violations, "
-                    " setup_violations, hold_violations, "
-                    " critical_path_delay_ns, slack_cpd_ratio_pct) "
-                    "VALUES (:run_id, :view, :wns, :tns, :fep, "
-                    " :fmax, :skew, :slew_vio, :fanout_vio, :cap_vio, "
-                    " :setup_vio, :hold_vio, :cpd, :ratio)"
-                ),
-                {
-                    "run_id": run_id,
-                    "view": rec.get("view", "default"),
-                    "wns": rec.get("wns_ns"),
-                    "tns": rec.get("tns_ns"),
-                    "fep": rec.get("failing_endpoints"),
-                    "fmax": rec.get("fmax_mhz"),
-                    "skew": rec.get("clock_skew_ns"),
-                    "slew_vio": rec.get("max_slew_violations"),
-                    "fanout_vio": rec.get("max_fanout_violations"),
-                    "cap_vio": rec.get("max_cap_violations"),
-                    "setup_vio": rec.get("setup_violations"),
-                    "hold_vio": rec.get("hold_violations"),
-                    "cpd": rec.get("critical_path_delay_ns"),
-                    "ratio": rec.get("slack_cpd_ratio_pct"),
-                },
-            )
-        elif kind == "path":
-            db.execute(
-                text(
-                    "INSERT INTO timing_paths "
-                    "(run_id, startpoint, endpoint, path_group, slack_ns) "
-                    "VALUES (:run_id, :sp, :ep, :pg, :slack)"
-                ),
-                {
-                    "run_id": run_id,
-                    "sp": rec.get("startpoint", ""),
-                    "ep": rec.get("endpoint", ""),
-                    "pg": rec.get("path_group"),
-                    "slack": rec.get("slack_ns", 0.0),
-                },
-            )
-        elif kind == "hotspot":
-            db.execute(
-                text(
-                    "INSERT INTO congestion_hotspots "
-                    "(run_id, geom, overflow) "
-                    "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow)"
-                ),
-                {
-                    "run_id": run_id,
-                    "wkt": rec["wkt"],
-                    "overflow": rec.get("overflow", 0),
-                },
-            )
-        elif kind == "orfs_violation":
-            # ORFS violation records from congestion-*.rpt files
-            wkt = rec.get("wkt")
-            if not wkt:
-                continue  # Skip violations without bounding box
-            db.execute(
-                text(
-                    "INSERT INTO congestion_hotspots "
-                    "(run_id, geom, overflow, layer) "
-                    "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow, :layer)"
-                ),
-                {
-                    "run_id": run_id,
-                    "wkt": wkt,
-                    "overflow": rec.get("overflow", 0),
-                    "layer": rec.get("layer"),
-                },
-            )
-        elif kind == "summary" and "design_area_um2" in rec:
-            db.execute(
-                text(
-                    "INSERT INTO utilization_summary "
-                    "(run_id, design_area_um2, utilization_pct, num_cells, num_registers) "
-                    "VALUES (:run_id, :area, :util, :cells, :regs)"
-                ),
-                {
-                    "run_id": run_id,
-                    "area": rec.get("design_area_um2"),
-                    "util": rec.get("utilization_pct"),
-                    "cells": rec.get("num_cells"),
-                    "regs": rec.get("num_registers"),
-                },
-            )
-        elif kind == "summary" and "total_power_w" in rec:
-            db.execute(
-                text(
-                    "INSERT INTO power_summary "
-                    "(run_id, internal_power_w, switching_power_w, "
-                    "leakage_power_w, total_power_w) "
-                    "VALUES (:run_id, :int, :sw, :lk, :tot)"
-                ),
-                {
-                    "run_id": run_id,
-                    "int": rec.get("internal_power_w"),
-                    "sw": rec.get("switching_power_w"),
-                    "lk": rec.get("leakage_power_w"),
-                    "tot": rec.get("total_power_w"),
-                },
-            )
-        elif kind == "summary" and "total_violations" in rec:
-            db.execute(
-                text(
-                    "INSERT INTO drc_violations "
-                    "(run_id, violation_type, total_violations) "
-                    "VALUES (:run_id, 'SUMMARY', :total)"
-                ),
-                {"run_id": run_id, "total": rec.get("total_violations")},
-            )
-        elif kind == "drc_violation":
-            db.execute(
-                text(
-                    "INSERT INTO drc_violations "
-                    "(run_id, violation_type, layer, nets, bbox_wkt) "
-                    "VALUES (:run_id, :vtype, :layer, :nets, :bbox)"
-                ),
-                {
-                    "run_id": run_id,
-                    "vtype": rec.get("violation_type", ""),
-                    "layer": rec.get("layer"),
-                    "nets": json.dumps(rec.get("nets") or []),
-                    "bbox": rec.get("bbox_wkt"),
-                },
-            )
+    from eda_agent.agent.tool_impl_persistence import ingest_records_impl
+
+    ingest_records_impl(records, run_id, stage, db)
