@@ -1885,10 +1885,14 @@ def _query_timing(
     run_id: int | None = None,
     limit: int = 10,
 ) -> dict[str, Any]:
-    with get_db() as db:
-        return EDAQueryRepository.get_timing(
-            db, design_name, stage=stage, run_id=run_id, limit=limit
-        )
+    from eda_agent.agent.tool_impl_query import query_timing_impl
+
+    return query_timing_impl(
+        design_name=design_name,
+        stage=stage,
+        run_id=run_id,
+        limit=limit,
+    )
 
 
 def _query_congestion(
@@ -1898,83 +1902,21 @@ def _query_congestion(
     x2: float | None = None,
     y2: float | None = None,
 ) -> list[dict[str, Any]]:
-    with get_db() as db:
-        return EDAQueryRepository.get_congestion(
-            db, run_id, x1=x1, y1=y1, x2=x2, y2=y2,
-        )
+    from eda_agent.agent.tool_impl_query import query_congestion_impl
+
+    return query_congestion_impl(run_id=run_id, x1=x1, y1=y1, x2=x2, y2=y2)
 
 
 def _query_congestion_summary(run_id: int) -> dict[str, Any]:
-    """Return congestion summary metrics for a run.
+    from eda_agent.agent.tool_impl_query import query_congestion_summary_impl
 
-    Primary source: parsed Innovus congestion report artifact.
-    Fallback: congestion_hotspots aggregates when no summary artifact exists.
-    """
-    with get_db() as db:
-        artifact_row = db.execute(
-            text(
-                """
-                SELECT file_path, artifact_type
-                FROM artifacts
-                WHERE run_id = :run_id
-                  AND artifact_type IN ('innovus_congestion', 'congestion')
-                  AND file_path NOT LIKE '%_map.rpt'
-                ORDER BY id ASC
-                LIMIT 1
-                """
-            ),
-            {"run_id": run_id},
-        ).mappings().first()
-
-        if artifact_row:
-            file_path = Path(str(artifact_row["file_path"]))
-            if file_path.is_file():
-                try:
-                    parser_name = str(artifact_row["artifact_type"])
-                    parser = get_parser(parser_name)
-                    records = parser.parse_file(file_path)
-                    summary = next((r for r in records if r.get("kind") == "summary"), None)
-                    if summary:
-                        return {
-                            "run_id": run_id,
-                            "source": "report",
-                            **summary,
-                        }
-                except Exception:
-                    logger.debug(
-                        "query_congestion_summary: failed to parse artifact for run_id=%s",
-                        run_id,
-                        exc_info=True,
-                    )
-
-        hotspot_agg = db.execute(
-            text(
-                """
-                SELECT COALESCE(MAX(overflow), 0) AS max_overflow,
-                       COALESCE(SUM(overflow), 0) AS sum_overflow,
-                       COUNT(*) AS hotspot_count
-                FROM congestion_hotspots
-                WHERE run_id = :run_id
-                """
-            ),
-            {"run_id": run_id},
-        ).mappings().first()
-
-    if hotspot_agg:
-        return {
-            "run_id": run_id,
-            "source": "hotspot_fallback",
-            "kind": "summary",
-            "total_overflow": int(hotspot_agg["sum_overflow"] or 0),
-            "max_overflow": int(hotspot_agg["max_overflow"] or 0),
-            "hotspot_count": int(hotspot_agg["hotspot_count"] or 0),
-        }
-    return {"run_id": run_id, "error": "No congestion data found"}
+    return query_congestion_summary_impl(run_id)
 
 
 def _compare_runs(run_id_a: int, run_id_b: int) -> dict[str, Any]:
-    with get_db() as db:
-        return EDAQueryRepository.compare_runs(db, run_id_a, run_id_b)
+    from eda_agent.agent.tool_impl_query import compare_runs_impl
+
+    return compare_runs_impl(run_id_a, run_id_b)
 
 
 def _infer_objective_from_target_spec(
@@ -2081,10 +2023,14 @@ def _query_utilization(
     run_id: int | None = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    with get_db() as db:
-        return EDAQueryRepository.get_utilization(
-            db, design_name, stage=stage, run_id=run_id, limit=limit
-        )
+    from eda_agent.agent.tool_impl_query import query_utilization_impl
+
+    return query_utilization_impl(
+        design_name=design_name,
+        stage=stage,
+        run_id=run_id,
+        limit=limit,
+    )
 
 
 def _query_power(
@@ -2093,16 +2039,21 @@ def _query_power(
     run_id: int | None = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    with get_db() as db:
-        return EDAQueryRepository.get_power(
-            db, design_name, stage=stage, run_id=run_id, limit=limit
-        )
+    from eda_agent.agent.tool_impl_query import query_power_impl
+
+    return query_power_impl(
+        design_name=design_name,
+        stage=stage,
+        run_id=run_id,
+        limit=limit,
+    )
 
 
 def _get_run_log(run_id: int, lines: int = 50) -> dict[str, Any]:
     """Read the log file from a run and return the last N lines."""
-    with get_db() as db:
-        return EDAQueryRepository.get_run_log(db, run_id, lines=lines)
+    from eda_agent.agent.tool_impl_query import get_run_log_impl
+
+    return get_run_log_impl(run_id, lines=lines)
 
 
 def _add_placement_blockage(
