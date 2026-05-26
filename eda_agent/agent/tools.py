@@ -1250,36 +1250,20 @@ def _record_decision_trace(
     human_approved: bool = False,
 ) -> None:
     """Persist lineage from diagnosis/suggestion to the next rerun."""
-    with get_db() as db:
-        db.execute(
-            text(
-                """
-                INSERT INTO decision_trace
-                    (session_id, source_run_id, target_run_id,
-                     inference_id, case_id, rule_id,
-                     llm_reason, llm_reason_structured, human_approved)
-                VALUES
-                    (:session_id, :source_run_id, :target_run_id,
-                     :inference_id, :case_id, :rule_id,
-                     :llm_reason, :llm_reason_structured::jsonb, :human_approved)
-                """
-            ),
-            {
-                "session_id": session_id,
-                "source_run_id": source_run_id,
-                "target_run_id": target_run_id,
-                "inference_id": inference_id,
-                "case_id": case_id,
-                "rule_id": rule_id,
-                "llm_reason": llm_reason,
-                "llm_reason_structured": json.dumps(
-                    llm_reason_structured
-                    if llm_reason_structured is not None
-                    else ({"kind": "text", "text": llm_reason} if llm_reason else None)
-                ),
-                "human_approved": human_approved,
-            },
-        )
+    from eda_agent.agent.tool_impl_trace import record_decision_trace_impl
+
+    record_decision_trace_impl(
+        session_id,
+        source_run_id,
+        target_run_id,
+        llm_reason=llm_reason,
+        llm_reason_structured=llm_reason_structured,
+        inference_id=inference_id,
+        case_id=case_id,
+        rule_id=rule_id,
+        human_approved=human_approved,
+        get_db_fn=get_db,
+    )
 
 
 def _set_flow_session_inference_context(
