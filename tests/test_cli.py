@@ -5,9 +5,17 @@ from __future__ import annotations
 import io
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from eda_agent.cli import _complete_cmd_name, _path_completions, cli_repl
+from eda_agent.cli import (
+    _build_prompt,
+    _complete_cmd_name,
+    _format_repl_error,
+    _parse_slash_command,
+    _path_completions,
+    cli_repl,
+)
 
 
 def _run_cli_with_input(inputs: list[str]) -> tuple[str, str]:
@@ -45,20 +53,20 @@ def test_eof_exits_gracefully():
 
 
 def test_help_command():
-    out, _ = _run_cli_with_input(["help", "exit"])
-    assert "clear" in out
-    assert "history" in out
-    assert "cd" in out
+    out, _ = _run_cli_with_input(["/help", "exit"])
+    assert "/clear" in out
+    assert "/history" in out
+    assert "/cd" in out
     assert "!" in out
 
 
 def test_clear_command():
-    out, _ = _run_cli_with_input(["clear", "exit"])
+    out, _ = _run_cli_with_input(["/clear", "exit"])
     assert "cleared" in out.lower()
 
 
 def test_history_empty_session():
-    out, _ = _run_cli_with_input(["history", "exit"])
+    out, _ = _run_cli_with_input(["/history", "exit"])
     assert "empty" in out.lower()
 
 
@@ -87,17 +95,17 @@ def test_unexpected_exception_does_not_crash_repl():
 
 
 def test_forget_requires_confirmation():
-    """`forget` without 'yes' must not wipe the session."""
+    """`/forget` without 'yes' must not wipe the session."""
     with patch("eda_agent.cli.clear_session") as mock_clear:
-        # User types 'forget', then declines confirmation, then exits.
-        out, _ = _run_cli_with_input(["forget", "no", "exit"])
+        # User types '/forget', then declines confirmation, then exits.
+        out, _ = _run_cli_with_input(["/forget", "no", "exit"])
     mock_clear.assert_not_called()
     assert "cancelled" in out.lower()
 
 
 def test_forget_with_yes_wipes_session():
     with patch("eda_agent.cli.clear_session") as mock_clear:
-        out, _ = _run_cli_with_input(["forget", "yes", "exit"])
+        out, _ = _run_cli_with_input(["/forget", "yes", "exit"])
     mock_clear.assert_called_once()
     assert "wiped" in out.lower()
 
@@ -127,31 +135,55 @@ def test_shell_command_os_error():
 
 
 def test_cd_command(tmp_path):
-    """'cd <dir>' should change the working directory."""
+    """'/cd <dir>' should change the working directory."""
     original = os.getcwd()
     try:
-        out, err = _run_cli_with_input([f"cd {tmp_path}", "exit"])
+        out, err = _run_cli_with_input([f"/cd {tmp_path}", "exit"])
         assert str(tmp_path) in out or os.getcwd() == str(tmp_path)
     finally:
         os.chdir(original)
 
 
 def test_cd_invalid_dir():
-    """'cd' to a non-existent path should print an error and not crash."""
-    out, err = _run_cli_with_input(["cd /nonexistent_path_xyz_abc", "exit"])
+    """'/cd' to a non-existent path should print an error and not crash."""
+    out, err = _run_cli_with_input(["/cd /nonexistent_path_xyz_abc", "exit"])
     assert "Goodbye" in out
     assert "cd:" in err
 
 
 def test_cd_no_args(tmp_path, monkeypatch):
-    """'cd' with no argument should change to $HOME."""
+    """'/cd' with no argument should change to $HOME."""
     monkeypatch.setenv("HOME", str(tmp_path))
     original = os.getcwd()
     try:
-        out, err = _run_cli_with_input(["cd", "exit"])
+        out, err = _run_cli_with_input(["/cd", "exit"])
         assert str(tmp_path) in out
     finally:
         os.chdir(original)
+
+
+def test_natural_language_help_is_forwarded_to_agent():
+    with patch("eda_agent.cli.Planner") as MockPlanner:
+        instance = MockPlanner.return_value
+        instance.run.return_value = "done"
+        _run_cli_with_input(["help me with synth", "exit"])
+    instance.run.assert_called_once()
+    assert instance.run.call_args.args[0] == "help me with synth"
+
+
+def test_multiline_input_is_forwarded_as_single_turn():
+    with patch("eda_agent.cli.Planner") as MockPlanner:
+        instance = MockPlanner.return_value
+        instance.run.return_value = "ok"
+        _run_cli_with_input(['"""', "line 1", "line 2", '"""', "exit"])
+    instance.run.assert_called_once()
+    assert instance.run.call_args.args[0] == "line 1\nline 2"
+
+
+def test_shell_cd_prints_builtin_hint():
+    out, err = _run_cli_with_input(["!cd /tmp", "exit"])
+    assert "built-in '/cd'" in err
+    assert "Goodbye" in out
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +220,30 @@ def test_path_completions_returns_entries(tmp_path):
 def test_path_completions_no_match():
     results = _path_completions("/nonexistent_xyz_abc_123/")
     assert results == []
+
+
+def test_parse_slash_command():
+    assert _parse_slash_command("/history --full") == ("history", "--full")
+    assert _parse_slash_command("plain text") is None
+
+
+def test_build_prompt_includes_session_context_and_cwd(tmp_path, monkeypatch):
+    from eda_agent.agent.memory import AgentMemory
+
+    monkeypatch.chdir(tmp_path)
+    memory = AgentMemory()
+    memory.set("design_name", "aes")
+    memory.set("pdk", "sky130hd")
+    prompt = _build_prompt(memory, "demo")
+    assert "demo" in prompt
+    assert "aes@sky130hd" in prompt
+    assert tmp_path.name in prompt
+
+
+def test_format_repl_error_adds_suggestion():
+    text = _format_repl_error(ConnectionError("connection refused"), verbose=0)
+    assert "Connection failed" in text
+    assert "-vv" in text
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +412,30 @@ def test_cmd_wait_timeout_returns_two():
             assert exc.code == 2
         else:
             raise AssertionError("expected SystemExit(2) on timeout")
+
+
+def test_cmd_logs_follow_ctrl_c_prints_status_hint(tmp_path, capsys):
+    from eda_agent.cli import _cmd_logs
+    from eda_agent.queue.store import JobStatus
+
+    log_path = tmp_path / "job.log"
+    log_path.write_text("")
+    job = SimpleNamespace(job_id="abc", log_path=str(log_path), status=JobStatus.RUNNING)
+
+    class _BoomFile:
+        def __enter__(self):
+            raise KeyboardInterrupt
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    with patch("eda_agent.queue.store.JobStore") as MockStore:
+        MockStore.return_value.get_job.side_effect = [job, job]
+        with patch("pathlib.Path.open", return_value=_BoomFile()):
+            _cmd_logs(SimpleNamespace(job_id="abc", follow=True))
+    err = capsys.readouterr().err
+    assert "Stopped following logs" in err
+    assert "eda-agent status abc" in err
 
 
 # ---------------------------------------------------------------------------

@@ -34,12 +34,18 @@ import json
 import logging
 import os
 import subprocess
+from time import perf_counter
 from typing import Any
 
 from sqlalchemy import text
 
+from eda_agent.agent.custom_tools import (
+    CustomToolConfigError,
+    load_custom_tools,
+    load_custom_tools_from_entry_points,
+)
 from eda_agent.agent.param_mapper import OptimizationObjective
-from eda_agent.agent.tool_schemas import TOOL_SCHEMAS
+from eda_agent.agent.tool_schemas import TOOL_SCHEMAS as BUILTIN_TOOL_SCHEMAS
 from eda_agent.db.repository import EDAQueryRepository
 from eda_agent.backends.base import DesignSpec
 from eda_agent.config import settings
@@ -569,6 +575,38 @@ def _compare_runs(run_id_a: int, run_id_b: int) -> dict[str, Any]:
     return compare_runs_impl(run_id_a, run_id_b)
 
 
+def _query_flow_sessions(
+    design_name: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    from eda_agent.agent.tool_impl_query import query_flow_sessions_impl
+
+    return query_flow_sessions_impl(
+        design_name=design_name,
+        status=status,
+        limit=limit,
+    )
+
+
+def _query_session_trace(
+    session_id: int,
+    stage: str | None = None,
+    from_seq: int | None = None,
+    to_seq: int | None = None,
+    human_approved: bool | None = None,
+) -> dict[str, Any]:
+    from eda_agent.agent.tool_impl_query import query_session_trace_impl
+
+    return query_session_trace_impl(
+        session_id=session_id,
+        stage=stage,
+        from_seq=from_seq,
+        to_seq=to_seq,
+        human_approved=human_approved,
+    )
+
+
 def _infer_objective_from_target_spec(
     target_spec: str,
     timing_summary: dict[str, Any] | None = None,
@@ -982,6 +1020,8 @@ _TOOL_DISPATCH = {
     "query_utilization": _query_utilization,
     "query_power": _query_power,
     "compare_runs": _compare_runs,
+    "query_flow_sessions": _query_flow_sessions,
+    "query_session_trace": _query_session_trace,
     "suggest_params": _suggest_params,
     "tune_ppa": _tune_ppa,
     "tune_ppa_multistage": _tune_ppa_multistage,
@@ -997,6 +1037,147 @@ _TOOL_DISPATCH = {
     "confirm_root_cause": _confirm_root_cause_tool,
     "optimize_with_inference": _optimize_with_inference_tool,
 }
+def _parse_tool_name_set(raw: str) -> set[str]:
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def _summarize_arguments(args: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in args.items():
+        if isinstance(v, str):
+            out[k] = v if len(v) <= 200 else v[:200] + "..."
+        elif isinstance(v, (int, float, bool)) or v is None:
+            out[k] = v
+        elif isinstance(v, (list, dict)):
+            try:
+                encoded = json.dumps(v, ensure_ascii=False)
+            except TypeError:
+                encoded = str(v)
+            out[k] = encoded if len(encoded) <= 300 else encoded[:300] + "..."
+        else:
+            text_v = str(v)
+            out[k] = text_v if len(text_v) <= 200 else text_v[:200] + "..."
+    return out
+
+
+def _audit_custom_tool_call(
+    *,
+    tool_name: str,
+    source: str,
+    arguments: dict[str, Any],
+    duration_ms: int,
+    result: Any = None,
+    error: str | None = None,
+) -> None:
+    exit_code = None
+    ok = False
+    if isinstance(result, dict):
+        raw_exit = result.get("exit_code")
+        if isinstance(raw_exit, int):
+            exit_code = raw_exit
+        raw_ok = result.get("ok")
+        ok = bool(raw_ok) if isinstance(raw_ok, bool) else (error is None)
+    else:
+        ok = error is None
+
+    try:
+        with get_db() as db:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO custom_tool_audit
+                        (tool_name, source, arguments_summary, duration_ms,
+                         exit_code, ok, error_message)
+                    VALUES
+                        (:tool_name, :source, :arguments_summary::jsonb, :duration_ms,
+                         :exit_code, :ok, :error_message)
+                    """
+                ),
+                {
+                    "tool_name": tool_name,
+                    "source": source,
+                    "arguments_summary": json.dumps(_summarize_arguments(arguments)),
+                    "duration_ms": duration_ms,
+                    "exit_code": exit_code,
+                    "ok": ok,
+                    "error_message": (error or "")[:2000],
+                },
+            )
+    except Exception:
+        logger.warning("Failed to audit custom tool call: %s", tool_name, exc_info=True)
+
+
+def _load_custom_tool_bindings() -> tuple[
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, dict[str, Any]],
+    dict[str, str],
+]:
+    allowlist = _parse_tool_name_set(settings.custom_tools_allowlist)
+    denylist = _parse_tool_name_set(settings.custom_tools_denylist)
+    reserved = set(_TOOL_DISPATCH.keys())
+
+    schemas: list[dict[str, Any]] = []
+    dispatch: dict[str, Any] = {}
+    policies: dict[str, dict[str, Any]] = {}
+    sources: dict[str, str] = {}
+
+    custom_tools_file = settings.custom_tools_file.strip()
+    if custom_tools_file:
+        try:
+            file_schemas, file_dispatch, file_policies, file_sources = load_custom_tools(
+                custom_tools_file,
+                reserved_names=reserved,
+                allowlist=allowlist or None,
+                denylist=denylist or None,
+            )
+            schemas.extend(file_schemas)
+            dispatch.update(file_dispatch)
+            policies.update(file_policies)
+            sources.update(file_sources)
+            reserved.update(file_dispatch.keys())
+        except CustomToolConfigError:
+            logger.exception("Failed to load custom tools from %s", custom_tools_file)
+
+    if settings.custom_tools_enable_entrypoints:
+        try:
+            ep_schemas, ep_dispatch, ep_policies, ep_sources = load_custom_tools_from_entry_points(
+                group=settings.custom_tools_entrypoint_group,
+                reserved_names=reserved,
+                allowlist=allowlist or None,
+                denylist=denylist or None,
+            )
+            schemas.extend(ep_schemas)
+            dispatch.update(ep_dispatch)
+            policies.update(ep_policies)
+            sources.update(ep_sources)
+        except CustomToolConfigError:
+            logger.exception(
+                "Failed to load custom tools from entrypoint group %s",
+                settings.custom_tools_entrypoint_group,
+            )
+
+    return schemas, dispatch, policies, sources
+
+
+_CUSTOM_TOOL_SCHEMAS, _CUSTOM_TOOL_DISPATCH, _CUSTOM_TOOL_POLICIES, _CUSTOM_TOOL_SOURCES = (
+    _load_custom_tool_bindings()
+)
+if _CUSTOM_TOOL_DISPATCH:
+    _TOOL_DISPATCH.update(_CUSTOM_TOOL_DISPATCH)
+
+_CUSTOM_TOOL_NAMES = set(_CUSTOM_TOOL_DISPATCH.keys())
+
+# Register policies at startup so guardrails can enforce custom-tool risk levels.
+try:
+    from eda_agent.agent.guardrails import register_custom_tool_policies
+
+    register_custom_tool_policies(_CUSTOM_TOOL_POLICIES)
+except Exception:
+    logger.warning("Failed to register custom tool policies", exc_info=True)
+
+# Exposed to planner/API callers.
+TOOL_SCHEMAS = [*BUILTIN_TOOL_SCHEMAS, *_CUSTOM_TOOL_SCHEMAS]
 
 
 def execute_tool(name: str, arguments: dict[str, Any]) -> str:
@@ -1021,8 +1202,13 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> str:
     if gr.is_blocked:
         return json.dumps(gr.blocked_response(name, args))
 
+    started = perf_counter()
+    custom_result: Any = None
+    custom_error: str | None = None
     try:
         result = fn(**args)
+        if name in _CUSTOM_TOOL_NAMES:
+            custom_result = result
         # Attach warnings to result when present
         if gr.level == RiskLevel.WARN and gr.warnings:
             if isinstance(result, dict):
@@ -1032,8 +1218,20 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> str:
                 result = {"result": result, "_warnings": gr.warnings}
         return json.dumps(result, default=str)
     except Exception as exc:
+        if name in _CUSTOM_TOOL_NAMES:
+            custom_error = str(exc)
         logger.exception("Tool %s failed", name)
         return json.dumps({"error": str(exc)})
+    finally:
+        if name in _CUSTOM_TOOL_NAMES:
+            _audit_custom_tool_call(
+                tool_name=name,
+                source=_CUSTOM_TOOL_SOURCES.get(name, "custom"),
+                arguments=args,
+                duration_ms=max(0, int((perf_counter() - started) * 1000)),
+                result=custom_result,
+                error=custom_error,
+            )
 
 
 # ── Internal DB helpers ───────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ power_summary      – per-run power breakdown
 drc_violations     – per-run DRC violation records
 artifacts          – file artefacts produced by a run
 agent_sessions     – persistent multi-turn agent conversation history
+custom_tool_audit  – audit log for user-defined/custom tool invocations
 root_cause_inferences – per-run root cause inference results (Phase A engine)
 rule_weights           – per-rule score multipliers for Phase B feedback learning
 case_memory        – persisted resolved debugging cases
@@ -454,6 +455,33 @@ class AgentSession(Base):
     )
 
     __table_args__ = (Index("ix_agent_sessions_username", "username"),)
+
+
+# ── custom_tool_audit ───────────────────────────────────────────────────────
+
+class CustomToolAudit(Base):
+    """Audit records for custom tool executions."""
+
+    __tablename__ = "custom_tool_audit"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    arguments_summary: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_custom_tool_audit_tool_name", "tool_name"),
+        Index("ix_custom_tool_audit_created_at", "created_at"),
+    )
 
 
 # ── root_cause_inferences ────────────────────────────────────────────────────

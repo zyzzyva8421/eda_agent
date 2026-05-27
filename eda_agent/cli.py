@@ -27,18 +27,20 @@ to an in-memory session (same behaviour as before).
 
 Commands inside the REPL
 ------------------------
-    clear              -- drop message history (keep design context)
-    forget             -- drop EVERYTHING and delete the row from the DB
-    history [--full]   -- print message history (default: 200-char preview)
-    sessions           -- list recent sessions for the current user
-    session <id>       -- switch to / create another session
-    cd <dir>           -- change the working directory
+    /clear             -- drop message history (keep design context)
+    /forget            -- drop EVERYTHING and delete the row from the DB
+    /history [--full]  -- print message history (default: 200-char preview)
+    /sessions          -- list recent sessions for the current user
+    /session <id>      -- switch to / create another session
+    /cd <dir>          -- change the working directory
+    /help              -- show command help
+    '\"\"\"'          -- start / end a multi-line input block
     !<shell_cmd>       -- run a shell command (e.g. ``!ls -la``, ``!pwd``)
-    exit / quit / Ctrl-D / Ctrl-C  -- exit
+    exit / quit / Ctrl-D  -- exit
 
 Tab Completion:
 ------------------------
-    Press Tab to autocomplete built-in commands (clear, history, help, exit, cd).
+    Press Tab to autocomplete built-in commands (/clear, /history, /help, /cd).
     Tab also completes file/directory paths for any argument.
     When using the ``!`` prefix, Tab completes executables from PATH and paths.
     Use up/down arrow keys to navigate command history.
@@ -78,19 +80,22 @@ from eda_agent.console import Console, Spinner
 
 # Built-in commands for tab completion
 _BUILTIN_COMMANDS = [
-    "cd",
-    "clear",
+    "/cd",
+    "/clear",
+    "/exit",
+    "/forget",
+    "/help",
+    "/history",
+    "/quit",
+    "/session",
+    "/sessions",
     "exit",
-    "forget",
-    "help",
-    "history",
     "quit",
-    "session",
-    "sessions",
 ]
 
 # History file path for persistent readline history
 _HISTORY_FILE = os.path.expanduser("~/.eda_agent_history")
+_MULTILINE_SENTINEL = '"""'
 
 
 def _complete_cmd_name(prefix: str) -> list[str]:
@@ -191,20 +196,23 @@ def _save_history():
 _BANNER = """\
 \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
 \u2551          EDA Agent  \u2013  Interactive CLI               \u2551
-\u2551  Type 'help' for commands, 'exit' to quit.           \u2551
+\u2551  Type '/help' for commands, 'exit' to quit.          \u2551
 \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
 """
 
 _HELP = """\
 Built-in commands:
-  clear              -- drop message history (keep design context)
-  forget             -- drop EVERYTHING and delete this session from the DB
-  history [--full]   -- show message history (default: 200-char preview)
-  sessions           -- list recent sessions for your user
-  session <id>       -- switch to / create another session
-  cd <dir>           -- change working directory
-  help               -- show this help
-  exit               -- quit (also: quit, Ctrl-D, Ctrl-C)
+    /clear             -- drop message history (keep design context)
+    /forget            -- drop EVERYTHING and delete this session from the DB
+    /history [--full]  -- show message history (default: 200-char preview)
+    /sessions          -- list recent sessions for your user
+    /session <id>      -- switch to / create another session
+    /cd <dir>          -- change working directory
+    /help              -- show this help
+    exit               -- quit (also: quit, Ctrl-D)
+
+Multi-line input:
+    '\"\"\"'          -- start a multi-line block; enter '\"\"\"' again to send it
 
 Shell commands:
   !<cmd> [args]  -- run a shell command (e.g. !ls -la, !pwd, !cat file.txt)
@@ -225,8 +233,9 @@ def _print_history(memory: AgentMemory, full: bool = False) -> None:
     for i, m in enumerate(msgs, 1):
         role = m.get("role", "?").upper()
         content = m.get("content") or ""
-        if not full:
-            content = content[:200]
+        if not full and len(content) > 200:
+            hidden = len(content) - 200
+            content = content[:200] + f"... [truncated {hidden} chars]"
         print(f"[{i}] {role}: {content}")
 
 
@@ -247,7 +256,81 @@ def _print_banner(memory: AgentMemory, session_id: str, persistent: bool) -> Non
         design = ctx.get("design_name") or "?"
         pdk = ctx.get("pdk") or "?"
         print(f"  context: design={design}, pdk={pdk}")
+    print(f"  cwd: {os.getcwd()}")
     print()
+
+
+def _build_prompt(memory: AgentMemory, session_id: str) -> str:
+    ctx = memory.extract_design_context()
+    parts = [session_id]
+    design = ctx.get("design_name") if ctx else None
+    pdk = ctx.get("pdk") if ctx else None
+    if design or pdk:
+        parts.append(f"{design or '?'}@{pdk or '?'}")
+    cwd = os.path.basename(os.getcwd()) or os.getcwd()
+    parts.append(cwd)
+    return f"eda-agent [{' | '.join(parts)}]> "
+
+
+def _parse_slash_command(user_input: str) -> tuple[str, str] | None:
+    stripped = user_input.strip()
+    if not stripped.startswith("/"):
+        return None
+    body = stripped[1:].strip()
+    if not body:
+        return ("help", "")
+    name, _, arg_text = body.partition(" ")
+    return (name.lower(), arg_text.strip())
+
+
+def _read_repl_input(prompt: str) -> str | None:
+    first = input(prompt)
+    if first.strip() != _MULTILINE_SENTINEL:
+        return first.strip()
+
+    print("(multi-line mode; finish with \"\"\")")
+    lines: list[str] = []
+    while True:
+        try:
+            line = input("... ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n(multi-line input cancelled)")
+            return None
+        if line.strip() == _MULTILINE_SENTINEL:
+            return "\n".join(lines).strip()
+        lines.append(line)
+
+
+def _format_repl_error(exc: Exception, *, verbose: int) -> str:
+    message = f"{type(exc).__name__}: {exc}".strip()
+    lowered = str(exc).lower()
+    suggestion = "Retry with a narrower request."
+
+    if isinstance(exc, TimeoutError):
+        suggestion = "Operation timed out. Retry, or narrow the scope before rerunning."
+    elif isinstance(exc, (ConnectionError, OSError)) or any(
+        token in lowered
+        for token in ("connection refused", "temporary failure", "name or service not known", "network")
+    ):
+        suggestion = "Connection failed. Check the configured LLM/API/backend service and network reachability."
+    elif any(
+        token in lowered
+        for token in ("api key", "authentication", "unauthorized", "forbidden", "401", "403")
+    ):
+        suggestion = "Authentication failed. Check the model/API credentials in your environment."
+    elif any(
+        token in lowered
+        for token in ("quota", "rate limit", "429", "insufficient_quota")
+    ):
+        suggestion = "Quota or rate limit reached. Check provider limits or retry later."
+    elif isinstance(exc, ValueError):
+        suggestion = "Input validation failed. Check the request arguments or current design context."
+    elif isinstance(exc, KeyError):
+        suggestion = "Agent state was incomplete. Retry once; if it repeats, rerun with -vv to inspect the traceback."
+
+    if verbose < 2 and "-vv" not in suggestion:
+        suggestion = f"{suggestion} Rerun with -vv for traceback."
+    return f"{message}. {suggestion}"
 
 
 def _pick_resume_session(username: str, db) -> str | None:
@@ -382,88 +465,95 @@ def cli_repl(
 
     while True:
         try:
-            user_input = input("eda-agent> ").strip()
+            user_input = _read_repl_input(_build_prompt(memory, session_id))
         except EOFError:
             print("\nGoodbye!")
             break
         except KeyboardInterrupt:
-            print("\n(Interrupted -- type 'exit' to quit)")
+            print("\n(Cancelled input; use Ctrl-D or 'exit' to quit)")
             continue
 
         if not user_input:
             continue
 
-        cmd = user_input.lower()
-        if cmd in ("exit", "quit"):
+        cmd = user_input.strip().lower()
+        slash_cmd = _parse_slash_command(user_input)
+
+        if cmd in ("exit", "quit") or slash_cmd in {("exit", ""), ("quit", "")}:
             print("Goodbye!")
             break
-        if cmd == "clear":
-            memory.clear()
-            _persist()
-            print("Message history cleared. (Design context preserved -- use 'forget' to wipe everything.)")
-            continue
-        if cmd == "forget":
-            try:
-                confirm = input(
-                    f"This will permanently delete session '{session_id}' "
-                    f"and all its history.  Type 'yes' to confirm: "
-                ).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print("\nforget: cancelled.")
+
+        if slash_cmd is not None:
+            name, arg_text = slash_cmd
+            if name == "clear":
+                memory.clear()
+                _persist()
+                print("Message history cleared. (Design context preserved -- use '/forget' to wipe everything.)")
                 continue
-            if confirm != "yes":
-                print("forget: cancelled.")
+            if name == "forget":
+                try:
+                    confirm = input(
+                        f"This will permanently delete session '{session_id}' "
+                        f"and all its history.  Type 'yes' to confirm: "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n/forget: cancelled.")
+                    continue
+                if confirm != "yes":
+                    print("/forget: cancelled.")
+                    continue
+                memory.forget()
+                clear_session(session_id, db)
+                print(f"Session '{session_id}' wiped.")
                 continue
-            memory.forget()
-            clear_session(session_id, db)
-            print(f"Session '{session_id}' wiped.")
-            continue
-        if cmd == "history" or user_input.lower().startswith("history "):
-            parts = user_input.split()
-            full = len(parts) > 1 and parts[1] in ("--full", "-f", "full")
-            _print_history(memory, full=full)
-            continue
-        if cmd == "sessions":
-            entries = list_sessions(username, db, limit=20)
-            if not entries:
-                print("(no sessions)" if db is not None else "(persistence disabled)")
-            else:
-                for s in entries:
-                    ts = s.updated_at.strftime("%Y-%m-%d %H:%M") if s.updated_at else "?"
-                    marker = "*" if s.session_id == session_id else " "
-                    print(f" {marker} {s.session_id:40s}  {s.message_count:>4d} msg  {ts}")
-            continue
-        if user_input.lower().startswith("session "):
-            new_sid = user_input.split(None, 1)[1].strip()
-            if not new_sid:
-                print("Usage: session <id>", file=sys.stderr)
+            if name == "history":
+                parts = arg_text.split()
+                full = bool(parts) and parts[0] in ("--full", "-f", "full")
+                _print_history(memory, full=full)
                 continue
-            _persist()
-            session_id = new_sid
-            memory = load_session(session_id, db) if db is not None else AgentMemory()
-            print(f"Switched to session '{session_id}' ({len(memory)} msg).")
-            continue
-        if cmd == "help":
-            print(_HELP)
+            if name == "sessions":
+                entries = list_sessions(username, db, limit=20)
+                if not entries:
+                    print("(no sessions)" if db is not None else "(persistence disabled)")
+                else:
+                    for s in entries:
+                        ts = s.updated_at.strftime("%Y-%m-%d %H:%M") if s.updated_at else "?"
+                        marker = "*" if s.session_id == session_id else " "
+                        print(f" {marker} {s.session_id:40s}  {s.message_count:>4d} msg  {ts}")
+                continue
+            if name == "session":
+                new_sid = arg_text.strip()
+                if not new_sid:
+                    print("Usage: /session <id>", file=sys.stderr)
+                    continue
+                _persist()
+                session_id = new_sid
+                memory = load_session(session_id, db) if db is not None else AgentMemory()
+                print(f"Switched to session '{session_id}' ({len(memory)} msg).")
+                continue
+            if name == "help":
+                print(_HELP)
+                continue
+            if name == "cd":
+                target = arg_text or os.path.expanduser("~")
+                target = os.path.expanduser(target.strip())
+                try:
+                    os.chdir(target)
+                    print(os.getcwd())
+                except OSError as exc:
+                    print(f"cd: {exc}", file=sys.stderr)
+                continue
+            print(f"Unknown command '/{name}'. Type '/help' for available commands.", file=sys.stderr)
             continue
 
-        # cd: must be handled inside the process to affect the current CWD.
-        if cmd == "cd" or user_input.lower().startswith("cd "):
-            parts = user_input.split(None, 1)
-            target = parts[1] if len(parts) > 1 else os.path.expanduser("~")
-            target = os.path.expanduser(target.strip())
-            try:
-                os.chdir(target)
-                print(os.getcwd())
-            except OSError as exc:
-                print(f"cd: {exc}", file=sys.stderr)
-            continue
-
-        # !<shell_cmd>: execute directly in the shell.
         if user_input.startswith("!"):
             shell_cmd = user_input[1:].strip()
             if not shell_cmd:
                 print("Usage: !<command>  (e.g. !ls -la)", file=sys.stderr)
+                continue
+            first_token = shell_cmd.split(None, 1)[0] if shell_cmd else ""
+            if first_token == "cd":
+                print("Use the built-in '/cd' command to change the REPL working directory.", file=sys.stderr)
                 continue
             try:
                 subprocess.run(shell_cmd, shell=True)  # noqa: S602
@@ -485,11 +575,10 @@ def cli_repl(
             console.agent(reply)
             _persist()
         except KeyboardInterrupt:
-            # Re-arm prompt without killing the REPL.
-            print("\n(Interrupted -- type 'exit' to quit)")
+            console.info("(cancelled current turn)")
             _persist()
         except Exception as exc:  # noqa: BLE001 -- REPL must stay alive across any planner error
-            console.error(f"{type(exc).__name__}: {exc}")
+            console.error(_format_repl_error(exc, verbose=verbose))
             logging.getLogger(__name__).debug("planner.run raised", exc_info=True)
             # Persist whatever we have so far so transient failures don't
             # cost the user their conversation context.
@@ -911,7 +1000,12 @@ def _cmd_logs(args) -> None:
                     else:
                         break
     except KeyboardInterrupt:
-        pass
+        current = store.get_job(args.job_id)
+        status = current.status.value if current is not None else "unknown"
+        print(
+            f"\nStopped following logs; job is still {status}. Use 'eda-agent status {args.job_id}' to check.",
+            file=sys.stderr,
+        )
 
 
 def _cmd_wait(args) -> None:

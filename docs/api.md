@@ -118,6 +118,11 @@ Send a natural language query to the LLM agent.
 }
 ```
 
+Notes:
+- Custom tools (JSON config / Python entry points) are available through this same endpoint.
+- Tool risk policy (`safe|warn|block`, `requires_confirmation`) is enforced by guardrails before execution.
+- Custom tool calls are audited to `custom_tool_audit`.
+
 ### DELETE /agent/chat/{session_id}
 
 Clear a chat session.
@@ -353,6 +358,18 @@ Get run details.
 ---
 
 ## Models
+
+## Custom Tools Runtime Configuration (Phase 2)
+
+Set these environment variables before starting API/CLI:
+
+- `CUSTOM_TOOLS_FILE`
+- `CUSTOM_TOOLS_ALLOWLIST`
+- `CUSTOM_TOOLS_DENYLIST`
+- `CUSTOM_TOOLS_ENABLE_ENTRYPOINTS`
+- `CUSTOM_TOOLS_ENTRYPOINT_GROUP`
+
+When enabled, custom tools are merged with built-in tools at runtime and can be invoked by the planner via `/agent/chat`.
 
 ### ChatRequest
 ```python

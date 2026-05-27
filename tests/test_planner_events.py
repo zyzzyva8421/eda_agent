@@ -133,3 +133,21 @@ def test_on_event_listener_errors_do_not_crash_planner():
     ):
         reply = planner.run("hi", memory=AgentMemory(), on_event=bad_listener)
     assert reply == "ok"
+
+
+def test_run_mutates_passed_empty_memory_instance():
+    planner = Planner()
+    memory = AgentMemory()
+
+    with patch.object(
+        Planner, "_call_llm", return_value=_fake_llm_response_final("ok")
+    ):
+        reply = planner.run("hi", memory=memory)
+
+    assert reply == "ok"
+    msgs = memory.get_messages()
+    assert len(msgs) == 2
+    assert msgs[0]["role"] == "user"
+    assert msgs[0]["content"] == "hi"
+    assert msgs[1]["role"] == "assistant"
+    assert msgs[1]["content"] == "ok"

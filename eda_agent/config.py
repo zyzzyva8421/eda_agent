@@ -85,6 +85,13 @@ class Settings(BaseSettings):
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO")
 
+    # ── Custom tools ─────────────────────────────────────────────────────────
+    custom_tools_file: str = Field(default="")
+    custom_tools_allowlist: str = Field(default="")
+    custom_tools_denylist: str = Field(default="")
+    custom_tools_enable_entrypoints: bool = Field(default=True)
+    custom_tools_entrypoint_group: str = Field(default="eda_agent.custom_tools")
+
     # ── LangSmith ────────────────────────────────────────────────────────────
     langsmith_api_key: str = Field(default="")
     langsmith_endpoint: str = Field(default="https://api.smith.langchain.com")

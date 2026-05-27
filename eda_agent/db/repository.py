@@ -356,6 +356,44 @@ class EDAQueryRepository:
         return dict(row) if row else None
 
     @staticmethod
+    def get_flow_sessions(
+        db: Any,
+        *,
+        design_name: str | None = None,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List flow_sessions with optional design/status filters."""
+        filters = ["1=1"]
+        params: dict[str, Any] = {"limit": limit}
+        if design_name:
+            filters.append("d.name = :design_name")
+            params["design_name"] = design_name
+        if status:
+            filters.append("fs.status = :status")
+            params["status"] = status
+        where = " AND ".join(filters)
+
+        rows = db.execute(
+            text(
+                f"""
+                SELECT fs.id, fs.session_uuid, fs.objective, fs.status,
+                       fs.design_id, d.name AS design_name, d.pdk,
+                       fs.baseline_run_id, fs.parent_session_id,
+                       fs.last_inference_id, fs.last_case_id, fs.last_rule_id,
+                       fs.created_at, fs.updated_at
+                FROM flow_sessions fs
+                JOIN designs d ON d.id = fs.design_id
+                WHERE {where}
+                ORDER BY fs.updated_at DESC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings().fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
     def get_session_trace(
         db: Any,
         session_id: int,

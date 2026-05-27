@@ -137,7 +137,10 @@ class Planner:
             through *on_event*.  Falls back to the non-streaming path on
             any error so the agent always produces a final reply.
         """
-        mem = memory or AgentMemory()
+        # NOTE: AgentMemory defines __len__, so an empty memory object is
+        # falsy. We must check explicitly for None, otherwise we'd silently
+        # replace the caller-provided memory and lose session history.
+        mem = memory if memory is not None else AgentMemory()
 
         def _emit(kind: str, payload: dict[str, Any]) -> None:
             if on_event is None:

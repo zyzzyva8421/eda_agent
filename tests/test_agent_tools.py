@@ -323,3 +323,72 @@ def test_execute_run_multi_agent_cycle_without_lineage_skips_decision_trace(
     )
 
     mock_record_decision.assert_not_called()
+
+
+def test_execute_query_flow_sessions():
+    mock_query_flow_sessions = MagicMock(
+        return_value=[{"id": 1, "session_uuid": "s-1", "status": "active"}]
+    )
+    with patch.dict(
+        "eda_agent.agent.tools._TOOL_DISPATCH",
+        {"query_flow_sessions": mock_query_flow_sessions},
+    ):
+        result = json.loads(
+            execute_tool(
+                "query_flow_sessions",
+                {"status": "active", "limit": 5},
+            )
+        )
+
+    assert isinstance(result, list)
+    assert result and result[0]["id"] == 1
+    mock_query_flow_sessions.assert_called_once_with(status="active", limit=5)
+
+
+def test_execute_query_session_trace():
+    mock_query_session_trace = MagicMock(
+        return_value={
+            "session": {"id": 7},
+            "runs": [],
+            "stage_outcomes": [],
+            "decision_trace": [],
+        }
+    )
+    with patch.dict(
+        "eda_agent.agent.tools._TOOL_DISPATCH",
+        {"query_session_trace": mock_query_session_trace},
+    ):
+        result = json.loads(
+            execute_tool(
+                "query_session_trace",
+                {"session_id": 7},
+            )
+        )
+
+    assert isinstance(result, dict)
+    assert result["session"]["id"] == 7
+    mock_query_session_trace.assert_called_once_with(session_id=7)
+
+
+def test_execute_custom_tool_triggers_audit():
+    def _fake_custom_tool(**kwargs):
+        return {"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""}
+
+    with patch.dict(
+        "eda_agent.agent.tools._TOOL_DISPATCH",
+        {"custom_echo": _fake_custom_tool},
+        clear=False,
+    ), patch(
+        "eda_agent.agent.tools._CUSTOM_TOOL_NAMES",
+        {"custom_echo"},
+    ), patch.dict(
+        "eda_agent.agent.tools._CUSTOM_TOOL_SOURCES",
+        {"custom_echo": "json:/tmp/custom_tools.json"},
+        clear=False,
+    ), patch(
+        "eda_agent.agent.tools._audit_custom_tool_call"
+    ) as mock_audit:
+        result = json.loads(execute_tool("custom_echo", {"message": "hello"}))
+
+    assert result["ok"] is True
+    mock_audit.assert_called_once()

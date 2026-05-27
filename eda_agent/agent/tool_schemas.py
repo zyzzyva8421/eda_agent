@@ -265,6 +265,70 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "query_flow_sessions",
+            "description": (
+                "List flow_sessions lineage roots from the database, optionally filtered "
+                "by design_name and status. Returns session metadata sorted by latest update."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "design_name": {
+                        "type": "string",
+                        "description": "Optional design name filter (e.g. 'gcd').",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Optional session status filter (e.g. active/completed/failed).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum rows to return (default 20).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_session_trace",
+            "description": (
+                "Return a full lineage trace for one flow session, including session info, "
+                "runs, stage_outcomes, and decision_trace records."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "integer",
+                        "description": "flow_sessions.id to inspect.",
+                    },
+                    "stage": {
+                        "type": "string",
+                        "description": "Optional stage filter applied to runs and outcomes.",
+                    },
+                    "from_seq": {
+                        "type": "integer",
+                        "description": "Optional minimum stage_seq (inclusive).",
+                    },
+                    "to_seq": {
+                        "type": "integer",
+                        "description": "Optional maximum stage_seq (inclusive).",
+                    },
+                    "human_approved": {
+                        "type": "boolean",
+                        "description": "Optional filter for decision_trace.human_approved.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "suggest_params",
             "description": (
                 "Based on the current run results and historical data, suggest "

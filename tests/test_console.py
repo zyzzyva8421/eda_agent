@@ -76,3 +76,14 @@ def test_spinner_is_noop_on_non_tty():
         pass
     # No TTY → no spinner output written.
     assert out.getvalue() == ""
+
+
+def test_console_tool_events_update_spinner_text_even_when_events_hidden():
+    out = io.StringIO()
+    c = Console(stream=out, err_stream=io.StringIO(), show_events=False)
+    spinner = Spinner(c, text="thinking")
+    c.attach_spinner(spinner)
+    c.event("tool_call", {"name": "run_eda_stage", "arguments": {}})
+    assert spinner._text == "running run_eda_stage"
+    c.event("tool_result", {"name": "run_eda_stage", "ok": True})
+    assert spinner._text == "thinking"

@@ -162,6 +162,17 @@ def test_list_runs():
     assert isinstance(rows, list)
 
 
+def test_get_flow_sessions():
+    db = _mock_db(fetchall=[])
+    rows = EDAQueryRepository.get_flow_sessions(
+        db,
+        design_name="gcd",
+        status="active",
+        limit=10,
+    )
+    assert isinstance(rows, list)
+
+
 def test_get_run_not_found():
     db = Mock()
     db.execute.return_value.mappings.return_value.first.return_value = None

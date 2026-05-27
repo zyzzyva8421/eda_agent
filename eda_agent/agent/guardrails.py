@@ -36,6 +36,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_CUSTOM_TOOL_POLICIES: dict[str, dict[str, Any]] = {}
+
 
 class RiskLevel(str, Enum):
     SAFE = "safe"
@@ -149,6 +151,56 @@ _CHECKERS = [
 ]
 
 
+def register_custom_tool_policies(policies: dict[str, dict[str, Any]]) -> None:
+    """Register runtime custom-tool policy map.
+
+    Policy shape:
+        {
+            "tool_name": {
+                "risk_level": "safe|warn|block",
+                "requires_confirmation": bool,
+            }
+        }
+    """
+    _CUSTOM_TOOL_POLICIES.clear()
+    _CUSTOM_TOOL_POLICIES.update(policies)
+
+
+def _check_custom_tool_policy(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> GuardrailResult | None:
+    policy = _CUSTOM_TOOL_POLICIES.get(tool_name)
+    if not policy:
+        return None
+
+    requires_confirmation = bool(policy.get("requires_confirmation", False))
+    if requires_confirmation and not arguments.get("_guardrail_confirmed"):
+        return GuardrailResult(
+            level=RiskLevel.BLOCK,
+            reason=(
+                f"自定义工具 {tool_name} 需要显式确认后才能执行。"
+                "请先确认风险。"
+            ),
+        )
+
+    risk_level = str(policy.get("risk_level", "safe"))
+    if risk_level == RiskLevel.BLOCK:
+        return GuardrailResult(
+            level=RiskLevel.BLOCK,
+            reason=(
+                f"自定义工具 {tool_name} 当前策略为 BLOCK。"
+                "如需执行，请先调整权限策略。"
+            ),
+        )
+    if risk_level == RiskLevel.WARN:
+        return GuardrailResult(
+            level=RiskLevel.WARN,
+            warnings=[f"自定义工具 {tool_name} 按策略标记为高风险，请谨慎执行。"],
+        )
+    return None
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def check(tool_name: str, arguments: dict[str, Any]) -> GuardrailResult:
@@ -164,7 +216,21 @@ def check(tool_name: str, arguments: dict[str, Any]) -> GuardrailResult:
         logger.info("Guardrail bypassed by explicit confirmation for tool '%s'", tool_name)
         return GuardrailResult(level=RiskLevel.SAFE)
 
-    warnings: list[str] = []
+    custom_policy = _check_custom_tool_policy(tool_name, arguments)
+    if custom_policy is not None:
+        if custom_policy.level == RiskLevel.BLOCK:
+            logger.warning(
+                "Guardrail BLOCK by custom policy: tool=%s reason=%s",
+                tool_name,
+                custom_policy.reason,
+            )
+            return custom_policy
+        if custom_policy.level == RiskLevel.WARN:
+            warnings = list(custom_policy.warnings)
+        else:
+            warnings = []
+    else:
+        warnings = []
 
     for checker in _CHECKERS:
         result = checker(tool_name, arguments)

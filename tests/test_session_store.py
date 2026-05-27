@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from psycopg2.extras import Json
+
 from eda_agent.agent import session_store
 from eda_agent.agent.memory import AgentMemory
 
@@ -79,6 +81,61 @@ def test_save_session_writes_to_db():
     mem.set("design_name", "aes")
     session_store.save_session("s1", "alice", mem, db)
     assert db.execute.called
+    assert db.commit.called
+
+
+def test_save_session_passes_native_json_objects_to_db():
+    db = MagicMock()
+    mem = AgentMemory()
+    mem.add_user("hi")
+    mem.add_assistant("hello")
+    mem.set("design_name", "aes")
+
+    session_store.save_session("s1", "alice", mem, db)
+
+    _sql, params = db.execute.call_args.args
+    assert isinstance(params["msgs"], Json)
+    assert isinstance(params["scratch"], Json)
+
+
+def test_load_session_falls_back_when_scratchpad_column_missing():
+    db = MagicMock()
+
+    class MissingScratchpad(Exception):
+        pass
+
+    first_exc = MissingScratchpad('column "scratchpad" does not exist')
+    fallback_result = MagicMock()
+    fallback_mapping = MagicMock()
+    fallback_mapping.first.return_value = {
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    fallback_result.mappings.return_value = fallback_mapping
+
+    db.execute.side_effect = [first_exc, fallback_result]
+
+    mem = session_store.load_session("legacy", db)
+    assert len(mem) == 1
+    assert mem.get_messages()[0]["content"] == "hi"
+    assert mem.context() == {}
+    assert db.rollback.called
+
+
+def test_save_session_falls_back_when_scratchpad_column_missing():
+    db = MagicMock()
+
+    class MissingScratchpad(Exception):
+        pass
+
+    first_exc = MissingScratchpad('column "scratchpad" does not exist')
+    db.execute.side_effect = [first_exc, None]
+
+    mem = AgentMemory()
+    mem.add_user("hi")
+
+    session_store.save_session("legacy", "alice", mem, db)
+    assert db.execute.call_count == 2
+    assert db.rollback.called
     assert db.commit.called
 
 

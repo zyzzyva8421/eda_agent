@@ -122,6 +122,38 @@ def compare_runs_impl(run_id_a: int, run_id_b: int) -> dict[str, Any]:
         return EDAQueryRepository.compare_runs(db, run_id_a, run_id_b)
 
 
+def query_flow_sessions_impl(
+    design_name: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    with get_db() as db:
+        return EDAQueryRepository.get_flow_sessions(
+            db,
+            design_name=design_name,
+            status=status,
+            limit=limit,
+        )
+
+
+def query_session_trace_impl(
+    session_id: int,
+    stage: str | None = None,
+    from_seq: int | None = None,
+    to_seq: int | None = None,
+    human_approved: bool | None = None,
+) -> dict[str, Any]:
+    with get_db() as db:
+        return EDAQueryRepository.get_session_trace(
+            db,
+            session_id,
+            stage=stage,
+            from_seq=from_seq,
+            to_seq=to_seq,
+            human_approved=human_approved,
+        )
+
+
 def query_utilization_impl(
     design_name: str,
     stage: str | None = None,

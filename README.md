@@ -144,11 +144,127 @@ Copy `.env.example` to `.env` and fill in:
 | `API_SECRET_KEY`             | 256-bit random secret for JWT signing.                            |
 | `API_ACCESS_TOKEN_EXPIRE_MINUTES` | JWT lifetime in minutes.                                     |
 | `LOG_LEVEL`                  | Default log level for the API server / worker.                    |
+| `CUSTOM_TOOLS_FILE`          | Optional path to custom tool JSON config loaded at startup.       |
+| `CUSTOM_TOOLS_ALLOWLIST`     | Optional comma-separated custom tool names to allow.              |
+| `CUSTOM_TOOLS_DENYLIST`      | Optional comma-separated custom tool names to block.              |
+| `CUSTOM_TOOLS_ENABLE_ENTRYPOINTS` | Enable Python entry points custom tools (default true).     |
+| `CUSTOM_TOOLS_ENTRYPOINT_GROUP`   | Entry point group name (default `eda_agent.custom_tools`).   |
 | `EDA_AGENT_LOG`              | Override CLI log level (`DEBUG` / `INFO` / …); takes precedence over `-v`. |
 | `NO_COLOR` / `EDA_AGENT_NO_COLOR` | Disable ANSI colours in the REPL output.                     |
 | `LANGSMITH_*`                | Optional LangSmith tracing.                                       |
 
 Run `eda-agent doctor` after editing `.env` to confirm everything is wired correctly.
+
+## Custom tools (MVP)
+
+You can define your own tools and expose them to the agent through one JSON file.
+
+1. Create a JSON config file:
+
+```json
+{
+    "tools": [
+        {
+            "name": "echo_note",
+            "description": "Echo a note in terminal",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Text to echo"}
+                },
+                "required": ["message"]
+            },
+            "command": ["echo", "{message}"],
+            "timeout_sec": 10
+        }
+    ]
+}
+```
+
+2. Set env variable and start CLI/API:
+
+```bash
+export CUSTOM_TOOLS_FILE=/absolute/path/custom_tools.json
+eda-agent
+```
+
+Notes:
+- `command` is executed as argv (no shell), safer than shell string execution.
+- Placeholder values use Python format style, e.g. `"{message}"`.
+- Name conflicts with built-in tools are skipped automatically.
+
+### Custom tool permissions
+
+You can define per-tool policy in the JSON config:
+
+```json
+{
+    "name": "dangerous_tool",
+    "description": "...",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+    "command": ["echo", "x"],
+    "permissions": {
+        "risk_level": "warn",
+        "requires_confirmation": true
+    }
+}
+```
+
+- `risk_level`: `safe` | `warn` | `block`
+- `requires_confirmation`: if true, guardrail requires `_guardrail_confirmed=true`
+
+### Python entry points custom tools
+
+You can also register custom tools via Python package entry points.
+
+Entry point group: `eda_agent.custom_tools` (or override with
+`CUSTOM_TOOLS_ENTRYPOINT_GROUP`). Each entry point must provide a dict or
+list of dict specs with:
+
+- `name`
+- `description`
+- `parameters` (OpenAI function schema object)
+- `callable` (Python callable)
+- optional `permissions`
+
+Custom tool calls are audited into DB table `custom_tool_audit`
+(tool_name, arguments_summary, duration_ms, exit_code, ok, error_message).
+
+## Custom tools rollout checklist (Phase 2)
+
+Use this checklist when enabling custom tools in a real environment.
+
+1. Apply latest DB migrations (includes `custom_tool_audit` table):
+
+```bash
+alembic upgrade head
+```
+
+2. Configure custom tool loading policy in `.env`:
+
+```bash
+CUSTOM_TOOLS_FILE=/abs/path/custom_tools.json
+CUSTOM_TOOLS_ALLOWLIST=
+CUSTOM_TOOLS_DENYLIST=
+CUSTOM_TOOLS_ENABLE_ENTRYPOINTS=true
+CUSTOM_TOOLS_ENTRYPOINT_GROUP=eda_agent.custom_tools
+```
+
+3. Start CLI or API and verify tool discovery with a simple custom tool call.
+
+4. Validate guardrail behavior:
+- `risk_level=warn` should execute with warnings.
+- `risk_level=block` should be blocked.
+- `requires_confirmation=true` should require `_guardrail_confirmed=true`.
+
+5. Validate audit records:
+
+```sql
+SELECT tool_name, ok, duration_ms, created_at
+FROM custom_tool_audit
+ORDER BY created_at DESC
+LIMIT 20;
+```
 
 ## Phase roadmap
 

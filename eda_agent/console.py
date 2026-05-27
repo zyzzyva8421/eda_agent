@@ -191,6 +191,12 @@ class Console:
             Printed inline (no newline, no styling) so the user sees the
             answer materialise progressively.
         """
+        if kind == "tool_call":
+            name = payload.get("name", "tool")
+            self.update_spinner_text(f"running {name}")
+        elif kind in {"tool_result", "async_submission"}:
+            self.update_spinner_text("thinking")
+
         if kind == "token":
             # Always honour streaming tokens, even in --quiet mode, so the
             # final answer still reaches stdout.  The spinner is paused
@@ -266,6 +272,12 @@ class Console:
     def attach_spinner(self, spinner: "Spinner | None") -> None:
         self._spinner = spinner
 
+    def update_spinner_text(self, text: str) -> None:
+        spinner = self._spinner
+        if spinner is None:
+            return
+        spinner.set_text(text)
+
 
 # ---------------------------------------------------------------------------
 # Spinner
@@ -307,6 +319,9 @@ class Spinner:
             return bool(getattr(self._stream, "isatty", lambda: False)())
         except Exception:
             return False
+
+    def set_text(self, text: str) -> None:
+        self._text = text
 
     # -- internal ---------------------------------------------------------
 

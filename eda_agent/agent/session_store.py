@@ -18,12 +18,12 @@ A session row contains:
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from psycopg2.extras import Json
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -35,6 +35,20 @@ logger = logging.getLogger(__name__)
 # exceeded we drop the oldest message pairs until we fit – see
 # :meth:`AgentMemory.shrink_to_byte_budget`.
 MAX_SESSION_BYTES = 512 * 1024
+
+
+def _rollback_quietly(db: Session | None) -> None:
+    if db is None:
+        return
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
+
+def _is_missing_column_error(exc: Exception, column: str) -> bool:
+    text = str(exc).lower()
+    return column.lower() in text and ("does not exist" in text or "undefinedcolumn" in text)
 
 
 @dataclass
@@ -58,6 +72,7 @@ def load_session(session_id: str, db: Session | None) -> AgentMemory:
     """
     if db is None:
         return AgentMemory()
+    used_legacy_layout = False
     try:
         row = (
             db.execute(
@@ -70,16 +85,46 @@ def load_session(session_id: str, db: Session | None) -> AgentMemory:
             .mappings()
             .first()
         )
-    except Exception:  # pragma: no cover – DB unavailable
-        logger.debug("load_session(%s) failed", session_id, exc_info=True)
-        return AgentMemory()
+    except Exception as exc:  # pragma: no cover – DB unavailable
+        _rollback_quietly(db)
+        if not _is_missing_column_error(exc, "scratchpad"):
+            logger.debug("load_session(%s) failed", session_id, exc_info=True)
+            return AgentMemory()
+        # Backward compatibility: old schema has only `messages`.
+        used_legacy_layout = True
+        try:
+            row = (
+                db.execute(
+                    text(
+                        "SELECT messages FROM agent_sessions "
+                        "WHERE session_id = :sid"
+                    ),
+                    {"sid": session_id},
+                )
+                .mappings()
+                .first()
+            )
+        except Exception:  # pragma: no cover – DB unavailable
+            _rollback_quietly(db)
+            logger.debug("load_session(%s) legacy fallback failed", session_id, exc_info=True)
+            return AgentMemory()
 
     if not row:
         return AgentMemory()
 
     raw_messages = row.get("messages") or []
-    raw_scratchpad = row.get("scratchpad") or {}
+    raw_scratchpad = {} if used_legacy_layout else (row.get("scratchpad") or {})
+    if isinstance(raw_messages, str):
+        # Legacy / defensive path: tolerate accidentally stringified JSON.
+        import json
+
+        try:
+            raw_messages = json.loads(raw_messages)
+        except Exception:
+            raw_messages = []
     if isinstance(raw_scratchpad, str):
+        import json
+
         try:
             raw_scratchpad = json.loads(raw_scratchpad)
         except Exception:
@@ -98,6 +143,7 @@ def save_session(
     """Upsert ``memory`` into the DB.  No-op when ``db`` is ``None``."""
     if db is None:
         return
+    did_fallback = False
     try:
         # Enforce a per-session size cap by dropping oldest message pairs
         # until the serialised payload fits.
@@ -118,13 +164,43 @@ def save_session(
             {
                 "sid": session_id,
                 "uname": username,
-                "msgs": json.dumps(payload["messages"]),
-                "scratch": json.dumps(payload["scratchpad"]),
+                "msgs": Json(payload["messages"]),
+                "scratch": Json(payload["scratchpad"]),
             },
         )
         db.commit()
-    except Exception:  # pragma: no cover – DB unavailable
+    except Exception as exc:  # pragma: no cover – DB unavailable
+        _rollback_quietly(db)
+        if _is_missing_column_error(exc, "scratchpad"):
+            did_fallback = True
+            try:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO agent_sessions
+                            (session_id, username, messages, updated_at)
+                        VALUES (:sid, :uname, :msgs, now())
+                        ON CONFLICT (session_id) DO UPDATE
+                          SET messages   = EXCLUDED.messages,
+                              updated_at = now()
+                        """
+                    ),
+                    {
+                        "sid": session_id,
+                        "uname": username,
+                        "msgs": Json(payload["messages"]),
+                    },
+                )
+                db.commit()
+                return
+            except Exception:  # pragma: no cover – DB unavailable
+                _rollback_quietly(db)
+                logger.debug("save_session(%s) legacy fallback failed", session_id, exc_info=True)
+                return
         logger.debug("save_session(%s) failed", session_id, exc_info=True)
+    finally:
+        if did_fallback:
+            logger.debug("save_session(%s) used legacy layout fallback", session_id)
 
 
 def clear_session(session_id: str, db: Session | None) -> None:
@@ -138,6 +214,7 @@ def clear_session(session_id: str, db: Session | None) -> None:
         )
         db.commit()
     except Exception:  # pragma: no cover
+        _rollback_quietly(db)
         logger.debug("clear_session(%s) failed", session_id, exc_info=True)
 
 
@@ -182,6 +259,7 @@ def list_sessions(
                 {"uname": username, "lim": limit},
             ).fetchall()
     except Exception:  # pragma: no cover
+        _rollback_quietly(db)
         logger.debug("list_sessions failed", exc_info=True)
         return []
 
