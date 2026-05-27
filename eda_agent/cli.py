@@ -5,22 +5,35 @@ with the ReAct planner without going through the HTTP API.
 
 Usage::
 
-    eda-agent          # start interactive REPL
-    eda-agent submit   # submit an async EDA job
-    eda-agent list     # list submitted jobs
-    eda-agent status   # show status of a specific job
-    eda-agent logs     # print (or follow) logs for a job
-    eda-agent cancel   # cancel a pending job
+    eda-agent                       # resume the default CLI session
+    eda-agent --session demo        # use / create a named session
+    eda-agent --new                 # start a fresh random session
+    eda-agent --resume              # pick from recent sessions
+    eda-agent --no-persist          # one-off, do not read/write the DB
+    eda-agent submit ...            # submit an async EDA job
 
-    eda-agent-server   # start FastAPI/Uvicorn server (see pyproject.toml)
-    eda-agent-worker   # start background job worker
+    eda-agent-server                # start FastAPI/Uvicorn server
+    eda-agent-worker                # start background job worker
+
+Session memory
+--------------
+The REPL persists conversation history *and* derived facts
+(design_name / pdk / config_path …) to the ``agent_sessions`` PostgreSQL
+table.  Closing the REPL and re-launching it resumes the same default
+session automatically, so you can keep working where you left off.  Use
+``--session <id>`` to keep multiple parallel threads, or ``forget`` to
+wipe a session.  When the DB is unreachable the REPL silently falls back
+to an in-memory session (same behaviour as before).
 
 Commands inside the REPL
 ------------------------
-    clear          -- clear the current session memory
-    history        -- print the current session message history
-    cd <dir>       -- change the working directory
-    !<shell_cmd>   -- run a shell command (e.g. ``!ls -la``, ``!pwd``)
+    clear              -- drop message history (keep design context)
+    forget             -- drop EVERYTHING and delete the row from the DB
+    history [--full]   -- print message history (default: 200-char preview)
+    sessions           -- list recent sessions for the current user
+    session <id>       -- switch to / create another session
+    cd <dir>           -- change the working directory
+    !<shell_cmd>       -- run a shell command (e.g. ``!ls -la``, ``!pwd``)
     exit / quit / Ctrl-D / Ctrl-C  -- exit
 
 Tab Completion:
@@ -34,11 +47,14 @@ Tab Completion:
 
 from __future__ import annotations
 
+import argparse
 import atexit
+import getpass
 import glob as _glob
 import os
 import subprocess
 import sys
+import uuid
 
 try:
     import readline as _readline  # noqa: F401 -- imported for side-effect (history)
@@ -49,9 +65,27 @@ except ImportError:
 
 from eda_agent.agent.memory import AgentMemory
 from eda_agent.agent.planner import Planner
+from eda_agent.agent.session_store import (
+    clear_session,
+    default_cli_session_id,
+    list_sessions,
+    load_session,
+    open_db,
+    save_session,
+)
 
 # Built-in commands for tab completion
-_BUILTIN_COMMANDS = ["cd", "clear", "exit", "help", "history", "quit"]
+_BUILTIN_COMMANDS = [
+    "cd",
+    "clear",
+    "exit",
+    "forget",
+    "help",
+    "history",
+    "quit",
+    "session",
+    "sessions",
+]
 
 # History file path for persistent readline history
 _HISTORY_FILE = os.path.expanduser("~/.eda_agent_history")
@@ -159,11 +193,14 @@ _BANNER = """\
 
 _HELP = """\
 Built-in commands:
-  clear          -- reset session memory
-  history        -- show message history
-  cd <dir>       -- change working directory
-  help           -- show this help
-  exit           -- quit (also: quit, Ctrl-D, Ctrl-C)
+  clear              -- drop message history (keep design context)
+  forget             -- drop EVERYTHING and delete this session from the DB
+  history [--full]   -- show message history (default: 200-char preview)
+  sessions           -- list recent sessions for your user
+  session <id>       -- switch to / create another session
+  cd <dir>           -- change working directory
+  help               -- show this help
+  exit               -- quit (also: quit, Ctrl-D, Ctrl-C)
 
 Shell commands:
   !<cmd> [args]  -- run a shell command (e.g. !ls -la, !pwd, !cat file.txt)
@@ -176,7 +213,7 @@ Anything else is forwarded to the EDA ReAct agent.
 """
 
 
-def _print_history(memory: AgentMemory) -> None:
+def _print_history(memory: AgentMemory, full: bool = False) -> None:
     msgs = memory.get_messages()
     if not msgs:
         print("(empty session)")
@@ -184,15 +221,105 @@ def _print_history(memory: AgentMemory) -> None:
     for i, m in enumerate(msgs, 1):
         role = m.get("role", "?").upper()
         content = m.get("content") or ""
-        print(f"[{i}] {role}: {content[:200]}")
+        if not full:
+            content = content[:200]
+        print(f"[{i}] {role}: {content}")
 
 
-def cli_repl() -> None:
-    """Entry point for the interactive ``eda-agent`` REPL."""
+def _current_username() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER") or os.environ.get("USERNAME") or "anon"
+
+
+def _print_banner(memory: AgentMemory, session_id: str, persistent: bool) -> None:
     print(_BANNER)
+    ctx = memory.extract_design_context()
+    persistence_note = "DB-backed" if persistent else "in-memory only (--no-persist)"
+    summary = f"session: {session_id}  ({persistence_note}, {len(memory)} msg)"
+    print(f"  {summary}")
+    if ctx:
+        design = ctx.get("design_name") or "?"
+        pdk = ctx.get("pdk") or "?"
+        print(f"  context: design={design}, pdk={pdk}")
+    print()
+
+
+def _pick_resume_session(username: str, db) -> str | None:
+    """Interactively let the user pick a recent session.  Returns the id."""
+    sessions = list_sessions(username, db, limit=10)
+    if not sessions:
+        print("No previous sessions found for", username)
+        return None
+    print("Recent sessions:")
+    for i, s in enumerate(sessions, 1):
+        ts = s.updated_at.strftime("%Y-%m-%d %H:%M") if s.updated_at else "?"
+        print(f"  [{i}] {s.session_id}  ({s.message_count} msg, last {ts})")
+    try:
+        choice = input("Pick a number (Enter = cancel): ").strip()
+    except EOFError:
+        return None
+    if not choice:
+        return None
+    try:
+        idx = int(choice)
+    except ValueError:
+        return None
+    if 1 <= idx <= len(sessions):
+        return sessions[idx - 1].session_id
+    return None
+
+
+def cli_repl(
+    session_id: str | None = None,
+    new: bool = False,
+    resume: bool = False,
+    no_persist: bool = False,
+) -> None:
+    """Entry point for the interactive ``eda-agent`` REPL.
+
+    Parameters
+    ----------
+    session_id:
+        Explicit session identifier; defaults to ``cli-<user>-default``
+        when no flag is provided so consecutive launches resume the same
+        conversation.
+    new:
+        Force a brand-new random session id (ignores stored history).
+    resume:
+        Show a picker of recent sessions before starting.
+    no_persist:
+        Do not read or write the ``agent_sessions`` table; useful for
+        throwaway debugging sessions.
+    """
     _setup_readline()
     planner = Planner()
-    memory = AgentMemory()
+
+    username = _current_username()
+    db = None if no_persist else open_db()
+
+    if resume:
+        picked = _pick_resume_session(username, db)
+        if picked:
+            session_id = picked
+        elif session_id is None and not new:
+            session_id = default_cli_session_id(username)
+
+    if new:
+        session_id = f"cli-{username}-{uuid.uuid4().hex[:8]}"
+    elif session_id is None:
+        session_id = default_cli_session_id(username)
+
+    memory = load_session(session_id, db) if db is not None else AgentMemory()
+
+    def _persist() -> None:
+        if db is not None:
+            save_session(session_id, username, memory, db)
+
+    atexit.register(_persist)
+
+    _print_banner(memory, session_id, persistent=db is not None)
 
     while True:
         try:
@@ -213,10 +340,38 @@ def cli_repl() -> None:
             break
         if cmd == "clear":
             memory.clear()
-            print("Session cleared.")
+            _persist()
+            print("Message history cleared. (Design context preserved -- use 'forget' to wipe everything.)")
             continue
-        if cmd == "history":
-            _print_history(memory)
+        if cmd == "forget":
+            memory.forget()
+            clear_session(session_id, db)
+            print(f"Session '{session_id}' wiped.")
+            continue
+        if cmd == "history" or user_input.lower().startswith("history "):
+            parts = user_input.split()
+            full = len(parts) > 1 and parts[1] in ("--full", "-f", "full")
+            _print_history(memory, full=full)
+            continue
+        if cmd == "sessions":
+            entries = list_sessions(username, db, limit=20)
+            if not entries:
+                print("(no sessions)" if db is not None else "(persistence disabled)")
+            else:
+                for s in entries:
+                    ts = s.updated_at.strftime("%Y-%m-%d %H:%M") if s.updated_at else "?"
+                    marker = "*" if s.session_id == session_id else " "
+                    print(f" {marker} {s.session_id:40s}  {s.message_count:>4d} msg  {ts}")
+            continue
+        if user_input.lower().startswith("session "):
+            new_sid = user_input.split(None, 1)[1].strip()
+            if not new_sid:
+                print("Usage: session <id>", file=sys.stderr)
+                continue
+            _persist()
+            session_id = new_sid
+            memory = load_session(session_id, db) if db is not None else AgentMemory()
+            print(f"Switched to session '{session_id}' ({len(memory)} msg).")
             continue
         if cmd == "help":
             print(_HELP)
@@ -249,8 +404,12 @@ def cli_repl() -> None:
         try:
             reply = planner.run(user_input, memory=memory)
             print(f"\nAgent: {reply}\n")
+            _persist()
         except (RuntimeError, ValueError, OSError, TimeoutError) as exc:
             print(f"Error: {exc}\n", file=sys.stderr)
+            # Persist whatever we have so far so transient failures don't
+            # cost the user their conversation context.
+            _persist()
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +419,6 @@ def cli_repl() -> None:
 
 def _build_parser():
     """Build the top-level argument parser for job subcommands."""
-    import argparse
-
     parser = argparse.ArgumentParser(
         prog="eda-agent",
         description=(
@@ -269,6 +426,28 @@ def _build_parser():
             "Use a subcommand to manage async EDA jobs."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # REPL-mode flags (only used when no subcommand is given).
+    parser.add_argument(
+        "--session",
+        default=None,
+        metavar="ID",
+        help="Resume / create a named REPL session (default: cli-<user>-default).",
+    )
+    parser.add_argument(
+        "--new",
+        action="store_true",
+        help="Start a brand-new REPL session (ignores stored history).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Pick a previous REPL session from a list.",
+    )
+    parser.add_argument(
+        "--no-persist",
+        action="store_true",
+        help="Do not read or write the agent_sessions DB table.",
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -601,13 +780,18 @@ def _cmd_cancel(args) -> None:
 
 def main() -> None:
     """Primary entry point -- dispatches to subcommand or interactive REPL."""
-    # No arguments: launch the interactive REPL (backward-compatible)
-    if len(sys.argv) == 1:
-        cli_repl()
-        return
-
     parser = _build_parser()
     args = parser.parse_args()
+
+    # No subcommand: enter the interactive REPL (with optional --session flags).
+    if args.command is None:
+        cli_repl(
+            session_id=args.session,
+            new=args.new,
+            resume=args.resume,
+            no_persist=args.no_persist,
+        )
+        return
 
     dispatch = {
         "submit": _cmd_submit,

@@ -358,6 +358,9 @@ class AgentSession(Base):
     session_id: Mapped[str] = mapped_column(String(256), nullable=False, unique=True)
     username: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     messages: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    scratchpad: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
