@@ -7,11 +7,14 @@ import logging
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from eda_agent.agent.memory import AgentMemory
 from eda_agent.agent.planner import Planner
+from eda_agent.agent.session_store import (
+    clear_session,
+    load_session,
+    save_session,
+)
 from eda_agent.agent.tools import execute_tool
 from eda_agent.api.auth import get_current_user
 from eda_agent.db.session import get_db_dependency
@@ -30,6 +33,7 @@ class ChatResponse(BaseModel):
     session_id: str | None = None
 
 
+<<<<<<< HEAD
 # ── DB-backed session helpers ─────────────────────────────────────────────────
 
 
@@ -62,6 +66,8 @@ def _save_session(session_id: str, username: str, memory: AgentMemory, db: Sessi
     db.commit()
 
 
+=======
+>>>>>>> origin/main
 # ── Route handlers ────────────────────────────────────────────────────────────
 
 
@@ -78,7 +84,7 @@ def chat(
     If the LLM is unavailable a keyword-based fallback is used.
     """
     session_id = req.session_id or f"anon-{_user['username']}"
-    memory = _load_session(session_id, db)
+    memory = load_session(session_id, db)
 
     try:
         planner = Planner()
@@ -87,7 +93,7 @@ def chat(
         logger.warning("Planner failed (%s); falling back to keyword query", exc)
         reply = _fallback_query(req.message)
 
-    _save_session(session_id, _user["username"], memory, db)
+    save_session(session_id, _user["username"], memory, db)
     return ChatResponse(reply=reply, session_id=session_id)
 
 
@@ -148,15 +154,11 @@ def _fallback_query(message: str) -> str:
 
 
 @router.delete("/chat/{session_id}")
-def clear_session(
+def clear_session_route(
     session_id: str,
     db: Session = Depends(get_db_dependency),
     _user: dict = Depends(get_current_user),
 ):
     """Clear conversation history for a session."""
-    db.execute(
-        text("DELETE FROM agent_sessions WHERE session_id = :sid"),
-        {"sid": session_id},
-    )
-    db.commit()
+    clear_session(session_id, db)
     return {"message": f"Session '{session_id}' cleared."}

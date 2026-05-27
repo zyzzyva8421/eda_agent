@@ -111,15 +111,11 @@ class Planner:
         """Run the ReAct loop and return the final assistant response."""
         mem = memory or AgentMemory()
 
-        # Inject similar historical cases into the scratchpad so _call_llm can
-        # include them in the system prompt.  We do this once per session (when
-        # the first user message arrives) using a lightweight DB query; failures
-        # are silently ignored so offline/test environments still work.
-        if not mem.get("_cases_loaded"):
-            similar = search_similar_cases(user_message, limit=3)
-            if similar:
-                mem.set("_similar_cases", similar)
-            mem.set("_cases_loaded", True)
+        # Retrieve similar historical cases once per *user turn* (topic may
+        # change between turns) with a small LRU cache keyed by the query
+        # text.  Results are stored in the volatile ``_similar_cases``
+        # slot, which is excluded from session persistence.
+        self._refresh_similar_cases(mem, user_message)
 
         mem.add_user(user_message)
 
@@ -129,7 +125,9 @@ class Planner:
 
             # Handle empty or None response
             if not response or not response.get("choices"):
-                return mem.get("last_assistant_text", "Sorry, I couldn't process that request.")
+                return self._last_assistant_text(mem) or (
+                    "Sorry, I couldn't process that request."
+                )
 
             choice = response["choices"][0]
             finish_reason = choice.get("finish_reason", "stop")
@@ -185,7 +183,15 @@ class Planner:
                 break
 
         # Safety net: return whatever is in the last assistant turn
-        return mem.get("last_assistant_text", "Agent reached max iterations.")
+        return self._last_assistant_text(mem) or "Agent reached max iterations."
+
+    @staticmethod
+    def _last_assistant_text(mem: AgentMemory) -> str:
+        """Return the most recent assistant ``content`` from history, if any."""
+        for m in reversed(mem.get_messages()):
+            if m.get("role") == "assistant" and m.get("content"):
+                return str(m["content"])
+        return ""
 
     def run_multi_agent_cycle(
         self,
@@ -476,6 +482,7 @@ class Planner:
         arguments: dict[str, Any],
         mem: AgentMemory,
     ) -> None:
+<<<<<<< HEAD
         """Extract design context from structured tool arguments → scratchpad.
 
         Uses only the *arguments* dict (already a structured Python dict from
@@ -491,3 +498,53 @@ class Planner:
         ):
             if arg_key in arguments:
                 mem.set(scratch_key, arguments[arg_key])
+=======
+        """Update the durable session context from any tool that exposes it.
+
+        Replaces the previous hard-coded whitelist; we now look at every
+        tool call (arguments + result) for keys in
+        :data:`eda_agent.agent.memory.CONTEXT_KEYS` so that
+        ``query_timing`` / ``submit_job`` / ``run_ppa_tuning`` etc. also
+        refresh ``design_name`` / ``pdk`` / ``run_id``.
+        """
+        del fn_name  # parameter kept for API stability
+        mem.update_context_from_tool(arguments, tool_result)
+
+    # ------------------------------------------------------------------
+    # Case retrieval helpers
+    # ------------------------------------------------------------------
+
+    _CASE_CACHE_MAX = 8
+
+    def _refresh_similar_cases(self, mem: AgentMemory, user_message: str) -> None:
+        """Refresh ``_similar_cases`` for the current user turn.
+
+        Caches up to :attr:`_CASE_CACHE_MAX` recent queries in the
+        volatile scratchpad so a back-and-forth conversation about the
+        same topic does not hammer the DB.
+        """
+        query = (user_message or "").strip()
+        if not query:
+            mem.set("_similar_cases", [])
+            return
+
+        cache: dict[str, list[dict[str, Any]]] = mem.get("_cases_cache") or {}
+        if query in cache:
+            mem.set("_similar_cases", cache[query])
+            return
+
+        try:
+            similar = search_similar_cases(query, limit=3) or []
+        except Exception:
+            logger.debug("similar-case lookup failed", exc_info=True)
+            similar = []
+
+        cache[query] = similar
+        # Keep the cache bounded so a long session can't bloat memory.
+        if len(cache) > self._CASE_CACHE_MAX:
+            # drop oldest insertion
+            first_key = next(iter(cache))
+            cache.pop(first_key, None)
+        mem.set("_cases_cache", cache)
+        mem.set("_similar_cases", similar)
+>>>>>>> origin/main
