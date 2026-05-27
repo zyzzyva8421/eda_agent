@@ -455,22 +455,23 @@ class TestAgentChatRouter:
     def test_chat_scratchpad_survives_across_requests(self, client):
         """Scratchpad set in one request is visible in the next (same session).
 
-        Regression guard: ``extract_design_context`` now reads only the
-        scratchpad (no JSON-parsing fallback), so the scratchpad must
-        survive the ``_save_session`` → DB → ``_load_session`` round-trip.
+        Regression guard: ``extract_design_context`` reads the durable
+        ``context`` namespace of the scratchpad, so it must survive the
+        ``save_session`` → DB → ``load_session`` round-trip handled by
+        :mod:`eda_agent.agent.session_store`.
         """
         storage: dict[str, Any] = {}
 
         def mock_load(sid: str, db: Any) -> AgentMemory:
             raw = storage.get(sid)
-            return AgentMemory.from_state(raw) if raw else AgentMemory()
+            return AgentMemory.from_dict(raw) if raw else AgentMemory()
 
         def mock_save(sid: str, uname: str, mem: AgentMemory, db: Any) -> None:
-            storage[sid] = mem.get_state()
+            storage[sid] = mem.to_dict()
 
         with (
-            patch.object(agent_router, "_load_session", side_effect=mock_load),
-            patch.object(agent_router, "_save_session", side_effect=mock_save),
+            patch.object(agent_router, "load_session", side_effect=mock_load),
+            patch.object(agent_router, "save_session", side_effect=mock_save),
             patch("eda_agent.api.routers.agent_router.Planner") as MockPlanner,
         ):
             instance = MockPlanner.return_value

@@ -174,7 +174,7 @@ class Planner:
                         async_submission_job = maybe_job
 
                 # Extract and store design context from structured tool arguments
-                self._extract_and_store_context(fn_name, arguments, mem)
+                self._extract_and_store_context(fn_name, arguments, tool_result, mem)
 
             if async_submission_job is not None:
                 return self._format_async_submission_reply(async_submission_job)
@@ -480,25 +480,9 @@ class Planner:
         self,
         fn_name: str,
         arguments: dict[str, Any],
+        tool_result: str,
         mem: AgentMemory,
     ) -> None:
-<<<<<<< HEAD
-        """Extract design context from structured tool arguments → scratchpad.
-
-        Uses only the *arguments* dict (already a structured Python dict from
-        the LLM's function call).  No JSON parsing of serialised tool results.
-        """
-        if fn_name not in ("run_eda_stage", "run_eda_flow"):
-            return
-
-        for arg_key, scratch_key in (
-            ("design_name", "design_name"),
-            ("pdk", "pdk"),
-            ("design_config", "config_path"),
-        ):
-            if arg_key in arguments:
-                mem.set(scratch_key, arguments[arg_key])
-=======
         """Update the durable session context from any tool that exposes it.
 
         Replaces the previous hard-coded whitelist; we now look at every
@@ -547,4 +531,3 @@ class Planner:
             cache.pop(first_key, None)
         mem.set("_cases_cache", cache)
         mem.set("_similar_cases", similar)
->>>>>>> origin/main

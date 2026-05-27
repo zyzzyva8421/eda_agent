@@ -355,103 +355,17 @@ class AgentMemory:
                 else:
                     self.set(key, val)
 
-    _CONTEXT_KEYS = ("design_name", "pdk", "config_path")
-
     def extract_design_context(self) -> dict[str, str]:
-<<<<<<< HEAD
-        """Extract design context from the session scratchpad.
-
-        The scratchpad is populated by the planner's
-        ``_extract_and_store_context()`` whenever a stage/flow tool is
-        executed.  This method reads only the scratchpad – no fragile JSON
-        parsing of serialised tool-result strings.
-
-        Returns a dict of non-empty context entries (may be empty).
-        """
-        return {
-            k: v
-            for k in self._CONTEXT_KEYS
-            if (v := self._scratchpad.get(k))
-        }
-
-    # ------------------------------------------------------------------
-    # Full-state serialisation (for DB persistence across HTTP requests)
-    # ------------------------------------------------------------------
-
-    def get_state(self) -> dict[str, Any]:
-        """Return the full serialisable state (messages + scratchpad).
-
-        The returned dict can be round-tripped through :meth:`from_state`
-        to preserve both message history and design context across API
-        requests.  Uses ``get_messages()`` for the message portion so the
-        format is OpenAI-compatible.
-
-        Example::
-
-            state = memory.get_state()
-            db.execute("INSERT ...", {"state": json.dumps(state)})
-        """
-        return {
-            "messages": self.get_messages(),
-            "scratchpad": dict(self._scratchpad),
-        }
-
-    @classmethod
-    def from_state(
-        cls,
-        state: dict[str, Any] | list[dict[str, Any]],
-        max_messages: int = 40,
-    ) -> "AgentMemory":
-        """Reconstruct from *state* (produced by :meth:`get_state`).
-
-        Handles both the current dict format
-        ``{"messages": [...], "scratchpad": {...}}`` and the legacy list
-        format (plain message array) for backward compatibility.
-        """
-        mem = cls(max_messages=max_messages)
-
-        if isinstance(state, dict):
-            messages = state.get("messages", [])
-            scratchpad = state.get("scratchpad", {})
-            if isinstance(scratchpad, dict):
-                mem._scratchpad.update(scratchpad)
-        elif isinstance(state, list):
-            messages = state  # legacy format
-        else:
-            messages = []
-
-        for m in messages:
-            if not isinstance(m, dict):
-                logger.warning(
-                    "Skipping non-dict entry in session state: %s",
-                    type(m).__name__,
-                )
-                continue
-            role = m.get("role", "")
-            content = m.get("content") or ""
-            if role == "system":
-                continue
-            if role == "user":
-                mem.add_user(content)
-            elif role == "assistant":
-                mem.add_assistant(content, tool_calls=m.get("tool_calls"))
-            elif role == "tool":
-                mem.add_tool_result(
-                    m.get("name", ""),
-                    content,
-                    tool_call_id=m.get("tool_call_id"),
-                )
-
-        return mem
-=======
         """Return the durable context as a flat ``str → str`` dict.
 
-        Provided for backwards compatibility with the previous planner
-        code which expected a string-only dict.  Non-string values are
-        coerced via ``str()``.
+        Reads from the ``context`` namespace of the scratchpad which is
+        populated by :meth:`update_context_from_tool` and persisted
+        across process restarts via the session store.  Non-string
+        values are coerced via ``str()`` for backwards compatibility
+        with the previous planner code which expected a string-only
+        dict.
         """
         return {k: str(v) for k, v in self.context().items() if v not in (None, "")}
->>>>>>> origin/main
 
     def __len__(self) -> int:
         return len(self._history)

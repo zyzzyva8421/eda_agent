@@ -33,41 +33,6 @@ class ChatResponse(BaseModel):
     session_id: str | None = None
 
 
-<<<<<<< HEAD
-# ── DB-backed session helpers ─────────────────────────────────────────────────
-
-
-def _load_session(session_id: str, db: Session) -> AgentMemory:
-    """Load and deserialise a session from the DB, or return a fresh one."""
-    row = db.execute(
-        text("SELECT messages FROM agent_sessions WHERE session_id = :sid"),
-        {"sid": session_id},
-    ).mappings().first()
-    if row and row["messages"]:
-        return AgentMemory.from_state(row["messages"])
-    return AgentMemory()
-
-
-def _save_session(session_id: str, username: str, memory: AgentMemory, db: Session) -> None:
-    """Upsert the serialised session (messages + scratchpad) into the DB."""
-    state = memory.get_state()
-    db.execute(
-        text(
-            """
-            INSERT INTO agent_sessions (session_id, username, messages, updated_at)
-            VALUES (:sid, :uname, :msgs, now())
-            ON CONFLICT (session_id) DO UPDATE
-              SET messages = EXCLUDED.messages,
-                  updated_at = now()
-            """
-        ),
-        {"sid": session_id, "uname": username, "msgs": json.dumps(state)},
-    )
-    db.commit()
-
-
-=======
->>>>>>> origin/main
 # ── Route handlers ────────────────────────────────────────────────────────────
 
 
