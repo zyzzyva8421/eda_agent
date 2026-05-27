@@ -597,6 +597,12 @@ def _build_parser():
         help="Keep following the log file (like tail -f).",
     )
 
+    # -- doctor ----------------------------------------------------------------
+    sub.add_parser(
+        "doctor",
+        help="Run environment checks (API key, PostgreSQL, ORFS, …) and report issues.",
+    )
+
     # -- cancel ----------------------------------------------------------------
     cp = sub.add_parser("cancel", help="Cancel pending job(s).")
     cp.add_argument(
@@ -864,6 +870,16 @@ def _cmd_cancel(args) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _cmd_doctor(_args) -> None:
+    """Run diagnostic checks and exit with a non-zero status on failure."""
+    from eda_agent import diagnostics
+
+    results = diagnostics.run_checks()
+    print(diagnostics.render_report(results, stream=sys.stdout))
+    if diagnostics.worst_status(results) == diagnostics.FAIL:
+        sys.exit(1)
+
+
 def main() -> None:
     """Primary entry point -- dispatches to subcommand or interactive REPL."""
     parser = _build_parser()
@@ -888,6 +904,7 @@ def main() -> None:
         "status": _cmd_status,
         "logs": _cmd_logs,
         "cancel": _cmd_cancel,
+        "doctor": _cmd_doctor,
     }
 
     handler = dispatch.get(args.command)
