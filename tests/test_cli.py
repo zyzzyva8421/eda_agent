@@ -187,3 +187,86 @@ def test_path_completions_returns_entries(tmp_path):
 def test_path_completions_no_match():
     results = _path_completions("/nonexistent_xyz_abc_123/")
     assert results == []
+
+
+# ---------------------------------------------------------------------------
+# `submit` subcommand pre-flight validation
+# ---------------------------------------------------------------------------
+
+
+def _submit_args(**overrides):
+    """Build a minimal argparse.Namespace for _cmd_submit."""
+    from types import SimpleNamespace
+
+    base = {
+        "backend": "orfs",
+        "stage": "synth",
+        "design_name": "gcd",
+        "design_config": "/nonexistent/path/config.mk",
+        "pdk": "sky130hd",
+        "param": [],
+        "clean": False,
+        "no_worker": True,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_cmd_submit_rejects_missing_config(tmp_path, capsys):
+    from eda_agent.cli import _cmd_submit
+
+    args = _submit_args(design_config=str(tmp_path / "missing.mk"))
+    try:
+        _cmd_submit(args)
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit(2) for missing config")
+    err = capsys.readouterr().err
+    assert "config file not found" in err.lower()
+
+
+def test_cmd_submit_rejects_unknown_orfs_stage(tmp_path, capsys):
+    from eda_agent.cli import _cmd_submit
+
+    cfg = tmp_path / "config.mk"
+    cfg.write_text("DESIGN_NAME=gcd\n")
+    args = _submit_args(design_config=str(cfg), stage="not_a_stage")
+    try:
+        _cmd_submit(args)
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit(2) for unknown stage")
+    err = capsys.readouterr().err
+    assert "unknown orfs stage" in err.lower()
+    assert "synth" in err  # the valid-list is included
+
+
+def test_cmd_submit_warns_on_relative_config(tmp_path, capsys, monkeypatch):
+    from eda_agent.cli import _cmd_submit
+
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "config.mk"
+    cfg.write_text("DESIGN_NAME=gcd\n")
+
+    fake_job = type(
+        "J",
+        (),
+        {
+            "job_id": "abc",
+            "backend": "orfs",
+            "stage": "synth",
+            "design_name": "gcd",
+            "pdk": "sky130hd",
+            "design_config": "config.mk",
+            "status": type("S", (), {"value": "pending"})(),
+        },
+    )()
+
+    with patch("eda_agent.queue.store.JobStore") as MockStore:
+        MockStore.return_value.create_job.return_value = fake_job
+        args = _submit_args(design_config="config.mk")  # relative
+        _cmd_submit(args)
+    err = capsys.readouterr().err
+    assert "not absolute" in err.lower()

@@ -689,7 +689,38 @@ def _ensure_worker(no_worker: bool = False) -> None:
 
 
 def _cmd_submit(args) -> None:
+    import os.path
+
     from eda_agent.queue.store import JobStore
+
+    # -- Pre-flight validation ------------------------------------------------
+    # Catch obvious mistakes (missing config, unknown stage) here instead of
+    # letting them surface as a stack trace from the worker minutes later.
+    if not os.path.isfile(args.design_config):
+        print(
+            f"Error: config file not found: {args.design_config}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not os.path.isabs(args.design_config):
+        print(
+            f"Warning: --config '{args.design_config}' is not absolute; "
+            "the worker may run from a different cwd than the CLI.",
+            file=sys.stderr,
+        )
+
+    if args.backend == "orfs":
+        try:
+            from eda_agent.backends.orfs import ORFS_STAGES
+        except Exception:  # noqa: BLE001 -- backend optional
+            ORFS_STAGES = None
+        if ORFS_STAGES and args.stage not in ORFS_STAGES:
+            valid = ", ".join(ORFS_STAGES)
+            print(
+                f"Error: unknown ORFS stage '{args.stage}'. Valid stages: {valid}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     params = _parse_params(args.param)
     if args.clean:
