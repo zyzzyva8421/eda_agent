@@ -501,6 +501,18 @@ def cli_repl(
 # ---------------------------------------------------------------------------
 
 
+def _get_version() -> str:
+    """Return the installed package version, falling back to 'unknown'."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("eda_agent")
+    except PackageNotFoundError:
+        return "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def _build_parser():
     """Build the top-level argument parser for job subcommands."""
     parser = argparse.ArgumentParser(
@@ -510,6 +522,12 @@ def _build_parser():
             "Use a subcommand to manage async EDA jobs."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {_get_version()}",
     )
     # REPL-mode flags (only used when no subcommand is given).
     parser.add_argument(

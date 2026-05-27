@@ -95,12 +95,14 @@ eda-agent
 
 ```bash
 eda-agent doctor                    # Environment / connectivity checklist
+eda-agent --version                 # Print package version
 eda-agent submit --stage synth \
     --design gcd \
     --config $ORFS_ROOT/flow/designs/sky130hd/gcd/config.mk
 eda-agent list [--status pending|running|success|failed|cancelled]
 eda-agent status <job_id>
 eda-agent logs   <job_id> [--follow]
+eda-agent wait   <job_id> [--timeout SECONDS]   # block until terminal; exit-coded
 eda-agent cancel <job_id> | --all
 ```
 

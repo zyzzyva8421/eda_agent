@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 from unittest.mock import patch
 
 from eda_agent.cli import _complete_cmd_name, _path_completions, cli_repl
@@ -355,3 +356,36 @@ def test_cmd_wait_timeout_returns_two():
             assert exc.code == 2
         else:
             raise AssertionError("expected SystemExit(2) on timeout")
+
+
+# ---------------------------------------------------------------------------
+# `--version` flag
+# ---------------------------------------------------------------------------
+
+
+def test_version_flag_prints_version_and_exits(capsys):
+    from eda_agent.cli import main
+
+    with patch.object(sys, "argv", ["eda-agent", "--version"]):
+        try:
+            main()
+        except SystemExit as exc:
+            assert exc.code == 0
+        else:
+            raise AssertionError("expected SystemExit(0) from --version")
+    out = capsys.readouterr().out
+    assert "eda-agent" in out
+    # Version should be either the real installed version or "unknown".
+    assert any(token in out for token in (".", "unknown"))
+
+
+def test_short_version_flag_works(capsys):
+    from eda_agent.cli import main
+
+    with patch.object(sys, "argv", ["eda-agent", "-V"]):
+        try:
+            main()
+        except SystemExit as exc:
+            assert exc.code == 0
+    out = capsys.readouterr().out
+    assert "eda-agent" in out
