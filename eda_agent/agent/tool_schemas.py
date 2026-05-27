@@ -578,7 +578,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": [
-                    "backend", "design_name", "target_spec",
+                    "backend", "design_name", "design_config", "pdk", "target_spec",
                 ],
             },
         },

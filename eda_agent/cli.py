@@ -95,6 +95,8 @@ def _setup_readline():
     """Configure readline with tab completion and load persistent history."""
     if not _HAS_READLINE:
         return
+    if not sys.stdin.isatty():
+        return
 
     def completer(text, state):
         line = _readline.get_line_buffer()
