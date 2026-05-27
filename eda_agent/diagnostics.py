@@ -98,20 +98,20 @@ def check_minimax_key() -> CheckResult:
         )
     if not settings.minimax_api_key:
         return CheckResult(
-            "MiniMax API key",
+            "MiniMax credentials",
             FAIL,
             "MINIMAX_API_KEY is empty",
             hint="set MINIMAX_API_KEY=<your-key> in .env (see .env.example)",
         )
     if not settings.minimax_group_id:
         return CheckResult(
-            "MiniMax API key",
+            "MiniMax credentials",
             WARN,
             "MINIMAX_API_KEY set but MINIMAX_GROUP_ID is empty",
             hint="some MiniMax endpoints require the group id; set MINIMAX_GROUP_ID in .env",
         )
     return CheckResult(
-        "MiniMax API key",
+        "MiniMax credentials",
         OK,
         f"key set (model={settings.minimax_model})",
     )
