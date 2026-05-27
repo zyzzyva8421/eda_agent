@@ -1,38 +1,83 @@
 """Session memory for the EDA agent.
 
-Keeps a bounded history of (role, content) message pairs and a scratchpad
-for the current ReAct iteration so the planner can build coherent prompts
-across multiple tool calls.
+Two layers of memory live in this module:
 
-Persistent case memory is stored in PostgreSQL (``case_memory`` table) and
-surfaced through :func:`save_case` and :func:`search_similar_cases`.
+* :class:`AgentMemory` — short-term, per-session message history plus a
+  structured scratchpad of durable session facts (design_name, pdk, …).
+  The scratchpad has two namespaces: ``context`` (persisted across
+  process restarts via :mod:`eda_agent.agent.session_store`) and
+  ``_internal`` (volatile cache; recomputed each new process).
+
+* :func:`save_case` / :func:`search_similar_cases` — persistent case
+  memory stored in PostgreSQL ``case_memory``, surfaced to the planner
+  so previous debugging sessions inform new ones.
+
+The class is intentionally framework-agnostic: persistence wiring lives
+in :mod:`eda_agent.agent.session_store`.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
+
+
+# Per-tool-result character cap.  Long EDA log dumps would otherwise
+# dominate the context window and may even bust LLM input limits.
+DEFAULT_TOOL_RESULT_MAX_CHARS = 8 * 1024
+
+# Rough characters-per-token estimate for the budget-aware view.  Good
+# enough for trimming heuristics without pulling in tiktoken at runtime.
+_CHARS_PER_TOKEN = 4
+_OVERHEAD_TOKENS_PER_MESSAGE = 4  # role + bookkeeping tokens charged per msg
+
+# Well-known scratchpad keys for L2 session facts.  Whenever a tool call
+# exposes one of these (as an argument or in its return payload) we
+# update the ``context`` namespace.
+CONTEXT_KEYS: tuple[str, ...] = (
+    "design_name",
+    "pdk",
+    "config_path",
+    "design_config",
+    "backend",
+    "last_run_id",
+    "run_id",
+    "stage",
+)
 
 
 @dataclass
 class Message:
     role: Literal["system", "user", "assistant", "tool"]
     content: str
-    tool_name: str | None = None   # set when role == "tool"
+    tool_name: str | None = None        # set when role == "tool"
     tool_call_id: str | None = None
-    tool_calls: list[dict[str, Any]] | None = None  # set when role == "assistant" and using tools
+    tool_calls: list[dict[str, Any]] | None = None  # set on assistant tool turns
 
 
 class AgentMemory:
-    """Bounded message history + key-value scratchpad for a single session."""
+    """Bounded message history + key-value scratchpad for a single session.
 
-    def __init__(self, max_messages: int = 40) -> None:
-        self._history: deque[Message] = deque(maxlen=max_messages)
-        self._scratchpad: dict[str, Any] = {}
+    Not thread-safe; each REPL or HTTP request creates its own instance.
+    """
+
+    def __init__(
+        self,
+        max_messages: int = 40,
+        tool_result_max_chars: int = DEFAULT_TOOL_RESULT_MAX_CHARS,
+    ) -> None:
+        self._max_messages = max_messages
+        self._tool_result_max_chars = tool_result_max_chars
+        # We use a plain list and manage eviction manually so we can drop
+        # (assistant tool_calls -> tool result) pairs atomically rather
+        # than risk leaving an orphan tool message at the front.
+        self._history: list[Message] = []
+        self._scratchpad: dict[str, Any] = {"context": {}, "_internal": {}}
 
     # ------------------------------------------------------------------
     # Message history
@@ -40,6 +85,7 @@ class AgentMemory:
 
     def add(self, msg: Message) -> None:
         self._history.append(msg)
+        self._evict_if_needed()
 
     def add_user(self, content: str) -> None:
         self.add(Message(role="user", content=content))
@@ -54,6 +100,20 @@ class AgentMemory:
     def add_tool_result(
         self, tool_name: str, content: str, tool_call_id: str | None = None
     ) -> None:
+        # Truncate oversized payloads so a single noisy tool can't poison
+        # the whole context window.
+        if (
+            self._tool_result_max_chars > 0
+            and isinstance(content, str)
+            and len(content) > self._tool_result_max_chars
+        ):
+            keep = self._tool_result_max_chars
+            dropped = len(content) - keep
+            content = (
+                content[:keep]
+                + f"\n…<truncated {dropped} chars; "
+                f"use job_logs / query_timing for the full payload>"
+            )
         self.add(
             Message(
                 role="tool",
@@ -63,25 +123,128 @@ class AgentMemory:
             )
         )
 
-    def get_messages(self, system_prompt: str = "") -> list[dict[str, Any]]:
-        """Return message list in OpenAI-compatible chat format."""
+    def _evict_if_needed(self) -> None:
+        """Trim oldest messages while keeping tool_calls/result pairs together."""
+        max_n = self._max_messages
+        if max_n <= 0 or len(self._history) <= max_n:
+            return
+        # We drop one *group* at a time, where a group starts at the first
+        # non-tool message and includes any tool messages that immediately
+        # follow (each tool message belongs to the preceding assistant
+        # tool_calls turn).  This guarantees we never leave an orphan
+        # tool message at the front, which would otherwise make the next
+        # LLM request 400.
+        while len(self._history) > max_n:
+            # Drop the very first message…
+            self._history.pop(0)
+            # …and any tool messages immediately after it that belonged
+            # to the assistant turn we just removed.
+            while self._history and self._history[0].role == "tool":
+                self._history.pop(0)
+
+    def get_messages(
+        self,
+        system_prompt: str = "",
+        max_tokens: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return message list in OpenAI-compatible chat format.
+
+        When *max_tokens* is given, the oldest message groups are dropped
+        (preserving system prompt + tool_call/result pairing) until the
+        estimated token budget fits.  The estimate is intentionally
+        coarse (characters / 4) so this stays fast and dependency-free.
+        """
         msgs: list[dict[str, Any]] = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
         for m in self._history:
-            entry: dict[str, Any] = {"role": m.role, "content": m.content}
-            if m.role == "tool":
-                if m.tool_name:
-                    entry["name"] = m.tool_name
-                if m.tool_call_id:
-                    entry["tool_call_id"] = m.tool_call_id
-            elif m.role == "assistant" and m.tool_calls:
-                entry["tool_calls"] = m.tool_calls
-            msgs.append(entry)
+            msgs.append(self._serialise(m))
+
+        if max_tokens is not None and max_tokens > 0:
+            msgs = _trim_to_token_budget(msgs, max_tokens)
         return msgs
 
+    @staticmethod
+    def _serialise(m: Message) -> dict[str, Any]:
+        entry: dict[str, Any] = {"role": m.role, "content": m.content}
+        if m.role == "tool":
+            if m.tool_name:
+                entry["name"] = m.tool_name
+            if m.tool_call_id:
+                entry["tool_call_id"] = m.tool_call_id
+        elif m.role == "assistant" and m.tool_calls:
+            entry["tool_calls"] = m.tool_calls
+        return entry
+
     def clear(self) -> None:
+        """Drop message history, but keep the scratchpad."""
         self._history.clear()
+
+    def forget(self) -> None:
+        """Drop everything — history *and* scratchpad."""
+        self._history.clear()
+        self._scratchpad = {"context": {}, "_internal": {}}
+
+    # ------------------------------------------------------------------
+    # Byte-budget enforcement (for persistence layer)
+    # ------------------------------------------------------------------
+
+    def shrink_to_byte_budget(self, max_bytes: int) -> None:
+        """Drop oldest message groups until the JSON payload fits."""
+        if max_bytes <= 0:
+            return
+        while self._history:
+            payload = json.dumps([self._serialise(m) for m in self._history])
+            if len(payload.encode("utf-8")) <= max_bytes:
+                return
+            # Drop one group from the front.
+            self._history.pop(0)
+            while self._history and self._history[0].role == "tool":
+                self._history.pop(0)
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def to_dict(self, *, persist_internal: bool = False) -> dict[str, Any]:
+        """Return a JSON-serialisable representation of this memory.
+
+        ``_internal`` keys (cache, retrieval results, transient flags)
+        are stripped by default — they are recomputed in each new
+        process.  Callers can pass ``persist_internal=True`` for tests
+        or debugging dumps.
+        """
+        scratch: dict[str, Any] = {"context": dict(self._scratchpad.get("context", {}))}
+        if persist_internal:
+            scratch["_internal"] = dict(self._scratchpad.get("_internal", {}))
+        return {
+            "messages": [self._serialise(m) for m in self._history],
+            "scratchpad": scratch,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: dict[str, Any],
+        max_messages: int = 40,
+    ) -> "AgentMemory":
+        """Inverse of :meth:`to_dict`.
+
+        The serialised messages list is sanitised so that orphan tool
+        messages (i.e. ``role == "tool"`` without a preceding
+        ``assistant`` turn carrying a matching ``tool_call_id``) are
+        dropped.  Otherwise the next LLM call would 400.
+        """
+        mem = cls(max_messages=max_messages)
+        messages = payload.get("messages") or []
+        mem._load_messages(messages)
+        scratch = payload.get("scratchpad") or {}
+        if isinstance(scratch, dict):
+            mem._scratchpad["context"] = dict(scratch.get("context") or {})
+            internal = scratch.get("_internal")
+            if isinstance(internal, dict):
+                mem._scratchpad["_internal"] = dict(internal)
+        return mem
 
     @classmethod
     def from_messages(
@@ -89,132 +252,166 @@ class AgentMemory:
         messages: list[dict],
         max_messages: int = 40,
     ) -> "AgentMemory":
-        """Reconstruct an :class:`AgentMemory` from a serialised message list.
+        """Backwards-compatible constructor used by old session rows."""
+        return cls.from_dict({"messages": messages, "scratchpad": {}}, max_messages)
 
-        The format is the OpenAI-compatible list returned by
-        :meth:`get_messages` (without the system message).
+    def _load_messages(self, messages: list[dict]) -> None:
+        """Internal helper used by :meth:`from_dict`.
+
+        Performs pair-awareness sanitisation: a ``tool`` message is kept
+        only if the most recent assistant turn declared its
+        ``tool_call_id`` in ``tool_calls``.
         """
-        mem = cls(max_messages=max_messages)
+        pending_ids: set[str] = set()
         for m in messages:
             role = m.get("role", "")
             content = m.get("content") or ""
             if role == "system":
                 continue
-            elif role == "user":
-                mem.add_user(content)
+            if role == "user":
+                pending_ids.clear()
+                self._history.append(Message(role="user", content=content))
             elif role == "assistant":
-                mem.add_assistant(content, tool_calls=m.get("tool_calls"))
-            elif role == "tool":
-                mem.add_tool_result(
-                    m.get("name", ""),
-                    content,
-                    tool_call_id=m.get("tool_call_id"),
+                tc = m.get("tool_calls") or None
+                pending_ids = {
+                    str(t.get("id")) for t in (tc or []) if t and t.get("id")
+                }
+                self._history.append(
+                    Message(role="assistant", content=content, tool_calls=tc)
                 )
-        return mem
+            elif role == "tool":
+                tool_call_id = m.get("tool_call_id")
+                if tool_call_id and str(tool_call_id) in pending_ids:
+                    self._history.append(
+                        Message(
+                            role="tool",
+                            content=content,
+                            tool_name=m.get("name") or "",
+                            tool_call_id=tool_call_id,
+                        )
+                    )
+                    pending_ids.discard(str(tool_call_id))
+                else:
+                    logger.debug(
+                        "Dropping orphan tool message (call_id=%s, name=%s)",
+                        tool_call_id,
+                        m.get("name"),
+                    )
+        self._evict_if_needed()
 
     # ------------------------------------------------------------------
     # Scratchpad (per-session key-value store)
     # ------------------------------------------------------------------
 
     def set(self, key: str, value: Any) -> None:
-        self._scratchpad[key] = value
+        """Store *value* under *key*.
+
+        Keys starting with ``_`` are treated as volatile (``_internal``
+        namespace) and will NOT be persisted across process restarts.
+        All other keys live in the ``context`` namespace, which IS
+        persisted.
+        """
+        bucket = "_internal" if key.startswith("_") else "context"
+        self._scratchpad.setdefault(bucket, {})[key] = value
 
     def get(self, key: str, default: Any = None) -> Any:
-        return self._scratchpad.get(key, default)
+        bucket = "_internal" if key.startswith("_") else "context"
+        return self._scratchpad.get(bucket, {}).get(key, default)
 
-    _CONTEXT_KEYS = ("design_name", "pdk", "config_path")
+    def context(self) -> dict[str, Any]:
+        """Return a copy of the durable context namespace."""
+        return dict(self._scratchpad.get("context", {}))
+
+    def update_context_from_tool(
+        self,
+        arguments: dict[str, Any] | None,
+        tool_result: str | dict | None,
+    ) -> None:
+        """Incrementally update context facts from a tool call.
+
+        Looks at both *arguments* (what the LLM asked for) and
+        *tool_result* (what the backend reported) for any key in
+        :data:`CONTEXT_KEYS`.  Newer values overwrite older ones so the
+        scratchpad always reflects the most recent run.
+        """
+        parsed_result: Any = tool_result
+        if isinstance(tool_result, str):
+            try:
+                parsed_result = json.loads(tool_result)
+            except Exception:
+                parsed_result = None
+
+        for source in (arguments, parsed_result):
+            if not isinstance(source, dict):
+                continue
+            for key in CONTEXT_KEYS:
+                val = source.get(key)
+                if val in (None, ""):
+                    continue
+                # design_config from arguments maps onto config_path for
+                # consistency with what the planner exposes.
+                if key == "design_config":
+                    self.set("config_path", val)
+                else:
+                    self.set(key, val)
 
     def extract_design_context(self) -> dict[str, str]:
-        """Extract design context from the session scratchpad.
+        """Return the durable context as a flat ``str → str`` dict.
 
-        The scratchpad is populated by the planner's
-        ``_extract_and_store_context()`` whenever a stage/flow tool is
-        executed.  This method reads only the scratchpad – no fragile JSON
-        parsing of serialised tool-result strings.
-
-        Returns a dict of non-empty context entries (may be empty).
+        Reads from the ``context`` namespace of the scratchpad which is
+        populated by :meth:`update_context_from_tool` and persisted
+        across process restarts via the session store.  Non-string
+        values are coerced via ``str()`` for backwards compatibility
+        with the previous planner code which expected a string-only
+        dict.
         """
-        return {
-            k: v
-            for k in self._CONTEXT_KEYS
-            if (v := self._scratchpad.get(k))
-        }
-
-    # ------------------------------------------------------------------
-    # Full-state serialisation (for DB persistence across HTTP requests)
-    # ------------------------------------------------------------------
-
-    def get_state(self) -> dict[str, Any]:
-        """Return the full serialisable state (messages + scratchpad).
-
-        The returned dict can be round-tripped through :meth:`from_state`
-        to preserve both message history and design context across API
-        requests.  Uses ``get_messages()`` for the message portion so the
-        format is OpenAI-compatible.
-
-        Example::
-
-            state = memory.get_state()
-            db.execute("INSERT ...", {"state": json.dumps(state)})
-        """
-        return {
-            "messages": self.get_messages(),
-            "scratchpad": dict(self._scratchpad),
-        }
-
-    @classmethod
-    def from_state(
-        cls,
-        state: dict[str, Any] | list[dict[str, Any]],
-        max_messages: int = 40,
-    ) -> "AgentMemory":
-        """Reconstruct from *state* (produced by :meth:`get_state`).
-
-        Handles both the current dict format
-        ``{"messages": [...], "scratchpad": {...}}`` and the legacy list
-        format (plain message array) for backward compatibility.
-        """
-        mem = cls(max_messages=max_messages)
-
-        if isinstance(state, dict):
-            messages = state.get("messages", [])
-            scratchpad = state.get("scratchpad", {})
-            if isinstance(scratchpad, dict):
-                mem._scratchpad.update(scratchpad)
-        elif isinstance(state, list):
-            messages = state  # legacy format
-        else:
-            messages = []
-
-        for m in messages:
-            if not isinstance(m, dict):
-                logger.warning(
-                    "Skipping non-dict entry in session state: %s",
-                    type(m).__name__,
-                )
-                continue
-            role = m.get("role", "")
-            content = m.get("content") or ""
-            if role == "system":
-                continue
-            if role == "user":
-                mem.add_user(content)
-            elif role == "assistant":
-                mem.add_assistant(content, tool_calls=m.get("tool_calls"))
-            elif role == "tool":
-                mem.add_tool_result(
-                    m.get("name", ""),
-                    content,
-                    tool_call_id=m.get("tool_call_id"),
-                )
-
-        return mem
+        return {k: str(v) for k, v in self.context().items() if v not in (None, "")}
 
     def __len__(self) -> int:
         return len(self._history)
 
 
+# ---------------------------------------------------------------------------
+# Token budget helper
+# ---------------------------------------------------------------------------
+
+
+def _trim_to_token_budget(
+    messages: list[dict[str, Any]], max_tokens: int
+) -> list[dict[str, Any]]:
+    """Drop oldest message groups until estimated tokens ≤ *max_tokens*.
+
+    System prompt (index 0, role=system) is always preserved.  Tool
+    messages are dropped together with their preceding assistant turn to
+    keep ``tool_call_id`` pairing intact.
+    """
+
+    def estimate(msgs: list[dict[str, Any]]) -> int:
+        total = 0
+        for m in msgs:
+            content = m.get("content") or ""
+            total += len(content) // _CHARS_PER_TOKEN + _OVERHEAD_TOKENS_PER_MESSAGE
+            for tc in m.get("tool_calls") or []:
+                total += len(json.dumps(tc)) // _CHARS_PER_TOKEN
+        return total
+
+    if estimate(messages) <= max_tokens:
+        return messages
+
+    has_system = bool(messages) and messages[0].get("role") == "system"
+    head = [messages[0]] if has_system else []
+    rest = messages[1:] if has_system else list(messages)
+
+    while rest and estimate(head + rest) > max_tokens:
+        # Drop the first message and any tool messages glued to it.
+        rest.pop(0)
+        while rest and rest[0].get("role") == "tool":
+            rest.pop(0)
+    return head + rest
+
+
 # ── Persistent case memory (PostgreSQL) ──────────────────────────────────────
+
 
 def save_case(
     design_name: str,
@@ -224,11 +421,7 @@ def save_case(
     actions: list[str] | None = None,
     result_metrics: dict[str, Any] | None = None,
 ) -> int:
-    """Persist a resolved debugging case and return its DB id.
-
-    Uses the shared SQLAlchemy session from :mod:`eda_agent.db.session` so no
-    extra connection parameters are needed.
-    """
+    """Persist a resolved debugging case and return its DB id."""
     from sqlalchemy import text as _text
 
     from eda_agent.db.session import get_db
@@ -253,8 +446,8 @@ def save_case(
                 "pdk": pdk,
                 "symptoms": symptoms,
                 "root_cause": root_cause,
-                "actions": __import__("json").dumps(actions_val),
-                "metrics": __import__("json").dumps(metrics_val),
+                "actions": json.dumps(actions_val),
+                "metrics": json.dumps(metrics_val),
             },
         ).first()
         case_id: int = row[0]
@@ -269,21 +462,10 @@ def search_similar_cases(
 ) -> list[dict[str, Any]]:
     """Return the top-*limit* cases whose symptoms/root_cause match *query*.
 
-    Uses PostgreSQL full-text search (``plainto_tsquery``).  Falls back to an
-    ILIKE scan when no FTS matches are found so the caller always gets *some*
-    results on small datasets.
-
-    Parameters
-    ----------
-    query:
-        Free-text description of the current issue.
-    design_name:
-        Optional filter – restrict results to this design.
-    limit:
-        Maximum number of cases to return.
+    Uses PostgreSQL full-text search (``plainto_tsquery``).  Falls back
+    to an ILIKE scan when no FTS matches are found so the caller always
+    gets *some* results on small datasets.
     """
-    import json as _json
-
     from sqlalchemy import text as _text
 
     from eda_agent.db.session import get_db
@@ -328,8 +510,12 @@ def search_similar_cases(
             "pdk": row[2],
             "symptoms": row[3],
             "root_cause": row[4],
-            "actions": row[5] if isinstance(row[5], list) else _json.loads(row[5] or "[]"),
-            "result_metrics": row[6] if isinstance(row[6], dict) else _json.loads(row[6] or "{}"),
+            "actions": row[5]
+            if isinstance(row[5], list)
+            else json.loads(row[5] or "[]"),
+            "result_metrics": row[6]
+            if isinstance(row[6], dict)
+            else json.loads(row[6] or "{}"),
             "created_at": str(row[7]),
         }
 
@@ -339,12 +525,17 @@ def search_similar_cases(
             if not rows:
                 # Build ILIKE pattern from the first meaningful word
                 keyword = query.split()[0] if query.split() else query
-                fb_params: dict[str, Any] = {"pattern": f"%{keyword}%", "limit": limit}
+                fb_params: dict[str, Any] = {
+                    "pattern": f"%{keyword}%",
+                    "limit": limit,
+                }
                 if design_name:
                     fb_params["design_name"] = design_name
                 rows = db.execute(fallback_sql, fb_params).fetchall()
             return [_row_to_dict(r) for r in rows]
     except Exception:
-        logger.warning("case memory search failed – DB may not be available", exc_info=True)
+        logger.warning(
+            "case memory search failed – DB may not be available",
+            exc_info=True,
+        )
         return []
-
