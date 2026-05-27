@@ -7,6 +7,22 @@ import subprocess
 from pathlib import Path
 
 
+def _swap_target_kb(size_gb: int) -> int:
+    return size_gb * 1024 * 1024
+
+
+def _swap_page_tolerance_kb() -> int:
+    try:
+        return max(4, int(os.sysconf("SC_PAGE_SIZE") // 1024))
+    except (AttributeError, OSError, ValueError):
+        return 4
+
+
+def _has_required_swap_kb(total_kb: int, target_gb: int) -> bool:
+    target_kb = _swap_target_kb(target_gb)
+    return total_kb + _swap_page_tolerance_kb() >= target_kb
+
+
 def _read_meminfo_kb() -> dict[str, int]:
     data: dict[str, int] = {}
     with open("/proc/meminfo", "r", encoding="utf-8") as f:
@@ -65,9 +81,12 @@ def ensure_vm_test_resources(
 
     mem = _read_meminfo_kb()
     mem_avail_gb = mem.get("MemAvailable", 0) / (1024 * 1024)
-    swap_total_gb = mem.get("SwapTotal", 0) / (1024 * 1024)
+    swap_total_kb = mem.get("SwapTotal", 0)
 
-    need_more_swap = mem_avail_gb < float(min_mem_available_gb) and swap_total_gb < float(min_swap_total_gb)
+    need_more_swap = mem_avail_gb < float(min_mem_available_gb) and not _has_required_swap_kb(
+        swap_total_kb,
+        min_swap_total_gb,
+    )
     if not need_more_swap:
         return
 
@@ -79,9 +98,9 @@ def ensure_vm_test_resources(
         )
 
     mem_after = _read_meminfo_kb()
-    swap_after_gb = mem_after.get("SwapTotal", 0) / (1024 * 1024)
-    if swap_after_gb < float(min_swap_total_gb):
+    swap_after_kb = mem_after.get("SwapTotal", 0)
+    if not _has_required_swap_kb(swap_after_kb, min_swap_total_gb):
         raise RuntimeError(
-            f"Swap setup did not reach target: have {swap_after_gb:.1f} GB, "
+            f"Swap setup did not reach target: have {swap_after_kb / (1024 * 1024):.1f} GB, "
             f"need >= {min_swap_total_gb} GB."
         )
