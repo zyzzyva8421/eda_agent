@@ -403,6 +403,17 @@ def cli_repl(
             print("Message history cleared. (Design context preserved -- use 'forget' to wipe everything.)")
             continue
         if cmd == "forget":
+            try:
+                confirm = input(
+                    f"This will permanently delete session '{session_id}' "
+                    f"and all its history.  Type 'yes' to confirm: "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nforget: cancelled.")
+                continue
+            if confirm != "yes":
+                print("forget: cancelled.")
+                continue
             memory.forget()
             clear_session(session_id, db)
             print(f"Session '{session_id}' wiped.")
@@ -473,8 +484,13 @@ def cli_repl(
                 )
             console.agent(reply)
             _persist()
-        except (RuntimeError, ValueError, OSError, TimeoutError) as exc:
-            console.error(f"{exc}")
+        except KeyboardInterrupt:
+            # Re-arm prompt without killing the REPL.
+            print("\n(Interrupted -- type 'exit' to quit)")
+            _persist()
+        except Exception as exc:  # noqa: BLE001 -- REPL must stay alive across any planner error
+            console.error(f"{type(exc).__name__}: {exc}")
+            logging.getLogger(__name__).debug("planner.run raised", exc_info=True)
             # Persist whatever we have so far so transient failures don't
             # cost the user their conversation context.
             _persist()
@@ -483,6 +499,18 @@ def cli_repl(
 # ---------------------------------------------------------------------------
 # Job sub-commands (eda-agent submit / list / status / logs / cancel)
 # ---------------------------------------------------------------------------
+
+
+def _get_version() -> str:
+    """Return the installed package version, falling back to 'unknown'."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("eda_agent")
+    except PackageNotFoundError:
+        return "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
 
 def _build_parser():
@@ -494,6 +522,12 @@ def _build_parser():
             "Use a subcommand to manage async EDA jobs."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {_get_version()}",
     )
     # REPL-mode flags (only used when no subcommand is given).
     parser.add_argument(
@@ -597,6 +631,38 @@ def _build_parser():
         help="Keep following the log file (like tail -f).",
     )
 
+    # -- doctor ----------------------------------------------------------------
+    sub.add_parser(
+        "doctor",
+        help="Run environment checks (API key, PostgreSQL, ORFS, …) and report issues.",
+    )
+
+    # -- wait ------------------------------------------------------------------
+    wp = sub.add_parser(
+        "wait",
+        help="Block until a job reaches a terminal state. Exit 0 on success, "
+        "non-zero on failure / cancellation / timeout.",
+    )
+    wp.add_argument("job_id", help="Job UUID returned by 'submit'.")
+    wp.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Maximum seconds to wait (default: no timeout).",
+    )
+    wp.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Poll interval in seconds (default: 2).",
+    )
+    wp.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress progress output; only set exit code.",
+    )
+
     # -- cancel ----------------------------------------------------------------
     cp = sub.add_parser("cancel", help="Cancel pending job(s).")
     cp.add_argument(
@@ -667,7 +733,38 @@ def _ensure_worker(no_worker: bool = False) -> None:
 
 
 def _cmd_submit(args) -> None:
+    import os.path
+
     from eda_agent.queue.store import JobStore
+
+    # -- Pre-flight validation ------------------------------------------------
+    # Catch obvious mistakes (missing config, unknown stage) here instead of
+    # letting them surface as a stack trace from the worker minutes later.
+    if not os.path.isfile(args.design_config):
+        print(
+            f"Error: config file not found: {args.design_config}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not os.path.isabs(args.design_config):
+        print(
+            f"Warning: --config '{args.design_config}' is not absolute; "
+            "the worker may run from a different cwd than the CLI.",
+            file=sys.stderr,
+        )
+
+    if args.backend == "orfs":
+        try:
+            from eda_agent.backends.orfs import ORFS_STAGES
+        except Exception:  # noqa: BLE001 -- backend optional
+            ORFS_STAGES = None
+        if ORFS_STAGES and args.stage not in ORFS_STAGES:
+            valid = ", ".join(ORFS_STAGES)
+            print(
+                f"Error: unknown ORFS stage '{args.stage}'. Valid stages: {valid}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     params = _parse_params(args.param)
     if args.clean:
@@ -817,6 +914,60 @@ def _cmd_logs(args) -> None:
         pass
 
 
+def _cmd_wait(args) -> None:
+    """Block until a job reaches a terminal state.
+
+    Exit code:
+        0 — job succeeded
+        1 — job not found, failed, or cancelled
+        2 — timeout reached before terminal state
+    """
+    import time
+
+    from eda_agent.queue.store import JobStatus, JobStore
+
+    store = JobStore()
+    job = store.get_job(args.job_id)
+    if job is None:
+        print(f"Error: job '{args.job_id}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    terminal = {JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.CANCELLED}
+    deadline = (time.monotonic() + args.timeout) if args.timeout else None
+    last_status = None
+
+    try:
+        while True:
+            job = store.get_job(args.job_id)
+            if job is None:
+                print(f"Error: job '{args.job_id}' disappeared.", file=sys.stderr)
+                sys.exit(1)
+            if job.status != last_status and not args.quiet:
+                print(f"[{job.job_id}] status: {job.status.value}")
+                last_status = job.status
+            if job.status in terminal:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                if not args.quiet:
+                    print(
+                        f"Timeout after {args.timeout:g}s; job still {job.status.value}.",
+                        file=sys.stderr,
+                    )
+                sys.exit(2)
+            time.sleep(max(0.1, args.interval))
+    except KeyboardInterrupt:
+        if not args.quiet:
+            print("\nInterrupted; job continues running in background.", file=sys.stderr)
+        sys.exit(130)
+
+    if job.status == JobStatus.SUCCESS:
+        sys.exit(0)
+    # failed / cancelled
+    if job.error_message and not args.quiet:
+        print(f"Error: {job.error_message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def _cmd_cancel(args) -> None:
     from eda_agent.queue.store import JobStatus, JobStore
 
@@ -864,6 +1015,16 @@ def _cmd_cancel(args) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _cmd_doctor(_args) -> None:
+    """Run diagnostic checks and exit with a non-zero status on failure."""
+    from eda_agent import diagnostics
+
+    results = diagnostics.run_checks()
+    print(diagnostics.render_report(results, stream=sys.stdout))
+    if diagnostics.worst_status(results) == diagnostics.FAIL:
+        sys.exit(1)
+
+
 def main() -> None:
     """Primary entry point -- dispatches to subcommand or interactive REPL."""
     parser = _build_parser()
@@ -888,6 +1049,8 @@ def main() -> None:
         "status": _cmd_status,
         "logs": _cmd_logs,
         "cancel": _cmd_cancel,
+        "doctor": _cmd_doctor,
+        "wait": _cmd_wait,
     }
 
     handler = dispatch.get(args.command)
