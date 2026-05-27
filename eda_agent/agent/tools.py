@@ -34,7 +34,6 @@ import json
 import logging
 import os
 import subprocess
-import uuid
 from typing import Any
 
 from sqlalchemy import text
@@ -42,7 +41,6 @@ from sqlalchemy import text
 from eda_agent.agent.param_mapper import OptimizationObjective
 from eda_agent.agent.tool_schemas import TOOL_SCHEMAS
 from eda_agent.db.repository import EDAQueryRepository
-from eda_agent.backends import get_backend
 from eda_agent.backends.base import DesignSpec
 from eda_agent.config import settings
 from eda_agent.db.session import get_db
@@ -136,63 +134,14 @@ def _create_flow_session(
     A session groups one multi-stage flow execution (baseline or variant) so we
     can detect completion based on the *last stage in that session*.
     """
-    import sys
-    import json as _json
-    import importlib.metadata as _meta
+    from eda_agent.agent.tool_impl_flow_session import create_flow_session_impl
 
-    def _pkg_version(pkg: str) -> str:
-        try:
-            return _meta.version(pkg)
-        except Exception:
-            return "unknown"
-
-    env_snapshot = {
-        "python": sys.version,
-        "sqlalchemy": _pkg_version("sqlalchemy"),
-        "pdk": design.pdk,
-        "design": design.name,
-        "captured_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
-    }
-
-    with get_db() as db:
-        design_row = db.execute(
-            text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
-            {"name": design.name, "pdk": design.pdk},
-        ).first()
-        design_id = design_row[0] if design_row else None
-        if design_id is None:
-            db.execute(
-                text(
-                    "INSERT INTO designs (name, pdk, config_path) "
-                    "VALUES (:name, :pdk, :cfg)"
-                ),
-                {"name": design.name, "pdk": design.pdk, "cfg": str(design.config_path)},
-            )
-            design_id = db.execute(
-                text("SELECT id FROM designs WHERE name = :name AND pdk = :pdk"),
-                {"name": design.name, "pdk": design.pdk},
-            ).scalar()
-
-        session_uuid = str(uuid.uuid4())
-        session_id = db.execute(
-            text(
-                """
-                INSERT INTO flow_sessions
-                    (session_uuid, design_id, objective, status, notes, env_snapshot)
-                VALUES
-                    (:session_uuid, :design_id, :objective, 'active', :notes, :env_snapshot)
-                RETURNING id
-                """
-            ),
-            {
-                "session_uuid": session_uuid,
-                "design_id": design_id,
-                "objective": objective,
-                "notes": notes,
-                "env_snapshot": _json.dumps(env_snapshot),
-            },
-        ).scalar()
-        return int(session_id)
+    return create_flow_session_impl(
+        design,
+        objective=objective,
+        notes=notes,
+        get_db_fn=get_db,
+    )
 
 
 def _update_flow_session_status(
@@ -201,36 +150,14 @@ def _update_flow_session_status(
     baseline_run_id: int | None = None,
 ) -> None:
     """Update flow session lifecycle state (active/completed/failed)."""
-    with get_db() as db:
-        if baseline_run_id is None:
-            db.execute(
-                text(
-                    """
-                    UPDATE flow_sessions
-                    SET status = :status,
-                        updated_at = now()
-                    WHERE id = :sid
-                    """
-                ),
-                {"status": status, "sid": session_id},
-            )
-        else:
-            db.execute(
-                text(
-                    """
-                    UPDATE flow_sessions
-                    SET status = :status,
-                        baseline_run_id = :baseline_run_id,
-                        updated_at = now()
-                    WHERE id = :sid
-                    """
-                ),
-                {
-                    "status": status,
-                    "baseline_run_id": baseline_run_id,
-                    "sid": session_id,
-                },
-            )
+    from eda_agent.agent.tool_impl_flow_session import update_flow_session_status_impl
+
+    update_flow_session_status_impl(
+        session_id,
+        status,
+        baseline_run_id=baseline_run_id,
+        get_db_fn=get_db,
+    )
 
 
 def _record_stage_outcome(
@@ -713,61 +640,15 @@ def _add_placement_blockage(
     stage: str = "place",
 ) -> dict[str, Any]:
     """Apply placement blockages to an Innovus run context and persist metadata."""
-    with get_db() as db:
-        run_row = db.execute(
-            text(
-                """
-                SELECT r.id AS run_id, r.params, r.stage, b.name AS backend, d.name AS design_name
-                FROM runs r
-                JOIN designs d ON d.id = r.design_id
-                JOIN backends b ON b.id = r.backend_id
-                WHERE r.id = :rid
-                """
-            ),
-            {"rid": run_id},
-        ).mappings().first()
+    from eda_agent.agent.tool_impl_blockage import add_placement_blockage_impl
 
-        if not run_row:
-            return {"error": f"Run {run_id} not found"}
-
-        backend_name = str(run_row["backend"]).lower()
-        if backend_name != "innovus":
-            return {"error": f"add_placement_blockage supports only innovus backend, got '{backend_name}'"}
-
-        be = get_backend(backend_name)
-        if not hasattr(be, "add_blockage_to_design_state"):
-            return {"error": "Selected backend does not support placement blockage injection"}
-
-        result = be.add_blockage_to_design_state(  # type: ignore[attr-defined]
-            design_name=str(run_row["design_name"]),
-            blockage_specs=blockages,
-            workdir=workdir,
-            stage=stage,
-        )
-
-        existing_params = run_row["params"] if isinstance(run_row["params"], dict) else {}
-        if isinstance(run_row["params"], str):
-            try:
-                existing_params = json.loads(run_row["params"])
-            except json.JSONDecodeError:
-                existing_params = {}
-        blockage_history = list(existing_params.get("placement_blockages", []))
-        blockage_history.extend(blockages)
-        updated_params = dict(existing_params)
-        updated_params["placement_blockages"] = blockage_history
-        db.execute(
-            text("UPDATE runs SET params = :params WHERE id = :rid"),
-            {"rid": run_id, "params": json.dumps(updated_params)},
-        )
-
-    return {
-        "run_id": run_id,
-        "status": "success",
-        "backend": "innovus",
-        "applied_blockages": len(blockages),
-        "blockages": blockages,
-        "details": result,
-    }
+    return add_placement_blockage_impl(
+        run_id,
+        blockages,
+        workdir=workdir,
+        stage=stage,
+        get_db_fn=get_db,
+    )
 
 
 def _suggest_params(run_id: int, target_spec: str) -> dict[str, Any]:
