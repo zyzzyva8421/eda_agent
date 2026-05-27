@@ -72,6 +72,35 @@ def test_agent_error_does_not_crash():
         assert "Error" in combined or "error" in combined.lower()
 
 
+def test_unexpected_exception_does_not_crash_repl():
+    """Even exceptions outside the legacy narrow tuple must not kill the REPL."""
+    with patch("eda_agent.cli.Planner") as MockPlanner:
+        instance = MockPlanner.return_value
+        # KeyError used to bubble out of cli_repl in the previous narrow except.
+        instance.run.side_effect = KeyError("missing_field")
+        out, err = _run_cli_with_input(["check timing", "exit"])
+    combined = out + err
+    # The REPL must have reached "Goodbye" — proving it survived the KeyError.
+    assert "Goodbye" in out
+    assert "KeyError" in combined or "missing_field" in combined
+
+
+def test_forget_requires_confirmation():
+    """`forget` without 'yes' must not wipe the session."""
+    with patch("eda_agent.cli.clear_session") as mock_clear:
+        # User types 'forget', then declines confirmation, then exits.
+        out, _ = _run_cli_with_input(["forget", "no", "exit"])
+    mock_clear.assert_not_called()
+    assert "cancelled" in out.lower()
+
+
+def test_forget_with_yes_wipes_session():
+    with patch("eda_agent.cli.clear_session") as mock_clear:
+        out, _ = _run_cli_with_input(["forget", "yes", "exit"])
+    mock_clear.assert_called_once()
+    assert "wiped" in out.lower()
+
+
 def test_shell_command_execution():
     """!<cmd> should run the shell command and not forward it to the agent."""
     with patch("eda_agent.cli.subprocess.run") as mock_run:

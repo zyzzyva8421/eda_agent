@@ -403,6 +403,17 @@ def cli_repl(
             print("Message history cleared. (Design context preserved -- use 'forget' to wipe everything.)")
             continue
         if cmd == "forget":
+            try:
+                confirm = input(
+                    f"This will permanently delete session '{session_id}' "
+                    f"and all its history.  Type 'yes' to confirm: "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nforget: cancelled.")
+                continue
+            if confirm != "yes":
+                print("forget: cancelled.")
+                continue
             memory.forget()
             clear_session(session_id, db)
             print(f"Session '{session_id}' wiped.")
@@ -473,8 +484,13 @@ def cli_repl(
                 )
             console.agent(reply)
             _persist()
-        except (RuntimeError, ValueError, OSError, TimeoutError) as exc:
-            console.error(f"{exc}")
+        except KeyboardInterrupt:
+            # Re-arm prompt without killing the REPL.
+            print("\n(Interrupted -- type 'exit' to quit)")
+            _persist()
+        except Exception as exc:  # noqa: BLE001 -- REPL must stay alive across any planner error
+            console.error(f"{type(exc).__name__}: {exc}")
+            logging.getLogger(__name__).debug("planner.run raised", exc_info=True)
             # Persist whatever we have so far so transient failures don't
             # cost the user their conversation context.
             _persist()
