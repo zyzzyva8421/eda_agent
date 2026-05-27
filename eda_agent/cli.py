@@ -51,6 +51,7 @@ import argparse
 import atexit
 import getpass
 import glob as _glob
+import logging
 import os
 import subprocess
 import sys
@@ -73,6 +74,7 @@ from eda_agent.agent.session_store import (
     open_db,
     save_session,
 )
+from eda_agent.console import Console, Spinner
 
 # Built-in commands for tab completion
 _BUILTIN_COMMANDS = [
@@ -273,11 +275,54 @@ def _pick_resume_session(username: str, db) -> str | None:
     return None
 
 
+def _configure_logging(verbose: int, quiet: bool) -> None:
+    """Initialise root logging based on CLI flags / ``EDA_AGENT_LOG``.
+
+    Resolution order (highest priority first):
+
+    1. Explicit log level in ``EDA_AGENT_LOG`` (e.g. ``DEBUG``, ``INFO``).
+    2. ``--quiet`` → ``ERROR``.
+    3. ``--verbose`` count (``-v`` → ``INFO``, ``-vv`` and up → ``DEBUG``).
+    4. Default → ``WARNING``.
+    """
+    env_level = os.environ.get("EDA_AGENT_LOG")
+    if env_level:
+        level = getattr(logging, env_level.upper(), None)
+        if not isinstance(level, int):
+            level = logging.INFO
+    elif quiet:
+        level = logging.ERROR
+    elif verbose >= 2:
+        level = logging.DEBUG
+    elif verbose >= 1:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+
+    # Re-configure even if called more than once so the user can flip
+    # verbosity by relaunching the REPL.  ``force=True`` was added in 3.8
+    # and is safe to use unconditionally.
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+    # Quiet noisy third-party libraries unless the user explicitly opted
+    # in to DEBUG.
+    if level > logging.DEBUG:
+        for noisy in ("httpx", "httpcore", "urllib3"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def cli_repl(
     session_id: str | None = None,
     new: bool = False,
     resume: bool = False,
     no_persist: bool = False,
+    verbose: int = 0,
+    quiet: bool = False,
+    stream: bool = False,
 ) -> None:
     """Entry point for the interactive ``eda-agent`` REPL.
 
@@ -294,7 +339,19 @@ def cli_repl(
     no_persist:
         Do not read or write the ``agent_sessions`` table; useful for
         throwaway debugging sessions.
+    verbose:
+        Verbosity counter from ``-v`` / ``-vv``.  Controls logging level
+        and step-by-step ReAct event output.
+    quiet:
+        Suppress progress lines (and lower the log level to ``ERROR``)
+        so only final replies and errors are written.
+    stream:
+        Stream the final assistant message via SSE when supported.  When
+        the LLM still wants to call tools the planner falls back to the
+        non-streaming path for that turn automatically.
     """
+    _configure_logging(verbose=verbose, quiet=quiet)
+    console = Console(quiet=quiet, show_events=(verbose >= 1 and not quiet))
     _setup_readline()
     planner = Planner()
 
@@ -404,11 +461,20 @@ def cli_repl(
             continue
 
         try:
-            reply = planner.run(user_input, memory=memory)
-            print(f"\nAgent: {reply}\n")
+            def _emit(kind: str, payload: dict) -> None:
+                console.event(kind, payload)
+
+            with Spinner(console, text="thinking"):
+                reply = planner.run(
+                    user_input,
+                    memory=memory,
+                    on_event=_emit,
+                    stream=stream,
+                )
+            console.agent(reply)
             _persist()
         except (RuntimeError, ValueError, OSError, TimeoutError) as exc:
-            print(f"Error: {exc}\n", file=sys.stderr)
+            console.error(f"{exc}")
             # Persist whatever we have so far so transient failures don't
             # cost the user their conversation context.
             _persist()
@@ -450,6 +516,24 @@ def _build_parser():
         "--no-persist",
         action="store_true",
         help="Do not read or write the agent_sessions DB table.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v: INFO + ReAct steps, -vv: DEBUG).",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Only print final replies / errors (sets log level to ERROR).",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream the final assistant reply token-by-token (best-effort SSE).",
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -792,6 +876,9 @@ def main() -> None:
             new=args.new,
             resume=args.resume,
             no_persist=args.no_persist,
+            verbose=args.verbose,
+            quiet=args.quiet,
+            stream=args.stream,
         )
         return
 

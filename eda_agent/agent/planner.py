@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -107,9 +108,44 @@ class Planner:
     # Public interface
     # ------------------------------------------------------------------
 
-    def run(self, user_message: str, memory: AgentMemory | None = None) -> str:
-        """Run the ReAct loop and return the final assistant response."""
+    def run(
+        self,
+        user_message: str,
+        memory: AgentMemory | None = None,
+        *,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
+        stream: bool = False,
+    ) -> str:
+        """Run the ReAct loop and return the final assistant response.
+
+        Parameters
+        ----------
+        user_message:
+            The user's input for this turn.
+        memory:
+            Conversation memory to extend.  A fresh :class:`AgentMemory`
+            is used when omitted.
+        on_event:
+            Optional progress callback ``fn(kind, payload)``.  Emitted
+            kinds: ``iteration_start``, ``tool_call``, ``tool_result``,
+            ``async_submission``, ``trace``.  Exceptions raised by the
+            callback are swallowed so a bad listener cannot break the
+            planner.
+        stream:
+            When True and the final assistant turn has no tool calls,
+            stream the LLM response via SSE and emit ``token`` events
+            through *on_event*.  Falls back to the non-streaming path on
+            any error so the agent always produces a final reply.
+        """
         mem = memory or AgentMemory()
+
+        def _emit(kind: str, payload: dict[str, Any]) -> None:
+            if on_event is None:
+                return
+            try:
+                on_event(kind, payload)
+            except Exception:  # noqa: BLE001 -- listeners must never crash the planner
+                logger.debug("on_event listener raised", exc_info=True)
 
         # Retrieve similar historical cases once per *user turn* (topic may
         # change between turns) with a small LRU cache keyed by the query
@@ -121,7 +157,13 @@ class Planner:
 
         for iteration in range(self._max_iterations):
             logger.debug("ReAct iteration %d", iteration + 1)
-            response = self._call_llm(mem)
+            _emit("iteration_start", {"iteration": iteration + 1})
+            response = self._call_llm(mem, stream=stream, on_event=_emit)
+
+            # Surface tracing metadata (LangSmith) for observability.
+            tracing_meta = response.get("_tracing") if isinstance(response, dict) else None
+            if tracing_meta:
+                _emit("trace", tracing_meta)
 
             # Handle empty or None response
             if not response or not response.get("choices"):
@@ -136,11 +178,11 @@ class Planner:
             # Persist assistant message
             assistant_text = message.get("content") or ""
             tool_calls = message.get("tool_calls") or []
-            
+
             # Include reasoning_content if content is empty (MiniMax specific)
             if not assistant_text and message.get("reasoning_content"):
                 assistant_text = message.get("reasoning_content", "")
-            
+
             # Add assistant message with tool_calls so MiniMax can match tool results
             if tool_calls:
                 mem.add_assistant(assistant_text, tool_calls=tool_calls)
@@ -162,7 +204,33 @@ class Planner:
                     arguments = {}
 
                 logger.info("Calling tool %s with %s", fn_name, arguments)
-                tool_result = execute_tool(fn_name, arguments)
+                _emit("tool_call", {"name": fn_name, "arguments": arguments})
+
+                _t0 = time.monotonic()
+                tool_ok = True
+                try:
+                    tool_result = execute_tool(fn_name, arguments)
+                except Exception as exc:  # noqa: BLE001 -- propagated after emit
+                    tool_ok = False
+                    _emit(
+                        "tool_result",
+                        {
+                            "name": fn_name,
+                            "ok": False,
+                            "preview": f"{type(exc).__name__}: {exc}",
+                            "duration": time.monotonic() - _t0,
+                        },
+                    )
+                    raise
+                _emit(
+                    "tool_result",
+                    {
+                        "name": fn_name,
+                        "ok": tool_ok,
+                        "preview": tool_result,
+                        "duration": time.monotonic() - _t0,
+                    },
+                )
                 mem.add_tool_result(fn_name, tool_result, tool_call_id=tc_id)
 
                 # Async flow/stage submissions should return immediately with a
@@ -177,6 +245,7 @@ class Planner:
                 self._extract_and_store_context(fn_name, arguments, tool_result, mem)
 
             if async_submission_job is not None:
+                _emit("async_submission", async_submission_job)
                 return self._format_async_submission_reply(async_submission_job)
 
             if finish_reason == "stop":
@@ -406,8 +475,21 @@ class Planner:
     # Internal
     # ------------------------------------------------------------------
 
-    def _call_llm(self, mem: AgentMemory) -> dict[str, Any]:
-        """POST to MiniMax chat completions and return the parsed response."""
+    def _call_llm(
+        self,
+        mem: AgentMemory,
+        *,
+        stream: bool = False,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """POST to MiniMax chat completions and return the parsed response.
+
+        When *stream* is True, an SSE request is issued and ``token``
+        events are emitted via *on_event* as content deltas arrive.  The
+        method then re-assembles a standard non-streaming response dict
+        so the rest of the ReAct loop is oblivious to the transport.
+        Any error during streaming falls back to the non-streaming path.
+        """
 
         # Inject design context into system prompt if available
         context = mem.extract_design_context()
@@ -461,10 +543,27 @@ class Planner:
 
         # Create client without proxy settings
         transport = httpx.HTTPTransport()
-        with httpx.Client(timeout=120, transport=transport) as client:
-            resp = client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            raw_response = resp.json()
+        if stream:
+            payload["stream"] = True
+            try:
+                raw_response = self._call_llm_stream(
+                    url, headers, payload, transport, on_event=on_event
+                )
+            except Exception:  # noqa: BLE001 -- streaming is best-effort
+                logger.warning(
+                    "Streaming LLM call failed; falling back to non-stream",
+                    exc_info=True,
+                )
+                payload.pop("stream", None)
+                with httpx.Client(timeout=120, transport=transport) as client:
+                    resp = client.post(url, headers=headers, json=payload)
+                    resp.raise_for_status()
+                    raw_response = resp.json()
+        else:
+            with httpx.Client(timeout=120, transport=transport) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                raw_response = resp.json()
 
         # Trace the LLM call if enabled
         if is_tracing_enabled():
@@ -475,6 +574,102 @@ class Planner:
             )
 
         return raw_response
+
+    def _call_llm_stream(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        transport: httpx.HTTPTransport,
+        *,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Issue an SSE chat completion and re-assemble a regular response.
+
+        Follows the OpenAI streaming format used by MiniMax's v2 endpoint:
+        the server emits ``data: {...}`` lines (one JSON object per line),
+        terminated by ``data: [DONE]``.  Each chunk contains a
+        ``choices[0].delta`` with optional ``content`` and ``tool_calls``
+        fragments.  We accumulate these into a single ``message`` dict.
+        """
+        accumulated_content: list[str] = []
+        accumulated_reasoning: list[str] = []
+        # tool_calls are accumulated by index (OpenAI streaming spec).
+        tool_calls_by_index: dict[int, dict[str, Any]] = {}
+        finish_reason = "stop"
+        model_name = self._model
+
+        with httpx.Client(timeout=300, transport=transport) as client:
+            with client.stream("POST", url, headers=headers, json=payload) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    if isinstance(raw_line, str):
+                        line = raw_line
+                    else:
+                        line = raw_line.decode("utf-8", "replace")
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    model_name = chunk.get("model", model_name)
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    delta = choice.get("delta") or {}
+                    if "content" in delta and delta["content"]:
+                        accumulated_content.append(delta["content"])
+                        if on_event is not None:
+                            try:
+                                on_event("token", {"content": delta["content"]})
+                            except Exception:  # noqa: BLE001
+                                pass
+                    if "reasoning_content" in delta and delta["reasoning_content"]:
+                        accumulated_reasoning.append(delta["reasoning_content"])
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        slot = tool_calls_by_index.setdefault(
+                            idx,
+                            {
+                                "id": tc.get("id"),
+                                "type": tc.get("type", "function"),
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["function"]["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            slot["function"]["arguments"] += fn["arguments"]
+
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(accumulated_content),
+        }
+        if accumulated_reasoning:
+            message["reasoning_content"] = "".join(accumulated_reasoning)
+        if tool_calls_by_index:
+            ordered = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
+            # Ensure every tool call has an id.
+            for tc in ordered:
+                if not tc.get("id"):
+                    tc["id"] = str(uuid.uuid4())
+            message["tool_calls"] = ordered
+
+        return {
+            "model": model_name,
+            "choices": [{"finish_reason": finish_reason, "message": message}],
+        }
 
     def _extract_and_store_context(
         self,
