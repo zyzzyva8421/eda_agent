@@ -34,6 +34,7 @@ DEFAULT_TOOL_RESULT_MAX_CHARS = 8 * 1024
 # Rough characters-per-token estimate for the budget-aware view.  Good
 # enough for trimming heuristics without pulling in tiktoken at runtime.
 _CHARS_PER_TOKEN = 4
+_OVERHEAD_TOKENS_PER_MESSAGE = 4  # role + bookkeeping tokens charged per msg
 
 # Well-known scratchpad keys for L2 session facts.  Whenever a tool call
 # exposes one of these (as an argument or in its return payload) we
@@ -386,7 +387,7 @@ def _trim_to_token_budget(
         total = 0
         for m in msgs:
             content = m.get("content") or ""
-            total += len(content) // _CHARS_PER_TOKEN + 4  # overhead per msg
+            total += len(content) // _CHARS_PER_TOKEN + _OVERHEAD_TOKENS_PER_MESSAGE
             for tc in m.get("tool_calls") or []:
                 total += len(json.dumps(tc)) // _CHARS_PER_TOKEN
         return total
