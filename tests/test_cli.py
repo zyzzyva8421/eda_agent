@@ -270,3 +270,88 @@ def test_cmd_submit_warns_on_relative_config(tmp_path, capsys, monkeypatch):
         _cmd_submit(args)
     err = capsys.readouterr().err
     assert "not absolute" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# `wait` subcommand
+# ---------------------------------------------------------------------------
+
+
+def _wait_args(**overrides):
+    from types import SimpleNamespace
+
+    base = {
+        "job_id": "abc",
+        "timeout": None,
+        "interval": 0.0,
+        "quiet": True,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _fake_job(status_value, error_message=None):
+    from eda_agent.queue.store import JobStatus
+
+    job = type("J", (), {})()
+    job.job_id = "abc"
+    job.status = JobStatus(status_value)
+    job.error_message = error_message
+    return job
+
+
+def test_cmd_wait_exits_zero_on_success():
+    from eda_agent.cli import _cmd_wait
+
+    states = iter([_fake_job("pending"), _fake_job("running"), _fake_job("success")])
+    with patch("eda_agent.queue.store.JobStore") as MockStore:
+        MockStore.return_value.get_job.side_effect = lambda _jid: next(states)
+        try:
+            _cmd_wait(_wait_args())
+        except SystemExit as exc:
+            assert exc.code == 0
+        else:
+            raise AssertionError("expected SystemExit(0)")
+
+
+def test_cmd_wait_exits_nonzero_on_failure(capsys):
+    from eda_agent.cli import _cmd_wait
+
+    states = iter([_fake_job("running"), _fake_job("failed", error_message="boom")])
+    with patch("eda_agent.queue.store.JobStore") as MockStore:
+        MockStore.return_value.get_job.side_effect = lambda _jid: next(states)
+        try:
+            _cmd_wait(_wait_args(quiet=False))
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("expected SystemExit(1)")
+    err = capsys.readouterr().err
+    assert "boom" in err
+
+
+def test_cmd_wait_exits_one_when_job_not_found():
+    from eda_agent.cli import _cmd_wait
+
+    with patch("eda_agent.queue.store.JobStore") as MockStore:
+        MockStore.return_value.get_job.return_value = None
+        try:
+            _cmd_wait(_wait_args())
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("expected SystemExit(1)")
+
+
+def test_cmd_wait_timeout_returns_two():
+    from eda_agent.cli import _cmd_wait
+
+    with patch("eda_agent.queue.store.JobStore") as MockStore:
+        # Always pending → never reaches terminal
+        MockStore.return_value.get_job.return_value = _fake_job("pending")
+        try:
+            _cmd_wait(_wait_args(timeout=0.05, interval=0.01))
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError("expected SystemExit(2) on timeout")

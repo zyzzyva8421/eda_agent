@@ -619,6 +619,32 @@ def _build_parser():
         help="Run environment checks (API key, PostgreSQL, ORFS, …) and report issues.",
     )
 
+    # -- wait ------------------------------------------------------------------
+    wp = sub.add_parser(
+        "wait",
+        help="Block until a job reaches a terminal state. Exit 0 on success, "
+        "non-zero on failure / cancellation / timeout.",
+    )
+    wp.add_argument("job_id", help="Job UUID returned by 'submit'.")
+    wp.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Maximum seconds to wait (default: no timeout).",
+    )
+    wp.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Poll interval in seconds (default: 2).",
+    )
+    wp.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress progress output; only set exit code.",
+    )
+
     # -- cancel ----------------------------------------------------------------
     cp = sub.add_parser("cancel", help="Cancel pending job(s).")
     cp.add_argument(
@@ -870,6 +896,60 @@ def _cmd_logs(args) -> None:
         pass
 
 
+def _cmd_wait(args) -> None:
+    """Block until a job reaches a terminal state.
+
+    Exit code:
+        0 — job succeeded
+        1 — job not found, failed, or cancelled
+        2 — timeout reached before terminal state
+    """
+    import time
+
+    from eda_agent.queue.store import JobStatus, JobStore
+
+    store = JobStore()
+    job = store.get_job(args.job_id)
+    if job is None:
+        print(f"Error: job '{args.job_id}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    terminal = {JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.CANCELLED}
+    deadline = (time.monotonic() + args.timeout) if args.timeout else None
+    last_status = None
+
+    try:
+        while True:
+            job = store.get_job(args.job_id)
+            if job is None:
+                print(f"Error: job '{args.job_id}' disappeared.", file=sys.stderr)
+                sys.exit(1)
+            if job.status != last_status and not args.quiet:
+                print(f"[{job.job_id}] status: {job.status.value}")
+                last_status = job.status
+            if job.status in terminal:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                if not args.quiet:
+                    print(
+                        f"Timeout after {args.timeout:g}s; job still {job.status.value}.",
+                        file=sys.stderr,
+                    )
+                sys.exit(2)
+            time.sleep(max(0.1, args.interval))
+    except KeyboardInterrupt:
+        if not args.quiet:
+            print("\nInterrupted; job continues running in background.", file=sys.stderr)
+        sys.exit(130)
+
+    if job.status == JobStatus.SUCCESS:
+        sys.exit(0)
+    # failed / cancelled
+    if job.error_message and not args.quiet:
+        print(f"Error: {job.error_message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def _cmd_cancel(args) -> None:
     from eda_agent.queue.store import JobStatus, JobStore
 
@@ -952,6 +1032,7 @@ def main() -> None:
         "logs": _cmd_logs,
         "cancel": _cmd_cancel,
         "doctor": _cmd_doctor,
+        "wait": _cmd_wait,
     }
 
     handler = dispatch.get(args.command)
