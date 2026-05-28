@@ -32,7 +32,8 @@ def get_engine():
 def create_all_tables() -> None:
     """Create all tables (and PostGIS extension) in the database."""
     with _engine.connect() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        if settings.enable_postgis:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
         conn.commit()
     Base.metadata.create_all(bind=_engine)
 

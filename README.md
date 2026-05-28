@@ -139,7 +139,17 @@ Copy `.env.example` to `.env` and fill in:
 | `POSTGRES_*`                 | PostgreSQL connection details (user / password / host / port / db).|
 | `ORFS_ROOT`                  | Absolute path to OpenROAD-flow-scripts.                           |
 | `ORFS_MAKE_JOBS`             | `-j` value passed to ORFS make invocations.                       |
-| `INNOVUS_*`                  | Innovus SSH backend settings (optional).                          |
+| `INNOVUS_EXECUTION_MODE`       | Innovus execution mode: `ssh` (default), `local`, `pbs`, `slurm`.   |
+| `INNOVUS_SSH_HOST`             | SSH hostname for remote Innovus host.                              |
+| `INNOVUS_SSH_USER`             | SSH username.                                                      |
+| `INNOVUS_SSH_PORT`            | SSH port (default 22).                                             |
+| `INNOVUS_SSH_PASSWORD`        | SSH password (used with sshpass).                                  |
+| `INNOVUS_BIN`                 | Path to Innovus binary on target host.                              |
+| `INNOVUS_REMOTE_WORKDIR`      | Base working directory on remote host.                             |
+| `INNOVUS_LOCAL_WORKDIR`       | Local working directory for `local`/`pbs`/`slurm` modes.          |
+| `INNOVUS_SCHEDULER_QUEUE`     | PBS queue or Slurm partition name.                                 |
+| `INNOVUS_SCHEDULER_ACCOUNT`   | Scheduler account/ project string.                                 |
+| `INNOVUS_SCHEDULER_EXTRA`     | Extra raw args appended to `qsub`/`sbatch` (e.g. `--nodes=2`).     |
 | `PARQUET_ARCHIVE_DIR`        | Directory for Parquet archives.                                   |
 | `API_SECRET_KEY`             | 256-bit random secret for JWT signing.                            |
 | `API_ACCESS_TOKEN_EXPIRE_MINUTES` | JWT lifetime in minutes.                                     |
@@ -265,6 +275,59 @@ FROM custom_tool_audit
 ORDER BY created_at DESC
 LIMIT 20;
 ```
+
+## Innovus execution modes
+
+The Innovus backend supports four execution modes, controlled by `INNOVUS_EXECUTION_MODE`:
+
+### SSH (default, legacy)
+
+```env
+INNOVUS_EXECUTION_MODE=ssh
+INNOVUS_SSH_HOST=innovus-server.example.com
+INNOVUS_SSH_USER=eda_user
+INNOVUS_SSH_PASSWORD=secret
+INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
+INNOVUS_REMOTE_WORKDIR=/home/eda_user/innovus_work
+```
+
+Commands run over SSH on the remote host; reports are copied back via SCP. This is the original behaviour and requires no additional configuration beyond SSH credentials.
+
+### Local (direct execution)
+
+```env
+INNOVUS_EXECUTION_MODE=local
+INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
+INNOVUS_LOCAL_WORKDIR=/tmp/eda_agent/innovus
+```
+
+Innovus runs on the local machine via `subprocess`. TCL scripts from `eda_agent/backends/scripts/innovus/` are copied into a per-run working directory under `INNOVUS_LOCAL_WORKDIR`. No SCP is needed — reports are read directly from the local workdir.
+
+### PBS/Torque job queue
+
+```env
+INNOVUS_EXECUTION_MODE=pbs
+INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
+INNOVUS_LOCAL_WORKDIR=/tmp/eda_agent/innovus
+INNOVUS_SCHEDULER_QUEUE=default_queue
+INNOVUS_SCHEDULER_ACCOUNT=my_project
+INNOVUS_SCHEDULER_EXTRA=-l nodes=1:ppn=8
+```
+
+A shell wrapper script is written to `<workdir>/submit.pbs`, then submitted with `qsub`. The agent polls `qstat` every 15 s until the job exits, then fetches the exit code via `qacct`. Stdout/stderr land in `pbs.stdout.txt` / `pbs.stderr.txt` under the workdir.
+
+### Slurm job queue
+
+```env
+INNOVUS_EXECUTION_MODE=slurm
+INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
+INNOVUS_LOCAL_WORKDIR=/tmp/eda_agent/innovus
+INNOVUS_SCHEDULER_QUEUE=compute
+INNOVUS_SCHEDULER_ACCOUNT=my_project
+INNOVUS_SCHEDULER_EXTRA=--nodes=1 --ntasks-per-node=8
+```
+
+A shell wrapper script is written to `<workdir>/submit.slurm`, then submitted with `sbatch`. The agent polls `squeue -j <job_id>` every 15 s until the job disappears from the queue, then fetches the exit code via `sacct`. Output files land in `slurm_<job_id>.out` / `slurm_<job_id>.err` under the workdir.
 
 ## Phase roadmap
 

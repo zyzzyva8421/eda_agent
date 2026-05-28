@@ -28,7 +28,15 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from geoalchemy2 import Geometry
+from eda_agent.config import settings
+
+try:
+    from geoalchemy2 import Geometry
+    _POSTGIS_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    Geometry = object  # type: ignore[misc, assignment]
+    _POSTGIS_AVAILABLE = False
+
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -306,7 +314,12 @@ class TimingPath(Base):
 # ── congestion_hotspots ───────────────────────────────────────────────────────
 
 class CongestionHotspot(Base):
-    """Spatial congestion hotspot polygon (PostGIS, SRID=0)."""
+    """Spatial congestion hotspot polygon (PostGIS, SRID=0).
+
+    When PostGIS is disabled (enable_postgis=False in settings), the polygon is
+    stored as raw WKT text instead of a native Geometry column, so the table
+    remains usable but without spatial indexing / PostGIS geometry functions.
+    """
 
     __tablename__ = "congestion_hotspots"
 
@@ -314,9 +327,13 @@ class CongestionHotspot(Base):
     run_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
     )
-    geom: Mapped[object] = mapped_column(
-        Geometry(geometry_type="POLYGON", srid=0), nullable=False
-    )
+    if settings.enable_postgis and _POSTGIS_AVAILABLE:
+        geom: Mapped[object] = mapped_column(
+            Geometry(geometry_type="POLYGON", srid=0), nullable=False
+        )
+    else:
+        # Fallback: store WKT string; callers must convert on read/write.
+        geom: Mapped[str] = mapped_column(Text, nullable=False)
     overflow: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     layer: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
@@ -327,12 +344,11 @@ class CongestionHotspot(Base):
 
     __table_args__ = (
         Index("ix_congestion_hotspots_run_id", "run_id"),
-        # PostGIS spatial index
         Index(
             "ix_congestion_hotspots_geom",
             "geom",
             postgresql_using="gist",
-        ),
+        ) if settings.enable_postgis and _POSTGIS_AVAILABLE else Index("ix_congestion_hotspots_geom", "geom"),
     )
 
 

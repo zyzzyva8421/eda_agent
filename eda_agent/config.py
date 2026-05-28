@@ -45,6 +45,10 @@ class Settings(BaseSettings):
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
 
+    # ── PostGIS ────────────────────────────────────────────────────────────────
+    # Set to false if your PostgreSQL has no PostGIS extension installed.
+    enable_postgis: bool = Field(default=True)
+
     # ── MiniMax LLM ───────────────────────────────────────────────────────────
     minimax_api_key: str = Field(default="")
     minimax_group_id: str = Field(default="")
@@ -72,6 +76,19 @@ class Settings(BaseSettings):
     innovus_connect_backoff_multiplier: float = Field(default=1.8)
     innovus_connect_max_backoff_sec: float = Field(default=20.0)
     innovus_ssh_probe_timeout_sec: int = Field(default=8)
+
+    # ── Innovus execution mode ────────────────────────────────────────────────
+    # "ssh"        – execute Innovus on a remote host via SSH (default, legacy)
+    # "local"      – execute Innovus directly on the local machine
+    # "pbs"        – submit to PBS/Torque queue via qsub
+    # "slurm"      – submit to Slurm queue via sbatch
+    innovus_execution_mode: str = Field(default="ssh")
+    # Local work directory (used when execution_mode == "local")
+    innovus_local_workdir: Path = Field(default_factory=lambda: Path("/tmp/eda_agent/innovus"))
+    # Scheduler settings (used when execution_mode == "pbs" or "slurm")
+    innovus_scheduler_queue: str = Field(default="")
+    innovus_scheduler_account: str = Field(default="")
+    innovus_scheduler_extra: str = Field(default="")  # extra qsub/sbatch args raw string
 
     # ── Parquet archive ───────────────────────────────────────────────────────
     parquet_archive_dir: Path = Field(default=Path("/data/archive"))

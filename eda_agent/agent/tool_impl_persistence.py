@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy import text
 
 from eda_agent.backends.base import DesignSpec
+from eda_agent.config import settings
 from eda_agent.db.session import get_db
 
 
@@ -200,35 +201,64 @@ def ingest_records_impl(records: list[dict], run_id: int, stage: str, db: Any) -
                 },
             )
         elif kind == "hotspot":
-            db.execute(
-                text(
-                    "INSERT INTO congestion_hotspots "
-                    "(run_id, geom, overflow) "
-                    "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow)"
-                ),
-                {
-                    "run_id": run_id,
-                    "wkt": rec["wkt"],
-                    "overflow": rec.get("overflow", 0),
-                },
-            )
+            if settings.enable_postgis:
+                db.execute(
+                    text(
+                        "INSERT INTO congestion_hotspots "
+                        "(run_id, geom, overflow) "
+                        "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow)"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "wkt": rec["wkt"],
+                        "overflow": rec.get("overflow", 0),
+                    },
+                )
+            else:
+                db.execute(
+                    text(
+                        "INSERT INTO congestion_hotspots "
+                        "(run_id, geom, overflow) "
+                        "VALUES (:run_id, :wkt, :overflow)"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "wkt": rec["wkt"],
+                        "overflow": rec.get("overflow", 0),
+                    },
+                )
         elif kind == "orfs_violation":
             wkt = rec.get("wkt")
             if not wkt:
                 continue
-            db.execute(
-                text(
-                    "INSERT INTO congestion_hotspots "
-                    "(run_id, geom, overflow, layer) "
-                    "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow, :layer)"
-                ),
-                {
-                    "run_id": run_id,
-                    "wkt": wkt,
-                    "overflow": rec.get("overflow", 0),
-                    "layer": rec.get("layer"),
-                },
-            )
+            if settings.enable_postgis:
+                db.execute(
+                    text(
+                        "INSERT INTO congestion_hotspots "
+                        "(run_id, geom, overflow, layer) "
+                        "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow, :layer)"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "wkt": wkt,
+                        "overflow": rec.get("overflow", 0),
+                        "layer": rec.get("layer"),
+                    },
+                )
+            else:
+                db.execute(
+                    text(
+                        "INSERT INTO congestion_hotspots "
+                        "(run_id, geom, overflow, layer) "
+                        "VALUES (:run_id, :wkt, :overflow, :layer)"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "wkt": wkt,
+                        "overflow": rec.get("overflow", 0),
+                        "layer": rec.get("layer"),
+                    },
+                )
         elif kind == "summary" and "design_area_um2" in rec:
             db.execute(
                 text(

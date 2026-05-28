@@ -20,6 +20,8 @@ from typing import Any
 
 from sqlalchemy import text
 
+from eda_agent.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,7 +108,7 @@ class EDAQueryRepository:
         y2: float | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        if all(v is not None for v in [x1, y1, x2, y2]):
+        if all(v is not None for v in [x1, y1, x2, y2]) and settings.enable_postgis:
             bbox_wkt = f"POLYGON(({x1} {y1},{x2} {y1},{x2} {y2},{x1} {y2},{x1} {y1}))"  # noqa: S608
             rows = db.execute(
                 text(
@@ -122,11 +124,13 @@ class EDAQueryRepository:
                 {"run_id": run_id, "bbox": bbox_wkt},
             ).mappings().fetchall()
         else:
+            # No spatial filter when PostGIS is disabled or no bbox given;
+            # geom is stored as raw WKT text so just return it directly.
             rows = db.execute(
                 text(
                     """
                     SELECT id, run_id, overflow, layer,
-                           ST_AsText(geom) AS geom_wkt
+                           geom AS geom_wkt
                     FROM congestion_hotspots
                     WHERE run_id = :run_id
                     ORDER BY overflow DESC

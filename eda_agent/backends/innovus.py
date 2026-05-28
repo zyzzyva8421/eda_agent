@@ -6,6 +6,7 @@ remote environment already has Innovus installed and licensed.
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -136,11 +137,20 @@ class InnovusBackend(AbstractEDABackend):
         return "innovus"
 
     @property
+    def name(self) -> str:
+        return "innovus"
+
+    @property
     def version(self) -> str:
         if not self.is_available():
             return "unavailable"
-        cmd = f"{shlex.quote(self._innovus_bin)} -version | head -n 1"
-        result = self._ssh_run(cmd, timeout=20)
+        mode = settings.innovus_execution_mode
+        if mode == "local":
+            cmd = f"{shlex.quote(settings.innovus_bin)} -version | head -n 1"
+            result = self._local_run(cmd, timeout=20)
+        else:
+            cmd = f"{shlex.quote(self._innovus_bin)} -version | head -n 1"
+            result = self._ssh_run(cmd, timeout=20)
         if result.returncode != 0:
             return "unknown"
         return (result.stdout or "unknown").strip() or "unknown"
@@ -149,6 +159,9 @@ class InnovusBackend(AbstractEDABackend):
         return list(_INNOVUS_STAGES)
 
     def is_available(self) -> bool:
+        mode = settings.innovus_execution_mode
+        if mode == "local":
+            return Path(settings.innovus_bin).exists()
         if not self._host or not self._user or not self._innovus_bin:
             return False
         test_cmd = f"test -x {shlex.quote(self._innovus_bin)}"
@@ -162,128 +175,139 @@ class InnovusBackend(AbstractEDABackend):
         params: dict[str, Any],
     ) -> RunResult:
         params = self.validate_params(stage, params)
-        if not self._host or not self._user:
-            raise RuntimeError(
-                "Innovus SSH is not configured. "
-                "Set INNOVUS_SSH_HOST/INNOVUS_SSH_USER."
-            )
+
+        mode = settings.innovus_execution_mode
+        if mode == "ssh":
+            if not self._host or not self._user:
+                raise RuntimeError(
+                    "Innovus SSH is not configured. "
+                    "Set INNOVUS_SSH_HOST/INNOVUS_SSH_USER."
+                )
 
         run_id = str(uuid.uuid4())
+        params["_run_id"] = run_id
         started_at = datetime.now(tz=timezone.utc)
 
         logs_dir = Path("/tmp/eda_agent/innovus") / design.name / stage
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = logs_dir / f"{run_id}.log"
 
-        # Auto-find script if not provided
+        # ── Local / PBS / Slurm: set up workdir locally ───────────────────────
+        if mode != "ssh":
+            local_workdir = self._local_workdir(stage, design, params)
+            Path(local_workdir).mkdir(parents=True, exist_ok=True)
+            (Path(local_workdir) / "scripts").mkdir(exist_ok=True)
+            (Path(local_workdir) / "FPR" / "work").mkdir(parents=True, exist_ok=True)
+
+            backend_scripts = Path(__file__).parent / "scripts" / "innovus"
+            if backend_scripts.exists():
+                for tcl in backend_scripts.glob("*.tcl"):
+                    if tcl.name.startswith("agent_args"):
+                        continue
+                    shutil.copy2(tcl, Path(local_workdir) / "scripts" / tcl.name)
+
+            result, workdir = self._dispatch(stage, design, params)
+
+            stdout_str = result.stdout.decode() if isinstance(result.stdout, bytes) else (result.stdout or "")
+            stderr_str = result.stderr.decode() if isinstance(result.stderr, bytes) else (result.stderr or "")
+            log_path.write_text(stdout_str + stderr_str)
+
+            status = StageStatus.SUCCESS if result.returncode == 0 else StageStatus.FAILED
+            error_message = "" if result.returncode == 0 else f"Innovus ({mode}) failed with exit code {result.returncode}"
+
+            finished_at = datetime.now(tz=timezone.utc)
+            return RunResult(
+                run_id=run_id,
+                backend_name=self.name,
+                design_name=design.name,
+                stage=stage,
+                status=status,
+                started_at=started_at,
+                finished_at=finished_at,
+                log_path=log_path,
+                report_dir=Path(workdir),
+                params=params,
+                error_message=error_message,
+            )
+
+        # ── SSH execution path ────────────────────────────────────────────────
         remote_tcl = str(params.get("tcl", "")).strip()
         remote_cmd = str(params.get("command", "")).strip()
-        
-        # Use shared workdir
         remote_workdir = str(params.get("workdir", self._workdir)).strip()
-        
-        # Job-specific workdir for isolation
         job_workdir = f"{remote_workdir}/runs/{run_id}"
-        
-        # Get stage order for PREV_STAGE calculation
+
         stage_order = ["floorplan", "powerplan", "place", "prects", "cts", "postcts", "route", "postroute", "signoff"]
         try:
             stage_idx = stage_order.index(stage)
             prev_stage = stage_order[stage_idx - 1] if stage_idx > 0 else ""
         except ValueError:
             prev_stage = ""
-        
-        # Get local TCL scripts path
+
         local_scripts_dir = Path(__file__).parent / "scripts" / "innovus"
-        
-        # Sync local TCL scripts to remote common directory (if local scripts exist)
         if local_scripts_dir.exists():
             sync_cmd = f"mkdir -p {shlex.quote(remote_workdir)}/scripts"
             self._ssh_run(sync_cmd, timeout=30)
-            # Upload each TCL script
             for tcl_file in local_scripts_dir.glob("*.tcl"):
-                if tcl_file.name.startswith("agent_args"):
-                    continue  # Skip agent_args templates, will be generated per-job
-                if tcl_file.name == "inject_hook.tcl":
-                    continue  # Will be synced separately or exists on remote
-                with open(tcl_file, "r") as f:
+                if tcl_file.name.startswith("agent_args") or tcl_file.name == "inject_hook.tcl":
+                    continue
+                with open(tcl_file) as f:
                     tcl_content = f.read()
-                # Quote content for safe shell transfer
-                escaped_content = tcl_content.replace("'", "'\\''")
-                upload_cmd = f"cat > {shlex.quote(remote_workdir)}/scripts/{tcl_file.name} <<'TCLEOF'\n{escaped_content}\nTCLEOF"
+                escaped = tcl_content.replace("'", "'\\''")
+                upload_cmd = f"cat > {shlex.quote(remote_workdir)}/scripts/{tcl_file.name} <<'TCLEOF'\n{escaped}\nTCLEOF"
                 self._ssh_run(upload_cmd, timeout=30)
-        
-        # Create job-specific directory with copied scripts and previous stage DB
-        # Key insight: 
-        # - First run (no prev_job_id): copy from common (remote_workdir)
-        # - Iterations (has prev_job_id): copy from previous job
+
         prev_db_copy = ""
         if stage == "floorplan":
-            # floorplan restores from initial saved design in common/FPR/saved
             saved_design = f"{remote_workdir}/FPR/saved/{design.name}.dat"
             prev_db_copy = (
                 f"&& mkdir -p {shlex.quote(job_workdir)}/FPR/saved && "
                 f"cp {saved_design} {shlex.quote(job_workdir)}/FPR/saved/ 2>/dev/null || true"
             )
-        elif stage != "floorplan" and prev_stage:
+        elif prev_stage:
             prev_job_id = params.get("prev_job_id", "")
-            last_job_id = params.get("last_job_id", "")  # Previous stage's job ID
-            
+            last_job_id = params.get("last_job_id", "")
             if prev_job_id:
-                # Copy from previous iteration's output
                 prev_work_base = f"{remote_workdir}/runs/{prev_job_id}/FPR/work/{prev_stage}"
             elif last_job_id:
-                # First run after previous stage, copy from previous stage's job output
                 prev_work_base = f"{remote_workdir}/runs/{last_job_id}/FPR/work/{prev_stage}"
             else:
-                # Fallback: try common directory
                 prev_work_base = f"{remote_workdir}/FPR/work/{prev_stage}"
-            
             prev_db_copy = (
                 f"&& mkdir -p {shlex.quote(job_workdir)}/FPR/work/{prev_stage} && "
                 f"cp -r {prev_work_base}/{prev_stage}.dat "
                 f"{shlex.quote(job_workdir)}/FPR/work/{prev_stage}/ 2>/dev/null || true"
             )
-        
+
         setup_cmd = (
             f"mkdir -p {shlex.quote(job_workdir)}/scripts && "
             f"mkdir -p {shlex.quote(job_workdir)}/FPR/work && "
             f"cp -r {shlex.quote(remote_workdir)}/scripts/*.tcl {shlex.quote(job_workdir)}/scripts/ 2>/dev/null || true {prev_db_copy}"
         )
         self._ssh_run(setup_cmd, timeout=60)
-        
-        # For default script (not custom command), inherit from previous if exists
+
         if not remote_cmd:
             prev_agent_args = str(params.get("prev_agent_args", "")).strip()
-            
             if prev_agent_args:
-                # Determine previous run's scripts directory
                 if "/scripts/agent_args_" in prev_agent_args:
-                    # prev_agent_args points to agent_args_{run_id}.tcl
                     prev_scripts_dir = prev_agent_args.replace("/scripts/agent_args_", "/scripts/").rsplit("/", 1)[0]
                 elif "/scripts/agent_args.tcl" in prev_agent_args:
-                    # prev_agent_args points to agent_args.tcl (base)
                     prev_scripts_dir = prev_agent_args.replace("/scripts/agent_args.tcl", "/scripts")
                 else:
                     prev_scripts_dir = None
-                
+
                 if prev_scripts_dir:
-                    # Copy all agent_args files from previous run
                     self._ssh_run(
                         f"cp {shlex.quote(prev_scripts_dir)}/agent_args_*.tcl {shlex.quote(job_workdir)}/scripts/ 2>/dev/null || true",
-                        timeout=10
+                        timeout=10,
                     )
-                    # Also copy agent_args.tcl (base, may be empty)
                     self._ssh_run(
                         f"cp {shlex.quote(prev_scripts_dir)}/agent_args.tcl {shlex.quote(job_workdir)}/scripts/ 2>/dev/null || true",
-                        timeout=10
+                        timeout=10,
                     )
-            
+
             agent_args_tcl = f"{job_workdir}/scripts/agent_args_{run_id}.tcl"
             if prev_agent_args:
-                # Create agent_args_inherited.tcl that sources the previous run's agent_args
                 inherited_src = prev_agent_args.replace("/scripts/agent_args.tcl", "/scripts/agent_args_*.tcl").rsplit("/", 1)[0]
-                # Find the actual previous agent_args file (pattern: agent_args_{uuid}.tcl)
                 create_inherited = (
                     f'prev_scripts=$(ls {inherited_src}/agent_args_*.tcl 2>/dev/null | tail -1) && '
                     f'if [ -n "$prev_scripts" ]; then '
@@ -291,35 +315,23 @@ class InnovusBackend(AbstractEDABackend):
                     f'else echo "# no previous agent_args" > {job_workdir}/scripts/agent_args_inherited.tcl; fi'
                 )
                 self._ssh_run(create_inherited, timeout=10)
-                # Source inherited file in new agent_args
                 self._ssh_run(
                     f'echo "source {job_workdir}/scripts/agent_args_inherited.tcl" > {shlex.quote(agent_args_tcl)}',
-                    timeout=10
+                    timeout=10,
                 )
-            
             params["tcl"] = agent_args_tcl
             params["_agent_args_inherited"] = f"{job_workdir}/scripts/agent_args_inherited.tcl"
-        
-        # Always use job-specific workdir
+
         params["workdir"] = job_workdir
-        
-        # Default script location - use stage-specific script from job directory
+
         default_script = f"{job_workdir}/scripts/{stage}.tcl"
         if not remote_tcl and not remote_cmd:
             remote_tcl = default_script
 
-        timeout_sec = int(params.get("timeout_sec", self._timeout_sec))
-
         if not remote_cmd:
             if not remote_tcl:
                 raise ValueError("Innovus stage requires params['tcl'] or params['command'].")
-            # Use job-specific workdir for execution with environment variables
             use_workdir = str(params.get("workdir", job_workdir)).strip()
-            # Pass environment variables for job isolation and stage chaining
-            # JOB_WORKDIR: job-specific workdir
-            # PREV_STAGE: previous stage name (for restore)
-            # CASE_DIR: base case directory (for initial DB restore)
-            # PREV_JOB_DIR: previous job's workdir (for direct restore without copy)
             env_vars = f"JOB_WORKDIR={shlex.quote(job_workdir)}"
             if prev_stage:
                 env_vars += f" PREV_STAGE={shlex.quote(prev_stage)}"
@@ -327,7 +339,6 @@ class InnovusBackend(AbstractEDABackend):
                 env_vars += f" CASE_DIR={shlex.quote(remote_workdir)}"
             prev_job_id = params.get("last_job_id", "")
             if prev_job_id:
-                # Pass previous job's directory for direct restore
                 env_vars += f" PREV_JOB_DIR={shlex.quote(remote_workdir)}/runs/{prev_job_id}"
             remote_cmd = (
                 f"cd {shlex.quote(use_workdir)} && "
@@ -335,20 +346,6 @@ class InnovusBackend(AbstractEDABackend):
                 f"{shlex.quote(self._innovus_bin)} "
                 f"-no_gui -overwrite -files {shlex.quote(remote_tcl)}"
             )
-
-        status = StageStatus.FAILED
-        error_message = ""
-        probe_ok, probe_msg = self._wait_for_connectivity()
-        # Use job-specific workdir for reports
-        use_workdir = str(params.get("workdir", job_workdir)).strip()
-        remote_rpt_dir = str(params.get("report_dir", "")).strip() or (
-            f"{use_workdir}/FPR/work/{stage}"
-        )
-        # Use isolated local report dir for each run to avoid pollution
-        local_report_dir = Path("/tmp/eda_agent/innovus") / design.name / stage / run_id / "reports"
-        if local_report_dir.exists():
-            shutil.rmtree(local_report_dir)
-        local_report_dir.mkdir(parents=True, exist_ok=True)
 
         probe_ok, probe_msg = self._wait_for_connectivity()
         if not probe_ok:
@@ -362,19 +359,23 @@ class InnovusBackend(AbstractEDABackend):
                 started_at=started_at,
                 finished_at=finished_at,
                 log_path=log_path,
-                report_dir=local_report_dir,
+                report_dir=Path("/tmp"),
                 params=params,
                 error_message=probe_msg,
             )
 
-        result = self._ssh_run(remote_cmd, timeout=timeout_sec)
-        # Ensure stdout/stderr are strings (defensive)
+        local_report_dir = Path("/tmp/eda_agent/innovus") / design.name / stage / run_id / "reports"
+        if local_report_dir.exists():
+            shutil.rmtree(local_report_dir)
+        local_report_dir.mkdir(parents=True, exist_ok=True)
+
+        remote_rpt_dir = str(params.get("report_dir", "")).strip() or f"{job_workdir}/FPR/work/{stage}"
+        result = self._ssh_run(remote_cmd, timeout=int(params.get("timeout_sec", self._timeout_sec)))
         stdout_str = result.stdout.decode() if isinstance(result.stdout, bytes) else (result.stdout or "")
         stderr_str = result.stderr.decode() if isinstance(result.stderr, bytes) else (result.stderr or "")
         log_path.write_text(stdout_str + stderr_str)
+        status = StageStatus.SUCCESS if result.returncode == 0 else StageStatus.FAILED
         if result.returncode == 0:
-            status = StageStatus.SUCCESS
-            # Copy reports from remote to local
             self._scp_copy(remote_rpt_dir, str(local_report_dir))
         else:
             error_message = f"Remote Innovus command failed with exit code {result.returncode}"
@@ -391,7 +392,7 @@ class InnovusBackend(AbstractEDABackend):
             log_path=log_path,
             report_dir=local_report_dir,
             params=params,
-            error_message=error_message,
+            error_message=error_message if result.returncode != 0 else "",
         )
 
     def collect_reports(self, result: RunResult) -> list[ReportFile]:
@@ -650,3 +651,362 @@ class InnovusBackend(AbstractEDABackend):
         if self._password:
             scp_cmd = ["sshpass", "-p", self._password] + scp_cmd
         subprocess.run(scp_cmd, capture_output=True, timeout=60)
+
+    # ── Local execution ─────────────────────────────────────────────────────────
+
+    def _local_run(self, cmd: str, timeout: int) -> subprocess.CompletedProcess[str]:
+        """Run *cmd* directly on the local machine (no SSH)."""
+        try:
+            return subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return subprocess.CompletedProcess(
+                args=[cmd],
+                returncode=255,
+                stdout=exc.stdout or "",
+                stderr=(exc.stderr or "") + "\nLocal command timed out",
+            )
+
+    def _wait_local_innovus(
+        self, job_id: str, timeout: int
+    ) -> subprocess.CompletedProcess[str]:
+        """Wait for a locally-launched Innovus process to complete.
+
+        For local mode this is a no-op because subprocess.run blocks.
+        For PBS/Slurm modes this polls the queue until the job finishes.
+        """
+        mode = settings.innovus_execution_mode
+        if mode == "pbs":
+            return self._wait_pbs_job(job_id, timeout)
+        if mode == "slurm":
+            return self._wait_slurm_job(job_id, timeout)
+        # local: no-op, caller already waited
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    # ── PBS/Torque job submission ───────────────────────────────────────────────
+
+    def _pbs_submit(self, script_path: str) -> tuple[str, str]:
+        """Submit *script_path* to PBS/Torque (qsub).
+
+        Returns (job_id, queue_name).
+        Raises RuntimeError on failure.
+        """
+        qsub_cmd = ["qsub"]
+        if settings.innovus_scheduler_queue:
+            qsub_cmd += ["-q", settings.innovus_scheduler_queue]
+        if settings.innovus_scheduler_account:
+            qsub_cmd += ["-A", settings.innovus_scheduler_account]
+        if settings.innovus_scheduler_extra:
+            qsub_cmd += settings.innovus_scheduler_extra.split()
+        qsub_cmd.append(script_path)
+
+        result = subprocess.run(
+            qsub_cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"qsub failed: {result.stderr.strip()}")
+        # PBS outputs "job_id.hostname\n"
+        job_id = result.stdout.strip().split("\n")[0].split(".")[0]
+        return job_id, settings.innovus_scheduler_queue or "default"
+
+    def _wait_pbs_job(self, job_id: str, timeout: int) -> subprocess.CompletedProcess[str]:
+        """Poll PBS job status until completion."""
+        start = time.monotonic()
+        while True:
+            check = subprocess.run(
+                ["qstat", job_id],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if check.returncode != 0:
+                # Job no longer listed – finished (success or failure)
+                break
+            if time.monotonic() - start > timeout:
+                subprocess.run(["qdel", job_id], capture_output=True, timeout=10)
+                return subprocess.CompletedProcess(
+                    args=["qdel", job_id],
+                    returncode=255,
+                    stdout="",
+                    stderr="PBS job timed out",
+                )
+            time.sleep(15)
+        # qstat returned non-zero → job is gone; get exit code via qacct
+        acct = subprocess.run(
+            ["qacct", "-j", job_id],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        exit_code = 0
+        if acct.returncode == 0:
+            for line in acct.stdout.splitlines():
+                if line.startswith("exit_status"):
+                    exit_code = int(line.split()[1])
+        return subprocess.CompletedProcess(
+            args=["qsub", job_id],
+            returncode=exit_code,
+            stdout="",
+            stderr="",
+        )
+
+    # ── Slurm job submission ───────────────────────────────────────────────────
+
+    def _slurm_submit(self, script_path: str) -> tuple[str, str]:
+        """Submit *script_path* to Slurm (sbatch).
+
+        Returns (job_id, partition_name).
+        Raises RuntimeError on failure.
+        """
+        sbatch_cmd = ["sbatch"]
+        if settings.innovus_scheduler_queue:
+            sbatch_cmd += ["--partition", settings.innovus_scheduler_queue]
+        if settings.innovus_scheduler_account:
+            sbatch_cmd += ["--account", settings.innovus_scheduler_account]
+        if settings.innovus_scheduler_extra:
+            sbatch_cmd += settings.innovus_scheduler_extra.split()
+        sbatch_cmd.append(script_path)
+
+        result = subprocess.run(
+            sbatch_cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"sbatch failed: {result.stderr.strip()}")
+        # sbatch outputs "Submitted batch job 12345\n"
+        job_id = result.stdout.strip().split()[-1]
+        return job_id, settings.innovus_scheduler_queue or "default"
+
+    def _wait_slurm_job(self, job_id: str, timeout: int) -> subprocess.CompletedProcess[str]:
+        """Poll Slurm job status until completion."""
+        start = time.monotonic()
+        while True:
+            check = subprocess.run(
+                ["squeue", "-j", job_id],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if check.returncode != 0 or job_id not in check.stdout:
+                # Job no longer in queue – finished
+                break
+            if time.monotonic() - start > timeout:
+                subprocess.run(["scancel", job_id], capture_output=True, timeout=10)
+                return subprocess.CompletedProcess(
+                    args=["scancel", job_id],
+                    returncode=255,
+                    stdout="",
+                    stderr="Slurm job timed out",
+                )
+            time.sleep(15)
+        # Job finished; get exit code from sacct
+        acct = subprocess.run(
+            ["sacct", "-j", job_id, "--format=ExitCode", "-n"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        exit_code = 0
+        if acct.returncode == 0 and acct.stdout.strip():
+            # First line is the job step, format: "0:0"
+            parts = acct.stdout.strip().split(":")
+            if len(parts) >= 2:
+                exit_code = int(parts[1])
+        return subprocess.CompletedProcess(
+            args=["sbatch", job_id],
+            returncode=exit_code,
+            stdout="",
+            stderr="",
+        )
+
+    # ── Execution-mode dispatcher ──────────────────────────────────────────────
+
+    def _dispatch(
+        self, stage: str, design: DesignSpec, params: dict[str, Any]
+    ) -> tuple[subprocess.CompletedProcess[str], str]:
+        """Run the Innovus stage using the configured execution mode.
+
+        Returns (result, workdir).  workdir is the directory where reports live.
+        """
+        mode = settings.innovus_execution_mode
+        if mode == "local":
+            return self._run_local(stage, design, params), self._local_workdir(stage, design, params)
+        if mode == "pbs":
+            return self._run_scheduler(stage, design, params, "pbs")
+        if mode == "slurm":
+            return self._run_scheduler(stage, design, params, "slurm")
+        # Default: SSH
+        return self._run_ssh(stage, design, params)
+
+    def _local_workdir(self, stage: str, design: DesignSpec, params: dict[str, Any]) -> str:
+        """Compute the local working directory for a run."""
+        base = settings.innovus_local_workdir / design.name
+        run_id = params.get("_run_id", str(uuid.uuid4()))
+        return str(base / stage / run_id)
+
+    def _build_innovus_cmd(
+        self, stage: str, design: DesignSpec, params: dict[str, Any], *, workdir: str
+    ) -> str:
+        """Build the raw Innovus Tcl-launcher command (without SSH wrapper)."""
+        remote_tcl = str(params.get("tcl", "")).strip()
+        remote_cmd = str(params.get("command", "")).strip()
+
+        stage_order = ["floorplan", "powerplan", "place", "prects", "cts", "postcts", "route", "postroute", "signoff"]
+        try:
+            stage_idx = stage_order.index(stage)
+            prev_stage = stage_order[stage_idx - 1] if stage_idx > 0 else ""
+        except ValueError:
+            prev_stage = ""
+
+        # agent_args.tcl in local mode lives under <workdir>/scripts/
+        if not remote_tcl and not remote_cmd:
+            remote_tcl = f"{workdir}/scripts/{stage}.tcl"
+
+        timeout_sec = int(params.get("timeout_sec", settings.innovus_timeout_sec))
+
+        if remote_cmd:
+            return remote_cmd
+
+        if not remote_tcl:
+            raise ValueError("Innovus stage requires params['tcl'] or params['command']")
+
+        env_vars = f"JOB_WORKDIR={shlex.quote(workdir)}"
+        if prev_stage:
+            env_vars += f" PREV_STAGE={shlex.quote(prev_stage)}"
+        prev_job_id = params.get("last_job_id", "")
+        if prev_job_id:
+            env_vars += f" PREV_JOB_DIR={shlex.quote(str(settings.innovus_local_workdir / design.name / prev_job_id))}"
+
+        return (
+            f"cd {shlex.quote(workdir)} && "
+            f"export {env_vars} && "
+            f"{shlex.quote(settings.innovus_bin)} "
+            f"-no_gui -overwrite -files {shlex.quote(remote_tcl)}"
+        )
+
+    def _run_local(self, stage: str, design: DesignSpec, params: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+        """Execute Innovus locally (no SSH)."""
+        run_id = params.get("_run_id", str(uuid.uuid4()))
+        workdir = self._local_workdir(stage, design, params)
+
+        # Create workdir tree
+        Path(workdir).mkdir(parents=True, exist_ok=True)
+        (Path(workdir) / "scripts").mkdir(exist_ok=True)
+        (Path(workdir) / "FPR" / "work").mkdir(parents=True, exist_ok=True)
+
+        # Copy TCL scripts from the backend's scripts/ directory
+        backend_scripts = Path(__file__).parent / "scripts" / "innovus"
+        if backend_scripts.exists():
+            for tcl in backend_scripts.glob("*.tcl"):
+                if tcl.name not in ("agent_args_template.tcl",):
+                    shutil.copy2(tcl, Path(workdir) / "scripts" / tcl.name)
+
+        cmd = self._build_innovus_cmd(stage, design, params, workdir=workdir)
+        timeout_sec = int(params.get("timeout_sec", settings.innovus_timeout_sec))
+        return self._local_run(cmd, timeout=timeout_sec)
+
+    def _run_ssh(self, stage: str, design: DesignSpec, params: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+        """Execute Innovus via SSH (legacy path)."""
+        remote_tcl = str(params.get("tcl", "")).strip()
+        remote_cmd = str(params.get("command", "")).strip()
+        use_workdir = str(params.get("workdir", self._workdir)).strip()
+
+        stage_order = ["floorplan", "powerplan", "place", "prects", "cts", "postcts", "route", "postroute", "signoff"]
+        try:
+            stage_idx = stage_order.index(stage)
+            prev_stage = stage_order[stage_idx - 1] if stage_idx > 0 else ""
+        except ValueError:
+            prev_stage = ""
+
+        if not remote_cmd:
+            if not remote_tcl:
+                raise ValueError("Innovus stage requires params['tcl'] or params['command']")
+            timeout_sec = int(params.get("timeout_sec", self._timeout_sec))
+            env_vars = f"JOB_WORKDIR={shlex.quote(use_workdir)}"
+            if prev_stage:
+                env_vars += f" PREV_STAGE={shlex.quote(prev_stage)}"
+            remote_cmd = (
+                f"cd {shlex.quote(use_workdir)} && "
+                f"export {env_vars} && "
+                f"{shlex.quote(self._innovus_bin)} "
+                f"-no_gui -overwrite -files {shlex.quote(remote_tcl)}"
+            )
+
+        timeout_sec = int(params.get("timeout_sec", self._timeout_sec))
+        return self._ssh_run(remote_cmd, timeout=timeout_sec)
+
+    def _run_scheduler(
+        self, stage: str, design: DesignSpec, params: dict[str, Any], scheduler: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute Innovus via PBS or Slurm job submission.
+
+        Generates a wrapper shell script, submits it, then polls until done.
+        """
+        run_id = params.get("_run_id", str(uuid.uuid4()))
+        workdir = self._local_workdir(stage, design, params)
+        Path(workdir).mkdir(parents=True, exist_ok=True)
+        (Path(workdir) / "scripts").mkdir(exist_ok=True)
+
+        cmd = self._build_innovus_cmd(stage, design, params, workdir=workdir)
+
+        # Write wrapper script
+        if scheduler == "pbs":
+            script = self._pbs_wrapper_script(workdir, cmd)
+        else:
+            script = self._slurm_wrapper_script(workdir, cmd)
+
+        script_path = Path(workdir) / f"submit.{scheduler}"
+        script_path.write_text(script, encoding="utf-8")
+        os.chmod(script_path, 0o755)
+
+        if scheduler == "pbs":
+            job_id, _ = self._pbs_submit(str(script_path))
+        else:
+            job_id, _ = self._slurm_submit(str(script_path))
+
+        timeout_sec = int(params.get("timeout_sec", settings.innovus_timeout_sec))
+        # _wait_<scheduler>_job polls until the job completes
+        return self._wait_local_innovus(job_id, timeout=timeout_sec)
+
+    def _pbs_wrapper_script(self, workdir: str, cmd: str) -> str:
+        q = settings.innovus_scheduler_queue or "default"
+        a = settings.innovus_scheduler_account or ""
+        extra = f"#PBS -A {a}" if a else ""
+        lines = [
+            "#!/bin/bash",
+            f"#PBS -N eda_innovus",
+            f"#PBS -q {q}",
+            extra,
+            f"#PBS -o {workdir}/pbs.stdout.txt",
+            f"#PBS -e {workdir}/pbs.stderr.txt",
+            "",
+            f"cd {workdir}",
+            cmd,
+        ]
+        return "\n".join(lines)
+
+    def _slurm_wrapper_script(self, workdir: str, cmd: str) -> str:
+        p = settings.innovus_scheduler_queue or ""
+        a = settings.innovus_scheduler_account or ""
+        lines = [
+            "#!/bin/bash",
+            f"#SBATCH --job-name=eda_innovus",
+            f"#SBATCH --partition={p}" if p else "",
+            f"#SBATCH --account={a}" if a else "",
+            f"#SBATCH --output={workdir}/slurm_%j.out",
+            f"#SBATCH --error={workdir}/slurm_%j.err",
+            "",
+            f"cd {workdir}",
+            cmd,
+        ]
+        return "\n".join(lines)
