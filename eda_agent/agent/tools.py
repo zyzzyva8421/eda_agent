@@ -13,7 +13,7 @@ job_status         – check async job status
 job_logs           – fetch logs from an async job
 cancel_job         – cancel a pending async job
 query_timing        – query timing metrics from the DB
-query_congestion    – spatial congestion query via PostGIS
+query_congestion    – spatial congestion query (WKT bbox filtering)
 query_utilization   – query cell area / utilization metrics from the DB
 query_power        – query power breakdown metrics from the DB
 compare_runs       – diff PPA between two runs
@@ -1130,36 +1130,30 @@ def _query_congestion(
     y2: float | None = None,
 ) -> list[dict[str, Any]]:
     with get_db() as db:
-        if all(v is not None for v in [x1, y1, x2, y2]):
-            bbox_wkt = f"POLYGON(({x1} {y1},{x2} {y1},{x2} {y2},{x1} {y2},{x1} {y1}))"
-            rows = db.execute(
-                text(
-                    """
-                    SELECT id, run_id, overflow, layer,
-                           ST_AsText(geom) AS geom_wkt
-                    FROM congestion_hotspots
-                    WHERE run_id = :run_id
-                      AND ST_Intersects(geom, ST_GeomFromText(:bbox, 0))
-                    ORDER BY overflow DESC
-                    """
-                ),
-                {"run_id": run_id, "bbox": bbox_wkt},
-            ).mappings().fetchall()
-        else:
-            rows = db.execute(
-                text(
-                    """
-                    SELECT id, run_id, overflow, layer,
-                           ST_AsText(geom) AS geom_wkt
-                    FROM congestion_hotspots
-                    WHERE run_id = :run_id
-                    ORDER BY overflow DESC
-                    LIMIT 20
-                    """
-                ),
-                {"run_id": run_id},
-            ).mappings().fetchall()
-    return [dict(r) for r in rows]
+        rows = db.execute(
+            text(
+                """
+                SELECT id, run_id, overflow, layer, geom_wkt
+                FROM congestion_hotspots
+                WHERE run_id = :run_id
+                ORDER BY overflow DESC
+                LIMIT 100
+                """
+            ),
+            {"run_id": run_id},
+        ).mappings().fetchall()
+    result = [dict(r) for r in rows]
+    if all(v is not None for v in [x1, y1, x2, y2]):
+        def _intersects(row: dict[str, Any]) -> bool:
+            bbox = _bbox_from_wkt(row.get("geom_wkt") or "")
+            if bbox is None:
+                return False
+            rx1, ry1, rx2, ry2 = bbox
+            return rx1 < x2 and rx2 > x1 and ry1 < y2 and ry2 > y1  # type: ignore[operator]
+        result = [r for r in result if _intersects(r)][:20]
+    else:
+        result = result[:20]
+    return result
 
 
 def _query_congestion_summary(run_id: int) -> dict[str, Any]:
@@ -2816,8 +2810,8 @@ def _ingest_records(records: list[dict], run_id: int, stage: str) -> None:
                 db.execute(
                     text(
                         "INSERT INTO congestion_hotspots "
-                        "(run_id, geom, overflow) "
-                        "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow)"
+                        "(run_id, geom_wkt, overflow) "
+                        "VALUES (:run_id, :wkt, :overflow)"
                     ),
                     {
                         "run_id": run_id,
@@ -2833,8 +2827,8 @@ def _ingest_records(records: list[dict], run_id: int, stage: str) -> None:
                 db.execute(
                     text(
                         "INSERT INTO congestion_hotspots "
-                        "(run_id, geom, overflow, layer) "
-                        "VALUES (:run_id, ST_GeomFromText(:wkt, 0), :overflow, :layer)"
+                        "(run_id, geom_wkt, overflow, layer) "
+                        "VALUES (:run_id, :wkt, :overflow, :layer)"
                     ),
                     {
                         "run_id": run_id,

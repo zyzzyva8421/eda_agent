@@ -113,8 +113,7 @@ def archive_run(run_id: int, archive_dir: Path | None = None) -> dict[str, Path]
         written["congestion_hotspots"] = _write(
             "congestion_hotspots",
             """
-            SELECT id, run_id, overflow, layer, created_at,
-                   ST_AsText(geom) AS geom_wkt
+            SELECT id, run_id, overflow, layer, created_at, geom_wkt
             FROM congestion_hotspots
             WHERE run_id = :run_id
             """,

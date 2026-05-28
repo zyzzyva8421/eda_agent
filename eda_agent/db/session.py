@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from eda_agent.config import settings
@@ -29,10 +29,7 @@ def get_engine():
 
 
 def create_all_tables() -> None:
-    """Create all tables (and PostGIS extension) in the database."""
-    with _engine.connect() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
-        conn.commit()
+    """Create all tables in the database."""
     Base.metadata.create_all(bind=_engine)
 
 

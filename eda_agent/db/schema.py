@@ -7,7 +7,7 @@ designs            – RTL design metadata
 runs               – individual flow stage executions
 timing_summary     – per-run WNS / TNS / FEP summary
 timing_paths       – individual violated timing paths
-congestion_hotspots – spatial congestion hotspot polygons (PostGIS)
+congestion_hotspots – congestion hotspot polygons stored as WKT text
 utilization_summary – per-run design area and cell utilisation
 power_summary      – per-run power breakdown
 drc_violations     – per-run DRC violation records
@@ -18,13 +18,13 @@ rule_weights           – per-rule score multipliers for Phase B feedback learn
 case_memory        – persisted resolved debugging cases
 
 All spatial columns use SRID 0 (unitless chip-coordinate space).
+Geometry data is stored as WKT text strings; no PostGIS extension is required.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 
-from geoalchemy2 import Geometry
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -220,7 +220,7 @@ class TimingPath(Base):
 # ── congestion_hotspots ───────────────────────────────────────────────────────
 
 class CongestionHotspot(Base):
-    """Spatial congestion hotspot polygon (PostGIS, SRID=0)."""
+    """Spatial congestion hotspot polygon stored as WKT text (SRID=0)."""
 
     __tablename__ = "congestion_hotspots"
 
@@ -228,9 +228,7 @@ class CongestionHotspot(Base):
     run_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
     )
-    geom: Mapped[object] = mapped_column(
-        Geometry(geometry_type="POLYGON", srid=0), nullable=False
-    )
+    geom_wkt: Mapped[str] = mapped_column(Text, nullable=False, default="")
     overflow: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     layer: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
@@ -241,12 +239,6 @@ class CongestionHotspot(Base):
 
     __table_args__ = (
         Index("ix_congestion_hotspots_run_id", "run_id"),
-        # PostGIS spatial index
-        Index(
-            "ix_congestion_hotspots_geom",
-            "geom",
-            postgresql_using="gist",
-        ),
     )
 
 

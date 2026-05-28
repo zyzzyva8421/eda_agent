@@ -11,7 +11,6 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
-from geoalchemy2 import Geometry
 
 revision: str = "0001"
 down_revision: Union[str, None] = None
@@ -20,9 +19,6 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Enable PostGIS extension (idempotent)
-    op.execute("CREATE EXTENSION IF NOT EXISTS postgis")
-
     op.create_table(
         "backends",
         sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
@@ -154,7 +150,7 @@ def upgrade() -> None:
             sa.ForeignKey("runs.id", ondelete="CASCADE"),
             nullable=False,
         ),
-        sa.Column("geom", Geometry(geometry_type="POLYGON", srid=0), nullable=False),
+        sa.Column("geom_wkt", sa.Text, nullable=False, server_default=""),
         sa.Column("overflow", sa.Integer, nullable=False, server_default="0"),
         sa.Column("layer", sa.String(64)),
         sa.Column(
@@ -164,12 +160,6 @@ def upgrade() -> None:
         ),
     )
     op.create_index("ix_congestion_hotspots_run_id", "congestion_hotspots", ["run_id"])
-    op.create_index(
-        "ix_congestion_hotspots_geom",
-        "congestion_hotspots",
-        ["geom"],
-        postgresql_using="gist",
-    )
 
     op.create_table(
         "artifacts",
