@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from eda_agent.config import settings
 from eda_agent.db.schema import Base
+
+logger = logging.getLogger(__name__)
 
 _engine = create_engine(
     settings.database_url,
@@ -28,8 +31,35 @@ def get_engine():
     return _engine
 
 
+def _enable_postgis_if_available() -> None:
+    """Enable PostGIS extension when running on PostgreSQL with extension available."""
+    if _engine.dialect.name != "postgresql":
+        return
+
+    with _engine.connect() as conn:
+        is_available = conn.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_available_extensions
+                    WHERE name = 'postgis'
+                )
+                """
+            )
+        ).scalar_one()
+
+        if not is_available:
+            logger.info("PostGIS extension is not available on this PostgreSQL instance.")
+            return
+
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        conn.commit()
+
+
 def create_all_tables() -> None:
     """Create all tables in the database."""
+    _enable_postgis_if_available()
     Base.metadata.create_all(bind=_engine)
 
 
