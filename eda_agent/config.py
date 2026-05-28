@@ -78,10 +78,11 @@ class Settings(BaseSettings):
     innovus_ssh_probe_timeout_sec: int = Field(default=8)
 
     # ── Innovus execution mode ────────────────────────────────────────────────
-    # "ssh"        – execute Innovus on a remote host via SSH (default, legacy)
-    # "local"      – execute Innovus directly on the local machine
-    # "pbs"        – submit to PBS/Torque queue via qsub
-    # "slurm"      – submit to Slurm queue via sbatch
+    # "ssh"   – execute Innovus on a remote host via SSH (default, legacy)
+    # "local" – execute Innovus directly on the local machine
+    # "pbs"   – submit to PBS/Torque queue via qsub
+    # "slurm" – submit to Slurm queue via sbatch
+    # "bsub"  – submit to LSF queue via bsub -Is -XF (blocks until done)
     innovus_execution_mode: str = Field(default="ssh")
     # Local work directory (used when execution_mode == "local")
     innovus_local_workdir: Path = Field(default_factory=lambda: Path("/tmp/eda_agent/innovus"))

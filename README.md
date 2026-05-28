@@ -329,6 +329,21 @@ INNOVUS_SCHEDULER_EXTRA=--nodes=1 --ntasks-per-node=8
 
 A shell wrapper script is written to `<workdir>/submit.slurm`, then submitted with `sbatch`. The agent polls `squeue -j <job_id>` every 15 s until the job disappears from the queue, then fetches the exit code via `sacct`. Output files land in `slurm_<job_id>.out` / `slurm_<job_id>.err` under the workdir.
 
+### LSF / bsub (IBM Platform LSF)
+
+```env
+INNOVUS_EXECUTION_MODE=bsub
+INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
+INNOVUS_LOCAL_WORKDIR=/tmp/eda_agent/innovus
+INNOVUS_SCHEDULER_QUEUE=eda_queue
+INNOVUS_SCHEDULER_ACCOUNT=my_project
+INNOVUS_SCHEDULER_EXTRA=-R "rusage[mem=8192]"   # optional LSF resource string
+```
+
+The full Innovus command is passed directly to `bsub -q <queue> -Is -XF <cmd>`. The `-Is -XF` flags allocate a pseudo-TTY and enable X11 forwarding, which is the standard way to run Cadence tools under LSF. The `bsub` call blocks until the job finishes, so the agent waits synchronously and captures the exit code directly. No wrapper script is written.
+
+> **Note:** LSF exit code retrieval via `bacct`/`bjobs` is not implemented; the assumed behaviour is that `bsub` returns only after the job completes and propagates the underlying process exit code as its own.
+
 ## Phase roadmap
 
 | Phase | Goal |

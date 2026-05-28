@@ -675,16 +675,18 @@ class InnovusBackend(AbstractEDABackend):
     def _wait_local_innovus(
         self, job_id: str, timeout: int
     ) -> subprocess.CompletedProcess[str]:
-        """Wait for a locally-launched Innovus process to complete.
+        """Wait for a queued Innovus job to finish.
 
         For local mode this is a no-op because subprocess.run blocks.
-        For PBS/Slurm modes this polls the queue until the job finishes.
+        For PBS/Slurm/BSUB modes this polls the queue until the job finishes.
         """
         mode = settings.innovus_execution_mode
         if mode == "pbs":
             return self._wait_pbs_job(job_id, timeout)
         if mode == "slurm":
             return self._wait_slurm_job(job_id, timeout)
+        if mode == "bsub":
+            return self._wait_bsub_job(job_id, timeout)
         # local: no-op, caller already waited
         return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
 
@@ -829,6 +831,66 @@ class InnovusBackend(AbstractEDABackend):
             stderr="",
         )
 
+    # ── LSF / bsub job submission ───────────────────────────────────────────────
+
+    def _bsub_submit(self, cmd: str) -> tuple[str, str]:
+        """Submit *cmd* to LSF via ``bsub``.
+
+        Unlike PBS/Slurm which write a wrapper script, LSF is typically used
+        with an inline command string plus ``-Is`` (interactive allocate) or
+        ``-XF`` (X11 forwarding) flags so the job runs pseudo-interactively
+        with a PTY.  The ``-q`` queue name is required; everything else comes
+        from ``innovus_scheduler_extra``.
+
+        Returns (job_id, queue_name).
+        Raises RuntimeError on failure.
+        """
+        bsub_cmd = ["bsub"]
+        if settings.innovus_scheduler_queue:
+            bsub_cmd += ["-q", settings.innovus_scheduler_queue]
+        # Common LSF flags for EDA tools:
+        #   -Is   interactive allocate (pseudo-terminal, blocks until done)
+        #   -XF   X11 forwarding (for GUI tools like Innovus)
+        #   -R    resource requirements string
+        bsub_cmd += ["-Is", "-XF"]
+        if settings.innovus_scheduler_extra:
+            bsub_cmd += settings.innovus_scheduler_extra.split()
+        if settings.innovus_scheduler_account:
+            bsub_cmd += ["-P", settings.innovus_scheduler_account]
+        bsub_cmd += [cmd]
+
+        result = subprocess.run(
+            bsub_cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"bsub failed: {result.stderr.strip()}")
+        # bsub stdout: "Job <12345> is submitted to queue <queuename>.\n"
+        import re
+        m = re.search(r"Job <(\d+)> is submitted to queue <([^>]+)>", result.stdout)
+        if not m:
+            raise RuntimeError(f"Unexpected bsub output: {result.stdout.strip()}")
+        job_id = m.group(1)
+        queue_name = m.group(2)
+        return job_id, queue_name
+
+    def _wait_bsub_job(self, job_id: str, timeout: int) -> subprocess.CompletedProcess[str]:
+        """BSUB ``-Is`` mode blocks the shell until the job completes.
+
+        Since we already waited synchronously inside ``_bsub_submit`` (the
+        subprocess call does not return until the job finishes), this method
+        is a no-op passthrough that returns success.  It exists only for
+        API consistency with PBS/Slurm.
+        """
+        return subprocess.CompletedProcess(
+            args=["bsub", job_id],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
     # ── Execution-mode dispatcher ──────────────────────────────────────────────
 
     def _dispatch(
@@ -845,6 +907,8 @@ class InnovusBackend(AbstractEDABackend):
             return self._run_scheduler(stage, design, params, "pbs")
         if mode == "slurm":
             return self._run_scheduler(stage, design, params, "slurm")
+        if mode == "bsub":
+            return self._run_bsub(stage, design, params)
         # Default: SSH
         return self._run_ssh(stage, design, params)
 
@@ -977,6 +1041,33 @@ class InnovusBackend(AbstractEDABackend):
         timeout_sec = int(params.get("timeout_sec", settings.innovus_timeout_sec))
         # _wait_<scheduler>_job polls until the job completes
         return self._wait_local_innovus(job_id, timeout=timeout_sec)
+
+    def _run_bsub(self, stage: str, design: DesignSpec, params: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+        """Execute Innovus via LSF ``bsub -Is -XF``.
+
+        Unlike PBS/Slurm which write a wrapper script, ``bsub`` is called
+        directly with the full Innovus command line.  The ``-Is`` flag makes
+        bsub block until the job completes, so this method waits synchronously
+        and returns the exit code of the Innovus process.
+        """
+        run_id = params.get("_run_id", str(uuid.uuid4()))
+        workdir = self._local_workdir(stage, design, params)
+        Path(workdir).mkdir(parents=True, exist_ok=True)
+        (Path(workdir) / "scripts").mkdir(exist_ok=True)
+
+        # Copy bundled TCL scripts into workdir/scripts/
+        backend_scripts = Path(__file__).parent / "scripts" / "innovus"
+        if backend_scripts.exists():
+            for tcl in backend_scripts.glob("*.tcl"):
+                if tcl.name.startswith("agent_args"):
+                    continue
+                shutil.copy2(tcl, Path(workdir) / "scripts" / tcl.name)
+
+        cmd = self._build_innovus_cmd(stage, design, params, workdir=workdir)
+
+        timeout_sec = int(params.get("timeout_sec", settings.innovus_timeout_sec))
+        # _bsub_submit blocks until the job finishes, returning exit code
+        return self._bsub_submit(cmd)
 
     def _pbs_wrapper_script(self, workdir: str, cmd: str) -> str:
         q = settings.innovus_scheduler_queue or "default"
