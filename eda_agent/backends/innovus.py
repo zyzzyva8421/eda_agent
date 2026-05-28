@@ -192,7 +192,7 @@ class InnovusBackend(AbstractEDABackend):
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = logs_dir / f"{run_id}.log"
 
-        # ── Local / PBS / Slurm: set up workdir locally ───────────────────────
+        # local/bsub: set up workdir locally
         if mode != "ssh":
             local_workdir = self._local_workdir(stage, design, params)
             Path(local_workdir).mkdir(parents=True, exist_ok=True)
@@ -678,158 +678,13 @@ class InnovusBackend(AbstractEDABackend):
         """Wait for a queued Innovus job to finish.
 
         For local mode this is a no-op because subprocess.run blocks.
-        For PBS/Slurm/BSUB modes this polls the queue until the job finishes.
+        For bsub mode the job already completed before this returns.
         """
         mode = settings.innovus_execution_mode
-        if mode == "pbs":
-            return self._wait_pbs_job(job_id, timeout)
-        if mode == "slurm":
-            return self._wait_slurm_job(job_id, timeout)
         if mode == "bsub":
             return self._wait_bsub_job(job_id, timeout)
         # local: no-op, caller already waited
         return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-
-    # ── PBS/Torque job submission ───────────────────────────────────────────────
-
-    def _pbs_submit(self, script_path: str) -> tuple[str, str]:
-        """Submit *script_path* to PBS/Torque (qsub).
-
-        Returns (job_id, queue_name).
-        Raises RuntimeError on failure.
-        """
-        qsub_cmd = ["qsub"]
-        if settings.innovus_scheduler_queue:
-            qsub_cmd += ["-q", settings.innovus_scheduler_queue]
-        if settings.innovus_scheduler_account:
-            qsub_cmd += ["-A", settings.innovus_scheduler_account]
-        if settings.innovus_scheduler_extra:
-            qsub_cmd += settings.innovus_scheduler_extra.split()
-        qsub_cmd.append(script_path)
-
-        result = subprocess.run(
-            qsub_cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"qsub failed: {result.stderr.strip()}")
-        # PBS outputs "job_id.hostname\n"
-        job_id = result.stdout.strip().split("\n")[0].split(".")[0]
-        return job_id, settings.innovus_scheduler_queue or "default"
-
-    def _wait_pbs_job(self, job_id: str, timeout: int) -> subprocess.CompletedProcess[str]:
-        """Poll PBS job status until completion."""
-        start = time.monotonic()
-        while True:
-            check = subprocess.run(
-                ["qstat", job_id],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if check.returncode != 0:
-                # Job no longer listed – finished (success or failure)
-                break
-            if time.monotonic() - start > timeout:
-                subprocess.run(["qdel", job_id], capture_output=True, timeout=10)
-                return subprocess.CompletedProcess(
-                    args=["qdel", job_id],
-                    returncode=255,
-                    stdout="",
-                    stderr="PBS job timed out",
-                )
-            time.sleep(15)
-        # qstat returned non-zero → job is gone; get exit code via qacct
-        acct = subprocess.run(
-            ["qacct", "-j", job_id],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        exit_code = 0
-        if acct.returncode == 0:
-            for line in acct.stdout.splitlines():
-                if line.startswith("exit_status"):
-                    exit_code = int(line.split()[1])
-        return subprocess.CompletedProcess(
-            args=["qsub", job_id],
-            returncode=exit_code,
-            stdout="",
-            stderr="",
-        )
-
-    # ── Slurm job submission ───────────────────────────────────────────────────
-
-    def _slurm_submit(self, script_path: str) -> tuple[str, str]:
-        """Submit *script_path* to Slurm (sbatch).
-
-        Returns (job_id, partition_name).
-        Raises RuntimeError on failure.
-        """
-        sbatch_cmd = ["sbatch"]
-        if settings.innovus_scheduler_queue:
-            sbatch_cmd += ["--partition", settings.innovus_scheduler_queue]
-        if settings.innovus_scheduler_account:
-            sbatch_cmd += ["--account", settings.innovus_scheduler_account]
-        if settings.innovus_scheduler_extra:
-            sbatch_cmd += settings.innovus_scheduler_extra.split()
-        sbatch_cmd.append(script_path)
-
-        result = subprocess.run(
-            sbatch_cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"sbatch failed: {result.stderr.strip()}")
-        # sbatch outputs "Submitted batch job 12345\n"
-        job_id = result.stdout.strip().split()[-1]
-        return job_id, settings.innovus_scheduler_queue or "default"
-
-    def _wait_slurm_job(self, job_id: str, timeout: int) -> subprocess.CompletedProcess[str]:
-        """Poll Slurm job status until completion."""
-        start = time.monotonic()
-        while True:
-            check = subprocess.run(
-                ["squeue", "-j", job_id],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if check.returncode != 0 or job_id not in check.stdout:
-                # Job no longer in queue – finished
-                break
-            if time.monotonic() - start > timeout:
-                subprocess.run(["scancel", job_id], capture_output=True, timeout=10)
-                return subprocess.CompletedProcess(
-                    args=["scancel", job_id],
-                    returncode=255,
-                    stdout="",
-                    stderr="Slurm job timed out",
-                )
-            time.sleep(15)
-        # Job finished; get exit code from sacct
-        acct = subprocess.run(
-            ["sacct", "-j", job_id, "--format=ExitCode", "-n"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        exit_code = 0
-        if acct.returncode == 0 and acct.stdout.strip():
-            # First line is the job step, format: "0:0"
-            parts = acct.stdout.strip().split(":")
-            if len(parts) >= 2:
-                exit_code = int(parts[1])
-        return subprocess.CompletedProcess(
-            args=["sbatch", job_id],
-            returncode=exit_code,
-            stdout="",
-            stderr="",
-        )
 
     # ── LSF / bsub job submission ───────────────────────────────────────────────
 
@@ -903,10 +758,7 @@ class InnovusBackend(AbstractEDABackend):
         mode = settings.innovus_execution_mode
         if mode == "local":
             return self._run_local(stage, design, params), self._local_workdir(stage, design, params)
-        if mode == "pbs":
-            return self._run_scheduler(stage, design, params, "pbs")
-        if mode == "slurm":
-            return self._run_scheduler(stage, design, params, "slurm")
+        # local/bsub: set up workdir locally
         if mode == "bsub":
             return self._run_bsub(stage, design, params)
         # Default: SSH
@@ -1009,39 +861,6 @@ class InnovusBackend(AbstractEDABackend):
         timeout_sec = int(params.get("timeout_sec", self._timeout_sec))
         return self._ssh_run(remote_cmd, timeout=timeout_sec)
 
-    def _run_scheduler(
-        self, stage: str, design: DesignSpec, params: dict[str, Any], scheduler: str
-    ) -> subprocess.CompletedProcess[str]:
-        """Execute Innovus via PBS or Slurm job submission.
-
-        Generates a wrapper shell script, submits it, then polls until done.
-        """
-        run_id = params.get("_run_id", str(uuid.uuid4()))
-        workdir = self._local_workdir(stage, design, params)
-        Path(workdir).mkdir(parents=True, exist_ok=True)
-        (Path(workdir) / "scripts").mkdir(exist_ok=True)
-
-        cmd = self._build_innovus_cmd(stage, design, params, workdir=workdir)
-
-        # Write wrapper script
-        if scheduler == "pbs":
-            script = self._pbs_wrapper_script(workdir, cmd)
-        else:
-            script = self._slurm_wrapper_script(workdir, cmd)
-
-        script_path = Path(workdir) / f"submit.{scheduler}"
-        script_path.write_text(script, encoding="utf-8")
-        os.chmod(script_path, 0o755)
-
-        if scheduler == "pbs":
-            job_id, _ = self._pbs_submit(str(script_path))
-        else:
-            job_id, _ = self._slurm_submit(str(script_path))
-
-        timeout_sec = int(params.get("timeout_sec", settings.innovus_timeout_sec))
-        # _wait_<scheduler>_job polls until the job completes
-        return self._wait_local_innovus(job_id, timeout=timeout_sec)
-
     def _run_bsub(self, stage: str, design: DesignSpec, params: dict[str, Any]) -> subprocess.CompletedProcess[str]:
         """Execute Innovus via LSF ``bsub -Is -XF``.
 
@@ -1068,36 +887,3 @@ class InnovusBackend(AbstractEDABackend):
         timeout_sec = int(params.get("timeout_sec", settings.innovus_timeout_sec))
         # _bsub_submit blocks until the job finishes, returning exit code
         return self._bsub_submit(cmd)
-
-    def _pbs_wrapper_script(self, workdir: str, cmd: str) -> str:
-        q = settings.innovus_scheduler_queue or "default"
-        a = settings.innovus_scheduler_account or ""
-        extra = f"#PBS -A {a}" if a else ""
-        lines = [
-            "#!/bin/bash",
-            f"#PBS -N eda_innovus",
-            f"#PBS -q {q}",
-            extra,
-            f"#PBS -o {workdir}/pbs.stdout.txt",
-            f"#PBS -e {workdir}/pbs.stderr.txt",
-            "",
-            f"cd {workdir}",
-            cmd,
-        ]
-        return "\n".join(lines)
-
-    def _slurm_wrapper_script(self, workdir: str, cmd: str) -> str:
-        p = settings.innovus_scheduler_queue or ""
-        a = settings.innovus_scheduler_account or ""
-        lines = [
-            "#!/bin/bash",
-            f"#SBATCH --job-name=eda_innovus",
-            f"#SBATCH --partition={p}" if p else "",
-            f"#SBATCH --account={a}" if a else "",
-            f"#SBATCH --output={workdir}/slurm_%j.out",
-            f"#SBATCH --error={workdir}/slurm_%j.err",
-            "",
-            f"cd {workdir}",
-            cmd,
-        ]
-        return "\n".join(lines)

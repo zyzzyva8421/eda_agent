@@ -78,18 +78,16 @@ class Settings(BaseSettings):
     innovus_ssh_probe_timeout_sec: int = Field(default=8)
 
     # ── Innovus execution mode ────────────────────────────────────────────────
-    # "ssh"   – execute Innovus on a remote host via SSH (default, legacy)
+    # "ssh"   – execute Innovus on a remote host via SSH (default)
     # "local" – execute Innovus directly on the local machine
-    # "pbs"   – submit to PBS/Torque queue via qsub
-    # "slurm" – submit to Slurm queue via sbatch
     # "bsub"  – submit to LSF queue via bsub -Is -XF (blocks until done)
     innovus_execution_mode: str = Field(default="ssh")
-    # Local work directory (used when execution_mode == "local")
+    # Local work directory (used when execution_mode == "local" or "bsub")
     innovus_local_workdir: Path = Field(default_factory=lambda: Path("/tmp/eda_agent/innovus"))
-    # Scheduler settings (used when execution_mode == "pbs" or "slurm")
+    # Scheduler settings (used when execution_mode == "bsub")
     innovus_scheduler_queue: str = Field(default="")
     innovus_scheduler_account: str = Field(default="")
-    innovus_scheduler_extra: str = Field(default="")  # extra qsub/sbatch args raw string
+    innovus_scheduler_extra: str = Field(default="")  # extra bsub args raw string
 
     # ── Parquet archive ───────────────────────────────────────────────────────
     parquet_archive_dir: Path = Field(default=Path("/data/archive"))

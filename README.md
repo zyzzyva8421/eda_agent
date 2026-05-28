@@ -278,9 +278,9 @@ LIMIT 20;
 
 ## Innovus execution modes
 
-The Innovus backend supports four execution modes, controlled by `INNOVUS_EXECUTION_MODE`:
+The Innovus backend supports three execution modes, controlled by `INNOVUS_EXECUTION_MODE`:
 
-### SSH (default, legacy)
+### SSH (default)
 
 ```env
 INNOVUS_EXECUTION_MODE=ssh
@@ -291,7 +291,7 @@ INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
 INNOVUS_REMOTE_WORKDIR=/home/eda_user/innovus_work
 ```
 
-Commands run over SSH on the remote host; reports are copied back via SCP. This is the original behaviour and requires no additional configuration beyond SSH credentials.
+Commands run over SSH on the remote host; reports are copied back via SCP.
 
 ### Local (direct execution)
 
@@ -301,33 +301,7 @@ INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
 INNOVUS_LOCAL_WORKDIR=/tmp/eda_agent/innovus
 ```
 
-Innovus runs on the local machine via `subprocess`. TCL scripts from `eda_agent/backends/scripts/innovus/` are copied into a per-run working directory under `INNOVUS_LOCAL_WORKDIR`. No SCP is needed — reports are read directly from the local workdir.
-
-### PBS/Torque job queue
-
-```env
-INNOVUS_EXECUTION_MODE=pbs
-INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
-INNOVUS_LOCAL_WORKDIR=/tmp/eda_agent/innovus
-INNOVUS_SCHEDULER_QUEUE=default_queue
-INNOVUS_SCHEDULER_ACCOUNT=my_project
-INNOVUS_SCHEDULER_EXTRA=-l nodes=1:ppn=8
-```
-
-A shell wrapper script is written to `<workdir>/submit.pbs`, then submitted with `qsub`. The agent polls `qstat` every 15 s until the job exits, then fetches the exit code via `qacct`. Stdout/stderr land in `pbs.stdout.txt` / `pbs.stderr.txt` under the workdir.
-
-### Slurm job queue
-
-```env
-INNOVUS_EXECUTION_MODE=slurm
-INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
-INNOVUS_LOCAL_WORKDIR=/tmp/eda_agent/innovus
-INNOVUS_SCHEDULER_QUEUE=compute
-INNOVUS_SCHEDULER_ACCOUNT=my_project
-INNOVUS_SCHEDULER_EXTRA=--nodes=1 --ntasks-per-node=8
-```
-
-A shell wrapper script is written to `<workdir>/submit.slurm`, then submitted with `sbatch`. The agent polls `squeue -j <job_id>` every 15 s until the job disappears from the queue, then fetches the exit code via `sacct`. Output files land in `slurm_<job_id>.out` / `slurm_<job_id>.err` under the workdir.
+Innovus runs on the local machine via `subprocess`. TCL scripts from `eda_agent/backends/scripts/innovus/` are copied into a per-run working directory under `INNOVUS_LOCAL_WORKDIR`. No SCP is needed.
 
 ### LSF / bsub (IBM Platform LSF)
 
@@ -337,12 +311,10 @@ INNOVUS_BIN=/opt/cadence/INNOVUS181/bin/innovus
 INNOVUS_LOCAL_WORKDIR=/tmp/eda_agent/innovus
 INNOVUS_SCHEDULER_QUEUE=eda_queue
 INNOVUS_SCHEDULER_ACCOUNT=my_project
-INNOVUS_SCHEDULER_EXTRA=-R "rusage[mem=8192]"   # optional LSF resource string
+INNOVUS_SCHEDULER_EXTRA=-R "rusage[mem=8192]"
 ```
 
-The full Innovus command is passed directly to `bsub -q <queue> -Is -XF <cmd>`. The `-Is -XF` flags allocate a pseudo-TTY and enable X11 forwarding, which is the standard way to run Cadence tools under LSF. The `bsub` call blocks until the job finishes, so the agent waits synchronously and captures the exit code directly. No wrapper script is written.
-
-> **Note:** LSF exit code retrieval via `bacct`/`bjobs` is not implemented; the assumed behaviour is that `bsub` returns only after the job completes and propagates the underlying process exit code as its own.
+The full Innovus command is passed directly to `bsub -q <queue> -Is -XF <cmd>`. The `-Is` flag allocates a pseudo-TTY and blocks until the job finishes, so the agent waits synchronously and captures the exit code directly. No wrapper script is written.
 
 ## Phase roadmap
 
