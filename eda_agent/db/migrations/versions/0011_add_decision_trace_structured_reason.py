@@ -32,12 +32,41 @@ def upgrade() -> None:
             WHERE llm_reason IS NOT NULL AND llm_reason <> ''
             """
         )
-    elif dialect == "postgresql":
+    elif dialect == "postgresql" and _supports_postgresql_to_json(bind):
         op.execute(
             """
             UPDATE decision_trace
             SET llm_reason_structured =
                 ('{"kind":"legacy_text","text":' || to_json(llm_reason)::text || '}')::json
+            WHERE llm_reason IS NOT NULL AND llm_reason <> ''
+            """
+        )
+    elif dialect == "postgresql":
+        op.execute(
+            r"""
+            UPDATE decision_trace
+            SET llm_reason_structured =
+                (
+                    '{"kind":"legacy_text","text":"'
+                    || replace(
+                           replace(
+                               replace(
+                                   replace(
+                                       replace(llm_reason, E'\\', E'\\\\'),
+                                       E'"',
+                                       E'\"'
+                                   ),
+                                   E'\n',
+                                   E'\\n'
+                               ),
+                               E'\r',
+                               E'\\r'
+                           ),
+                           E'\t',
+                           E'\\t'
+                       )
+                    || '"}'
+                )::json
             WHERE llm_reason IS NOT NULL AND llm_reason <> ''
             """
         )
@@ -65,5 +94,18 @@ def _supports_postgresql_jsonb(bind) -> bool:
     try:
         ver_num = bind.execute(sa.text("SHOW server_version_num")).scalar()
         return int(ver_num) >= 90400
+    except Exception:
+        return False
+
+
+def _supports_postgresql_to_json(bind) -> bool:
+    """Return True when current PostgreSQL server version supports to_json."""
+    ver_info = getattr(bind.dialect, "server_version_info", None)
+    if isinstance(ver_info, tuple) and len(ver_info) >= 2:
+        return (int(ver_info[0]), int(ver_info[1])) >= (9, 3)
+
+    try:
+        ver_num = bind.execute(sa.text("SHOW server_version_num")).scalar()
+        return int(ver_num) >= 90300
     except Exception:
         return False
