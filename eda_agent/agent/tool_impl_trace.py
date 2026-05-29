@@ -223,18 +223,36 @@ def latest_inference_context_for_run_impl(
                 if isinstance(first, dict):
                     rule_id = first.get("cause_id")
 
-        case_row = db.execute(
-            text(
-                """
-                SELECT id
-                FROM case_memory
-                WHERE result_metrics->>'inference_id' = :inference_id
-                ORDER BY created_at DESC
-                LIMIT 1
-                """
-            ),
-            {"inference_id": str(inference_id)},
-        ).first()
+        if supports_postgresql_jsonb():
+            case_row = db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM case_memory
+                    WHERE result_metrics->>'inference_id' = :inference_id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"inference_id": str(inference_id)},
+            ).first()
+        else:
+            case_row = db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM case_memory
+                    WHERE REPLACE(CAST(result_metrics AS TEXT), ' ', '') LIKE :pattern_numeric
+                       OR REPLACE(CAST(result_metrics AS TEXT), ' ', '') LIKE :pattern_string
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "pattern_numeric": f'%\"inference_id\":{inference_id}%',
+                    "pattern_string": f'%\"inference_id\":\"{inference_id}\"%',
+                },
+            ).first()
 
         case_id = int(case_row[0]) if case_row else None
         return {
