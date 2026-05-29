@@ -5,7 +5,6 @@ from __future__ import annotations
 from importlib import import_module
 from unittest.mock import MagicMock, Mock
 
-
 initial_schema = import_module("eda_agent.db.migrations.versions.0001_initial_schema")
 
 

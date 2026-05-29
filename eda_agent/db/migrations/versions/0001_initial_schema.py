@@ -12,6 +12,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 from geoalchemy2 import Geometry
+
 from eda_agent.db.json_type import JSON_OR_JSONB
 
 revision: str = "0001"
