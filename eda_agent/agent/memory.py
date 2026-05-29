@@ -424,12 +424,12 @@ def save_case(
     """Persist a resolved debugging case and return its DB id."""
     from sqlalchemy import text as _text
 
-    from eda_agent.db.session import get_db, is_postgresql
+    from eda_agent.db.session import get_db, supports_postgresql_jsonb
 
     actions_val = actions or []
     metrics_val = result_metrics or {}
 
-    _jc = "::jsonb" if is_postgresql() else ""
+    _jc = "::jsonb" if supports_postgresql_jsonb() else ""
     with get_db() as db:
         row = db.execute(
             _text(

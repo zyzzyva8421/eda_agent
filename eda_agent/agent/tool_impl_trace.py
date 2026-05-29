@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from sqlalchemy import text
 
-from eda_agent.db.session import get_db, is_postgresql
+from eda_agent.db.session import get_db, supports_postgresql_jsonb
 
 
 def record_decision_trace_impl(
@@ -25,7 +25,11 @@ def record_decision_trace_impl(
 ) -> None:
     """Persist lineage from diagnosis/suggestion to the next rerun."""
     with get_db_fn() as db:
-        _cast = "CAST(:llm_reason_structured AS jsonb)" if is_postgresql() else ":llm_reason_structured"
+        _cast = (
+            "CAST(:llm_reason_structured AS jsonb)"
+            if supports_postgresql_jsonb()
+            else ":llm_reason_structured"
+        )
         db.execute(
             text(
                 f"""

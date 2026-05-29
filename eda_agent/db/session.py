@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import lru_cache
 from typing import Generator
 
 from sqlalchemy import create_engine, text
@@ -32,6 +33,24 @@ def get_engine():
 def is_postgresql() -> bool:
     """Return True when the configured database engine targets PostgreSQL."""
     return _engine.dialect.name == "postgresql"
+
+
+@lru_cache(maxsize=1)
+def supports_postgresql_jsonb() -> bool:
+    """Return True when the PostgreSQL server version supports JSONB (>= 9.4)."""
+    if not is_postgresql():
+        return False
+
+    ver_info = getattr(_engine.dialect, "server_version_info", None)
+    if isinstance(ver_info, tuple) and len(ver_info) >= 2:
+        return (int(ver_info[0]), int(ver_info[1])) >= (9, 4)
+
+    try:
+        with _engine.connect() as conn:
+            ver_num = conn.execute(text("SHOW server_version_num")).scalar()
+        return int(ver_num) >= 90400
+    except Exception:
+        return False
 
 
 def create_all_tables() -> None:

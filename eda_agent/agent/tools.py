@@ -49,7 +49,7 @@ from eda_agent.agent.tool_schemas import TOOL_SCHEMAS as BUILTIN_TOOL_SCHEMAS
 from eda_agent.db.repository import EDAQueryRepository
 from eda_agent.backends.base import DesignSpec
 from eda_agent.config import settings
-from eda_agent.db.session import get_db, is_postgresql
+from eda_agent.db.session import get_db, supports_postgresql_jsonb
 from eda_agent.parsers import get_parser
 
 logger = logging.getLogger(__name__)
@@ -184,7 +184,7 @@ def _record_stage_outcome(
     if result.log_path:
         artifact_refs.append(str(result.log_path))
 
-    _jc = "::jsonb" if is_postgresql() else ""
+    _jc = "::jsonb" if supports_postgresql_jsonb() else ""
     with get_db() as db:
         db.execute(
             text(
@@ -1082,7 +1082,7 @@ def _audit_custom_tool_call(
         ok = error is None
 
     try:
-        _jc = "::jsonb" if is_postgresql() else ""
+        _jc = "::jsonb" if supports_postgresql_jsonb() else ""
         with get_db() as db:
             db.execute(
                 text(

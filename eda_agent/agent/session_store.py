@@ -28,7 +28,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from eda_agent.agent.memory import AgentMemory
-from eda_agent.db.session import is_postgresql
+from eda_agent.db.session import supports_postgresql_jsonb
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +231,7 @@ def list_sessions(
     """
     if db is None:
         return []
-    _json_len = "jsonb_array_length" if is_postgresql() else "json_array_length"
+    _json_len = "jsonb_array_length" if supports_postgresql_jsonb() else "json_array_length"
     try:
         if username is None:
             rows = db.execute(
