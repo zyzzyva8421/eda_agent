@@ -35,22 +35,33 @@ def is_postgresql() -> bool:
     return _engine.dialect.name == "postgresql"
 
 
-@lru_cache(maxsize=1)
-def supports_postgresql_jsonb() -> bool:
-    """Return True when the PostgreSQL server version supports JSONB (>= 9.4)."""
+def _postgresql_server_version_at_least(major: int, minor: int) -> bool:
+    """Return True when the PostgreSQL server version meets ``major.minor``."""
     if not is_postgresql():
         return False
 
     ver_info = getattr(_engine.dialect, "server_version_info", None)
     if isinstance(ver_info, tuple) and len(ver_info) >= 2:
-        return (int(ver_info[0]), int(ver_info[1])) >= (9, 4)
+        return (int(ver_info[0]), int(ver_info[1])) >= (major, minor)
 
     try:
         with _engine.connect() as conn:
             ver_num = conn.execute(text("SHOW server_version_num")).scalar()
-        return int(ver_num) >= 90400
+        return int(ver_num) >= ((major * 10000) + (minor * 100))
     except Exception:
         return False
+
+
+@lru_cache(maxsize=1)
+def supports_postgresql_jsonb() -> bool:
+    """Return True when the PostgreSQL server version supports JSONB (>= 9.4)."""
+    return _postgresql_server_version_at_least(9, 4)
+
+
+@lru_cache(maxsize=1)
+def supports_postgresql_on_conflict() -> bool:
+    """Return True when the PostgreSQL server version supports ON CONFLICT (>= 9.5)."""
+    return _postgresql_server_version_at_least(9, 5)
 
 
 def create_all_tables() -> None:

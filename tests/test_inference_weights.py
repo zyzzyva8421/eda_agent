@@ -18,7 +18,6 @@ from eda_agent.agent.inference.weights import (
     update_weights,
 )
 
-
 # ── _clamp ────────────────────────────────────────────────────────────────────
 
 
@@ -77,6 +76,32 @@ def test_get_multipliers_empty_table():
     with patch("eda_agent.agent.inference.weights.get_db", return_value=ctx):
         result = get_multipliers()
     assert result == {}
+
+
+def test_persist_updates_falls_back_without_on_conflict_support():
+    mock_db = MagicMock()
+    update_result = MagicMock()
+    update_result.rowcount = 0
+    mock_db.execute.side_effect = [update_result, None]
+
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=mock_db)
+    ctx.__exit__ = MagicMock(return_value=False)
+
+    with (
+        patch("eda_agent.agent.inference.weights.get_db", return_value=ctx),
+        patch(
+            "eda_agent.agent.inference.weights.supports_postgresql_on_conflict",
+            return_value=False,
+        ),
+    ):
+        from eda_agent.agent.inference.weights import _persist_updates
+
+        _persist_updates({"routing_detour": 1.2})
+
+    assert mock_db.execute.call_count == 2
+    assert "UPDATE rule_weights" in str(mock_db.execute.call_args_list[0].args[0])
+    assert "INSERT INTO rule_weights" in str(mock_db.execute.call_args_list[1].args[0])
 
 
 # ── update_weights – 3 learning cases ────────────────────────────────────────

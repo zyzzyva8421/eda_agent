@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from psycopg2.extras import Json
 
 from eda_agent.agent import session_store
 from eda_agent.agent.memory import AgentMemory
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -98,6 +97,26 @@ def test_save_session_passes_native_json_objects_to_db():
     assert isinstance(params["scratch"], Json)
 
 
+def test_save_session_falls_back_without_on_conflict_support():
+    db = MagicMock()
+    update_result = MagicMock()
+    update_result.rowcount = 0
+    db.execute.side_effect = [update_result, None]
+    mem = AgentMemory()
+    mem.add_user("hi")
+    mem.set("design_name", "aes")
+
+    with patch("eda_agent.agent.session_store.supports_postgresql_on_conflict", return_value=False):
+        session_store.save_session("s1", "alice", mem, db)
+
+    assert db.execute.call_count == 2
+    first_sql = str(db.execute.call_args_list[0].args[0])
+    second_sql = str(db.execute.call_args_list[1].args[0])
+    assert "UPDATE agent_sessions" in first_sql
+    assert "INSERT INTO agent_sessions" in second_sql
+    assert db.commit.called
+
+
 def test_load_session_falls_back_when_scratchpad_column_missing():
     db = MagicMock()
 
@@ -133,8 +152,33 @@ def test_save_session_falls_back_when_scratchpad_column_missing():
     mem = AgentMemory()
     mem.add_user("hi")
 
-    session_store.save_session("legacy", "alice", mem, db)
+    with patch("eda_agent.agent.session_store.supports_postgresql_on_conflict", return_value=True):
+        session_store.save_session("legacy", "alice", mem, db)
     assert db.execute.call_count == 2
+    assert db.rollback.called
+    assert db.commit.called
+
+
+def test_save_session_legacy_fallback_without_on_conflict_support():
+    db = MagicMock()
+
+    class MissingScratchpad(Exception):
+        pass
+
+    first_exc = MissingScratchpad('column "scratchpad" does not exist')
+    update_result = MagicMock()
+    update_result.rowcount = 0
+    db.execute.side_effect = [first_exc, update_result, None]
+
+    mem = AgentMemory()
+    mem.add_user("hi")
+
+    with patch("eda_agent.agent.session_store.supports_postgresql_on_conflict", return_value=False):
+        session_store.save_session("legacy", "alice", mem, db)
+
+    assert db.execute.call_count == 3
+    assert "UPDATE agent_sessions" in str(db.execute.call_args_list[1].args[0])
+    assert "INSERT INTO agent_sessions" in str(db.execute.call_args_list[2].args[0])
     assert db.rollback.called
     assert db.commit.called
 

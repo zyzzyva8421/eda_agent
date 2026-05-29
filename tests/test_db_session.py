@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from eda_agent.db.session import get_db_dependency, supports_postgresql_jsonb
+from eda_agent.db.session import (
+    get_db_dependency,
+    supports_postgresql_jsonb,
+    supports_postgresql_on_conflict,
+)
 
 
 def test_get_db_dependency_commits_on_success():
@@ -66,8 +70,10 @@ def test_get_db_dependency_yields_usable_session():
 @pytest.fixture(autouse=True)
 def _clear_jsonb_support_cache():
     supports_postgresql_jsonb.cache_clear()
+    supports_postgresql_on_conflict.cache_clear()
     yield
     supports_postgresql_jsonb.cache_clear()
+    supports_postgresql_on_conflict.cache_clear()
 
 
 def test_supports_postgresql_jsonb_false_on_non_postgresql(monkeypatch: pytest.MonkeyPatch):
@@ -109,3 +115,25 @@ def test_supports_postgresql_jsonb_uses_server_version_num_fallback(
     monkeypatch.setattr("eda_agent.db.session._engine", mock_engine)
 
     assert supports_postgresql_jsonb() is False
+
+
+def test_supports_postgresql_on_conflict_false_on_postgresql_94(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_engine = Mock()
+    mock_engine.dialect.name = "postgresql"
+    mock_engine.dialect.server_version_info = (9, 4, 26)
+    monkeypatch.setattr("eda_agent.db.session._engine", mock_engine)
+
+    assert supports_postgresql_on_conflict() is False
+
+
+def test_supports_postgresql_on_conflict_true_on_postgresql_95(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_engine = Mock()
+    mock_engine.dialect.name = "postgresql"
+    mock_engine.dialect.server_version_info = (9, 5, 0)
+    monkeypatch.setattr("eda_agent.db.session._engine", mock_engine)
+
+    assert supports_postgresql_on_conflict() is True

@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import text
 
-from eda_agent.db.session import get_db
+from eda_agent.db.session import get_db, supports_postgresql_on_conflict
 
 logger = logging.getLogger(__name__)
 
@@ -121,19 +121,45 @@ def _persist_updates(updates: dict[str, float]) -> None:
     try:
         with get_db() as db:
             for rule_id, multiplier in updates.items():
-                db.execute(
-                    text(
-                        """
-                        INSERT INTO rule_weights (rule_id, multiplier, confirm_count, updated_at)
-                        VALUES (:rule_id, :multiplier, 1, :now)
-                        ON CONFLICT (rule_id) DO UPDATE
-                        SET multiplier     = :multiplier,
-                            confirm_count  = rule_weights.confirm_count + 1,
-                            updated_at     = :now
-                        """
-                    ),
-                    {"rule_id": rule_id, "multiplier": multiplier, "now": now},
-                )
+                if supports_postgresql_on_conflict():
+                    db.execute(
+                        text(
+                            """
+                            INSERT INTO rule_weights
+                                (rule_id, multiplier, confirm_count, updated_at)
+                            VALUES (:rule_id, :multiplier, 1, :now)
+                            ON CONFLICT (rule_id) DO UPDATE
+                            SET multiplier     = :multiplier,
+                                confirm_count  = rule_weights.confirm_count + 1,
+                                updated_at     = :now
+                            """
+                        ),
+                        {"rule_id": rule_id, "multiplier": multiplier, "now": now},
+                    )
+                else:
+                    updated = db.execute(
+                        text(
+                            """
+                            UPDATE rule_weights
+                            SET multiplier = :multiplier,
+                                confirm_count = confirm_count + 1,
+                                updated_at = :now
+                            WHERE rule_id = :rule_id
+                            """
+                        ),
+                        {"rule_id": rule_id, "multiplier": multiplier, "now": now},
+                    )
+                    if updated.rowcount == 0:
+                        db.execute(
+                            text(
+                                """
+                                INSERT INTO rule_weights
+                                    (rule_id, multiplier, confirm_count, updated_at)
+                                VALUES (:rule_id, :multiplier, 1, :now)
+                                """
+                            ),
+                            {"rule_id": rule_id, "multiplier": multiplier, "now": now},
+                        )
         logger.info("Updated rule_weights: %s", updates)
     except Exception:
         logger.warning("Could not persist rule weight updates", exc_info=True)
