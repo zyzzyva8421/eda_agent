@@ -49,7 +49,7 @@ from eda_agent.agent.tool_schemas import TOOL_SCHEMAS as BUILTIN_TOOL_SCHEMAS
 from eda_agent.db.repository import EDAQueryRepository
 from eda_agent.backends.base import DesignSpec
 from eda_agent.config import settings
-from eda_agent.db.session import get_db
+from eda_agent.db.session import get_db, is_postgresql
 from eda_agent.parsers import get_parser
 
 logger = logging.getLogger(__name__)
@@ -184,18 +184,19 @@ def _record_stage_outcome(
     if result.log_path:
         artifact_refs.append(str(result.log_path))
 
+    _jc = "::jsonb" if is_postgresql() else ""
     with get_db() as db:
         db.execute(
             text(
-                """
+                f"""
                 INSERT INTO stage_outcomes
                     (run_id, stage_name, status, started_at, finished_at,
                      input_params_snapshot, output_metrics_snapshot, artifact_refs,
                      root_cause_inference_id, recommendation, approval_status)
                 VALUES
                     (:run_id, :stage_name, :status, :started_at, :finished_at,
-                     :input_params_snapshot::jsonb, :output_metrics_snapshot::jsonb,
-                     :artifact_refs::jsonb, :root_cause_inference_id,
+                     :input_params_snapshot{_jc}, :output_metrics_snapshot{_jc},
+                     :artifact_refs{_jc}, :root_cause_inference_id,
                      :recommendation, :approval_status)
                 """
             ),
@@ -1081,15 +1082,16 @@ def _audit_custom_tool_call(
         ok = error is None
 
     try:
+        _jc = "::jsonb" if is_postgresql() else ""
         with get_db() as db:
             db.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO custom_tool_audit
                         (tool_name, source, arguments_summary, duration_ms,
                          exit_code, ok, error_message)
                     VALUES
-                        (:tool_name, :source, :arguments_summary::jsonb, :duration_ms,
+                        (:tool_name, :source, :arguments_summary{_jc}, :duration_ms,
                          :exit_code, :ok, :error_message)
                     """
                 ),

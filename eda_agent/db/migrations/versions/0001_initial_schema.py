@@ -12,6 +12,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 from geoalchemy2 import Geometry
+from eda_agent.db.json_type import JSON_OR_JSONB
 
 revision: str = "0001"
 down_revision: Union[str, None] = None
@@ -84,7 +85,7 @@ def upgrade() -> None:
         ),
         sa.Column("stage", sa.String(64), nullable=False),
         sa.Column("status", sa.String(32), nullable=False, server_default="pending"),
-        sa.Column("params", sa.dialects.postgresql.JSONB, nullable=False, server_default="{}"),
+        sa.Column("params", JSON_OR_JSONB, nullable=False, server_default="{}"),
         sa.Column("git_hash", sa.String(128), nullable=False, server_default=""),
         sa.Column("log_path", sa.Text, nullable=False, server_default=""),
         sa.Column("report_dir", sa.Text, nullable=False, server_default=""),

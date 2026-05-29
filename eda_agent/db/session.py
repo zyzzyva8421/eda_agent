@@ -29,6 +29,11 @@ def get_engine():
     return _engine
 
 
+def is_postgresql() -> bool:
+    """Return True when the configured database engine targets PostgreSQL."""
+    return _engine.dialect.name == "postgresql"
+
+
 def create_all_tables() -> None:
     """Create all tables (and PostGIS extension) in the database."""
     with _engine.connect() as conn:

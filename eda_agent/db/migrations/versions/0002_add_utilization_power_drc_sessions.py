@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Sequence, Union
 
 import sqlalchemy as sa
+from eda_agent.db.json_type import JSON_OR_JSONB
 from alembic import op
 
 revision: str = "0002"
@@ -72,7 +73,7 @@ def upgrade() -> None:
         ),
         sa.Column("violation_type", sa.String(128), nullable=False, server_default=""),
         sa.Column("layer", sa.String(64)),
-        sa.Column("nets", sa.dialects.postgresql.JSONB),
+        sa.Column("nets", JSON_OR_JSONB),
         sa.Column("bbox_wkt", sa.Text),
         sa.Column("total_violations", sa.Integer),
         sa.Column(
@@ -90,7 +91,7 @@ def upgrade() -> None:
         sa.Column("username", sa.String(128), nullable=False, server_default=""),
         sa.Column(
             "messages",
-            sa.dialects.postgresql.JSONB,
+            JSON_OR_JSONB,
             nullable=False,
             server_default="[]",
         ),

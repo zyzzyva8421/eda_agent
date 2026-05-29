@@ -10,7 +10,7 @@ Create Date: 2026-05-21
 
 from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import JSONB
+from eda_agent.db.json_type import JSON_OR_JSONB
 
 revision = "0010"
 down_revision = "0009"
@@ -21,7 +21,7 @@ depends_on = None
 def upgrade() -> None:
     op.add_column(
         "flow_sessions",
-        sa.Column("env_snapshot", JSONB, nullable=True),
+        sa.Column("env_snapshot", JSON_OR_JSONB, nullable=True),
     )
     op.create_index(
         "ix_flow_sessions_env_snapshot_gin",

@@ -28,6 +28,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from eda_agent.agent.memory import AgentMemory
+from eda_agent.db.session import is_postgresql
 
 logger = logging.getLogger(__name__)
 
@@ -230,13 +231,14 @@ def list_sessions(
     """
     if db is None:
         return []
+    _json_len = "jsonb_array_length" if is_postgresql() else "json_array_length"
     try:
         if username is None:
             rows = db.execute(
                 text(
-                    """
+                    f"""
                     SELECT session_id, username, updated_at,
-                           jsonb_array_length(messages) AS msg_count
+                           {_json_len}(messages) AS msg_count
                     FROM agent_sessions
                     ORDER BY updated_at DESC
                     LIMIT :lim
@@ -247,9 +249,9 @@ def list_sessions(
         else:
             rows = db.execute(
                 text(
-                    """
+                    f"""
                     SELECT session_id, username, updated_at,
-                           jsonb_array_length(messages) AS msg_count
+                           {_json_len}(messages) AS msg_count
                     FROM agent_sessions
                     WHERE username = :uname
                     ORDER BY updated_at DESC

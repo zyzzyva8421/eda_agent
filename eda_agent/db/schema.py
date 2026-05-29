@@ -50,7 +50,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from eda_agent.db.json_type import JSON_OR_JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -134,7 +134,7 @@ class FlowSession(Base):
     last_rule_id: Mapped[str | None] = mapped_column(
         String(128), ForeignKey("rule_weights.rule_id", ondelete="SET NULL"), nullable=True
     )
-    env_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    env_snapshot: Mapped[dict | None] = mapped_column(JSON_OR_JSONB, nullable=True)
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -190,7 +190,7 @@ class Run(Base):
     parent_run_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("runs.id"), nullable=True
     )
-    params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    params: Mapped[dict] = mapped_column(JSON_OR_JSONB, nullable=False, default=dict)
     git_hash: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     log_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
     report_dir: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -437,7 +437,7 @@ class DRCViolation(Base):
     # For summary records (total count line) violation_type is 'SUMMARY'
     violation_type: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     layer: Mapped[str | None] = mapped_column(String(64))
-    nets: Mapped[list | None] = mapped_column(JSONB)
+    nets: Mapped[list | None] = mapped_column(JSON_OR_JSONB)
     bbox_wkt: Mapped[str | None] = mapped_column(Text)
     total_violations: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
@@ -459,9 +459,9 @@ class AgentSession(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(String(256), nullable=False, unique=True)
     username: Mapped[str] = mapped_column(String(128), nullable=False, default="")
-    messages: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    messages: Mapped[list | None] = mapped_column(JSON_OR_JSONB, nullable=False, default=list)
     scratchpad: Mapped[dict | None] = mapped_column(
-        JSONB, nullable=False, default=dict, server_default="{}"
+        JSON_OR_JSONB, nullable=False, default=dict, server_default="{}"
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -484,7 +484,7 @@ class CustomToolAudit(Base):
     tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
     source: Mapped[str] = mapped_column(String(256), nullable=False, default="")
     arguments_summary: Mapped[dict | None] = mapped_column(
-        JSONB, nullable=False, default=dict
+        JSON_OR_JSONB, nullable=False, default=dict
     )
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     exit_code: Mapped[int | None] = mapped_column(Integer)
@@ -513,9 +513,9 @@ class RootCauseInference(Base):
     )
     symptoms: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # Full feature vector snapshot at inference time
-    features: Mapped[dict | None] = mapped_column(JSONB, nullable=False, default=dict)
+    features: Mapped[dict | None] = mapped_column(JSON_OR_JSONB, nullable=False, default=dict)
     # Top-k ranked hypotheses list
-    hypotheses: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    hypotheses: Mapped[list | None] = mapped_column(JSON_OR_JSONB, nullable=False, default=list)
     # Filled in by confirm()
     chosen_cause: Mapped[str | None] = mapped_column(String(256))
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -559,9 +559,9 @@ class CaseRecord(Base):
     symptoms: Mapped[str] = mapped_column(Text, nullable=False, default="")
     root_cause: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # Ordered list of action strings (tool name + key params)
-    actions: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    actions: Mapped[list | None] = mapped_column(JSON_OR_JSONB, nullable=False, default=list)
     # Key QoR metrics captured after the fix (e.g. wns_before, wns_after)
-    result_metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=False, default=dict)
+    result_metrics: Mapped[dict | None] = mapped_column(JSON_OR_JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -585,12 +585,12 @@ class StageOutcome(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     input_params_snapshot: Mapped[dict | None] = mapped_column(
-        JSONB, nullable=False, default=dict
+        JSON_OR_JSONB, nullable=False, default=dict
     )
     output_metrics_snapshot: Mapped[dict | None] = mapped_column(
-        JSONB, nullable=False, default=dict
+        JSON_OR_JSONB, nullable=False, default=dict
     )
-    artifact_refs: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    artifact_refs: Mapped[list | None] = mapped_column(JSON_OR_JSONB, nullable=False, default=list)
     root_cause_inference_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("root_cause_inferences.id", ondelete="SET NULL"),
         nullable=True,
@@ -642,7 +642,7 @@ class DecisionTrace(Base):
         nullable=True,
     )
     llm_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    llm_reason_structured: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    llm_reason_structured: Mapped[dict | None] = mapped_column(JSON_OR_JSONB, nullable=True)
     human_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

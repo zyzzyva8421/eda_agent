@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import text
 
-from eda_agent.db.session import get_db
+from eda_agent.db.session import get_db, is_postgresql
 
 from .features import FeatureVector, extract_features
 from .rules import RULE_BY_ID, RULES
@@ -77,14 +77,15 @@ def _save_inference(
 ) -> int:
     """Insert a root_cause_inferences row and return its id."""
     try:
+        _jc = "::jsonb" if is_postgresql() else ""
         with get_db() as db:
             row = db.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO root_cause_inferences
                         (run_id, symptoms, features, hypotheses)
                     VALUES
-                        (:run_id, :symptoms, :features::jsonb, :hypotheses::jsonb)
+                        (:run_id, :symptoms, :features{_jc}, :hypotheses{_jc})
                     RETURNING id
                     """
                 ),
