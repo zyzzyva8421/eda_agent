@@ -54,7 +54,7 @@ def upgrade() -> None:
                                    replace(
                                        replace(llm_reason, E'\\', E'\\\\'),
                                        E'"',
-                                       E'\"'
+                                       E'\\\"'
                                    ),
                                    E'\n',
                                    E'\\n'

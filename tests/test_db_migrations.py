@@ -111,6 +111,6 @@ def test_upgrade_uses_replace_fallback_without_to_json():
 
         reason_structured.upgrade()
 
-    sql_calls = [str(call.args[0]) for call in mock_op.execute.call_args_list]
+    sql_calls = [str(call.args[0]).lower() for call in mock_op.execute.call_args_list]
     assert any("replace(" in sql for sql in sql_calls)
     assert not any("to_json(" in sql for sql in sql_calls)
