@@ -8,8 +8,9 @@ Revises: 0009
 Create Date: 2026-05-21
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
+
 from eda_agent.db.json_type import JSON_OR_JSONB
 
 revision = "0010"

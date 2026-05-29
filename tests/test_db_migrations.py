@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from importlib import import_module
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 initial_schema = import_module("eda_agent.db.migrations.versions.0001_initial_schema")
 env_snapshot = import_module("eda_agent.db.migrations.versions.0010_add_flow_session_env_snapshot")
