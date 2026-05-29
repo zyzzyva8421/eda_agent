@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from sqlalchemy import text
 
-from eda_agent.db.session import get_db
+from eda_agent.db.session import get_db, supports_postgresql_jsonb
 
 
 def record_decision_trace_impl(
@@ -25,9 +25,14 @@ def record_decision_trace_impl(
 ) -> None:
     """Persist lineage from diagnosis/suggestion to the next rerun."""
     with get_db_fn() as db:
+        _cast = (
+            "CAST(:llm_reason_structured AS jsonb)"
+            if supports_postgresql_jsonb()
+            else ":llm_reason_structured"
+        )
         db.execute(
             text(
-                """
+                f"""
                 INSERT INTO decision_trace
                     (session_id, source_run_id, target_run_id,
                      inference_id, case_id, rule_id,
@@ -35,7 +40,7 @@ def record_decision_trace_impl(
                 VALUES
                     (:session_id, :source_run_id, :target_run_id,
                      :inference_id, :case_id, :rule_id,
-                     :llm_reason, CAST(:llm_reason_structured AS jsonb), :human_approved)
+                     :llm_reason, {_cast}, :human_approved)
                 """
             ),
             {

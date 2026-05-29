@@ -28,6 +28,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from eda_agent.agent.memory import AgentMemory
+from eda_agent.db.session import (
+    supports_postgresql_jsonb,
+    supports_postgresql_on_conflict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +53,87 @@ def _rollback_quietly(db: Session | None) -> None:
 def _is_missing_column_error(exc: Exception, column: str) -> bool:
     text = str(exc).lower()
     return column.lower() in text and ("does not exist" in text or "undefinedcolumn" in text)
+
+
+def _update_then_insert_session(
+    db: Session,
+    session_id: str,
+    username: str,
+    payload: dict[str, Any],
+) -> None:
+    scratchpad = Json(payload["scratchpad"])
+    messages = Json(payload["messages"])
+    updated = db.execute(
+        text(
+            """
+            UPDATE agent_sessions
+            SET messages = :msgs,
+                scratchpad = :scratch,
+                updated_at = now()
+            WHERE session_id = :sid
+            """
+        ),
+        {
+            "sid": session_id,
+            "uname": username,
+            "msgs": messages,
+            "scratch": scratchpad,
+        },
+    )
+    if updated.rowcount == 0:
+        db.execute(
+            text(
+                """
+                INSERT INTO agent_sessions
+                    (session_id, username, messages, scratchpad, updated_at)
+                VALUES (:sid, :uname, :msgs, :scratch, now())
+                """
+            ),
+            {
+                "sid": session_id,
+                "uname": username,
+                "msgs": messages,
+                "scratch": scratchpad,
+            },
+        )
+
+
+def _update_then_insert_session_legacy(
+    db: Session,
+    session_id: str,
+    username: str,
+    messages: Json,
+) -> None:
+    updated = db.execute(
+        text(
+            """
+            UPDATE agent_sessions
+            SET messages = :msgs,
+                updated_at = now()
+            WHERE session_id = :sid
+            """
+        ),
+        {
+            "sid": session_id,
+            "uname": username,
+            "msgs": messages,
+        },
+    )
+    if updated.rowcount == 0:
+        db.execute(
+            text(
+                """
+                INSERT INTO agent_sessions
+                    (session_id, username, messages, updated_at)
+                VALUES (:sid, :uname, :msgs, now())
+                """
+            ),
+            {
+                "sid": session_id,
+                "uname": username,
+                "msgs": messages,
+            },
+        )
 
 
 @dataclass
@@ -149,48 +234,55 @@ def save_session(
         # until the serialised payload fits.
         memory.shrink_to_byte_budget(MAX_SESSION_BYTES)
         payload = memory.to_dict(persist_internal=False)
-        db.execute(
-            text(
-                """
-                INSERT INTO agent_sessions
-                    (session_id, username, messages, scratchpad, updated_at)
-                VALUES (:sid, :uname, :msgs, :scratch, now())
-                ON CONFLICT (session_id) DO UPDATE
-                  SET messages   = EXCLUDED.messages,
-                      scratchpad = EXCLUDED.scratchpad,
-                      updated_at = now()
-                """
-            ),
-            {
-                "sid": session_id,
-                "uname": username,
-                "msgs": Json(payload["messages"]),
-                "scratch": Json(payload["scratchpad"]),
-            },
-        )
+        if supports_postgresql_on_conflict():
+            db.execute(
+                text(
+                    """
+                    INSERT INTO agent_sessions
+                        (session_id, username, messages, scratchpad, updated_at)
+                    VALUES (:sid, :uname, :msgs, :scratch, now())
+                    ON CONFLICT (session_id) DO UPDATE
+                      SET messages   = EXCLUDED.messages,
+                          scratchpad = EXCLUDED.scratchpad,
+                          updated_at = now()
+                    """
+                ),
+                {
+                    "sid": session_id,
+                    "uname": username,
+                    "msgs": Json(payload["messages"]),
+                    "scratch": Json(payload["scratchpad"]),
+                },
+            )
+        else:
+            _update_then_insert_session(db, session_id, username, payload)
         db.commit()
     except Exception as exc:  # pragma: no cover – DB unavailable
         _rollback_quietly(db)
         if _is_missing_column_error(exc, "scratchpad"):
             did_fallback = True
             try:
-                db.execute(
-                    text(
-                        """
-                        INSERT INTO agent_sessions
-                            (session_id, username, messages, updated_at)
-                        VALUES (:sid, :uname, :msgs, now())
-                        ON CONFLICT (session_id) DO UPDATE
-                          SET messages   = EXCLUDED.messages,
-                              updated_at = now()
-                        """
-                    ),
-                    {
-                        "sid": session_id,
-                        "uname": username,
-                        "msgs": Json(payload["messages"]),
-                    },
-                )
+                messages = Json(payload["messages"])
+                if supports_postgresql_on_conflict():
+                    db.execute(
+                        text(
+                            """
+                            INSERT INTO agent_sessions
+                                (session_id, username, messages, updated_at)
+                            VALUES (:sid, :uname, :msgs, now())
+                            ON CONFLICT (session_id) DO UPDATE
+                              SET messages   = EXCLUDED.messages,
+                                  updated_at = now()
+                            """
+                        ),
+                        {
+                            "sid": session_id,
+                            "uname": username,
+                            "msgs": messages,
+                        },
+                    )
+                else:
+                    _update_then_insert_session_legacy(db, session_id, username, messages)
                 db.commit()
                 return
             except Exception:  # pragma: no cover – DB unavailable
@@ -230,13 +322,14 @@ def list_sessions(
     """
     if db is None:
         return []
+    _json_len = "jsonb_array_length" if supports_postgresql_jsonb() else "json_array_length"
     try:
         if username is None:
             rows = db.execute(
                 text(
-                    """
+                    f"""
                     SELECT session_id, username, updated_at,
-                           jsonb_array_length(messages) AS msg_count
+                           {_json_len}(messages) AS msg_count
                     FROM agent_sessions
                     ORDER BY updated_at DESC
                     LIMIT :lim
@@ -247,9 +340,9 @@ def list_sessions(
         else:
             rows = db.execute(
                 text(
-                    """
+                    f"""
                     SELECT session_id, username, updated_at,
-                           jsonb_array_length(messages) AS msg_count
+                           {_json_len}(messages) AS msg_count
                     FROM agent_sessions
                     WHERE username = :uname
                     ORDER BY updated_at DESC

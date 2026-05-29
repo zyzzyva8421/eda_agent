@@ -11,7 +11,7 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.dialects.postgresql import JSONB
+from eda_agent.db.json_type import JSON_OR_JSONB
 
 revision: str = "0004"
 down_revision: Union[str, None] = "0003"
@@ -27,8 +27,8 @@ def upgrade() -> None:
         sa.Column("pdk", sa.String(128), nullable=False, server_default=""),
         sa.Column("symptoms", sa.Text, nullable=False, server_default=""),
         sa.Column("root_cause", sa.Text, nullable=False, server_default=""),
-        sa.Column("actions", JSONB, nullable=False, server_default="[]"),
-        sa.Column("result_metrics", JSONB, nullable=False, server_default="{}"),
+        sa.Column("actions", JSON_OR_JSONB, nullable=False, server_default="[]"),
+        sa.Column("result_metrics", JSON_OR_JSONB, nullable=False, server_default="{}"),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),

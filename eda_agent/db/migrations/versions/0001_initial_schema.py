@@ -13,6 +13,8 @@ import sqlalchemy as sa
 from alembic import op
 from geoalchemy2 import Geometry
 
+from eda_agent.db.json_type import JSON_OR_JSONB
+
 revision: str = "0001"
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
@@ -84,7 +86,7 @@ def upgrade() -> None:
         ),
         sa.Column("stage", sa.String(64), nullable=False),
         sa.Column("status", sa.String(32), nullable=False, server_default="pending"),
-        sa.Column("params", sa.dialects.postgresql.JSONB, nullable=False, server_default="{}"),
+        sa.Column("params", JSON_OR_JSONB, nullable=False, server_default="{}"),
         sa.Column("git_hash", sa.String(128), nullable=False, server_default=""),
         sa.Column("log_path", sa.Text, nullable=False, server_default=""),
         sa.Column("report_dir", sa.Text, nullable=False, server_default=""),
@@ -192,15 +194,35 @@ def upgrade() -> None:
     op.create_index("ix_artifacts_run_id", "artifacts", ["run_id"])
 
     # Seed built-in backends
-    op.execute(
-        """
-        INSERT INTO backends (name, version, is_active) VALUES
-            ('orfs',    'unknown', true),
-            ('innovus', 'stub',    false),
-            ('icc2',    'stub',    false)
-        ON CONFLICT (name) DO NOTHING
-        """
-    )
+    bind = op.get_bind()
+    if _supports_postgresql_on_conflict(bind):
+        op.execute(
+            """
+            INSERT INTO backends (name, version, is_active) VALUES
+                ('orfs',    'unknown', true),
+                ('innovus', 'stub',    false),
+                ('icc2',    'stub',    false)
+            ON CONFLICT (name) DO NOTHING
+            """
+        )
+    else:
+        op.execute(
+            """
+            INSERT INTO backends (name, version, is_active)
+            SELECT seed.name, seed.version, seed.is_active
+            FROM (
+                VALUES
+                    ('orfs',    'unknown', true),
+                    ('innovus', 'stub',    false),
+                    ('icc2',    'stub',    false)
+            ) AS seed(name, version, is_active)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM backends existing
+                WHERE existing.name = seed.name
+            )
+            """
+        )
 
 
 def downgrade() -> None:
@@ -212,3 +234,16 @@ def downgrade() -> None:
     op.drop_table("users")
     op.drop_table("designs")
     op.drop_table("backends")
+
+
+def _supports_postgresql_on_conflict(bind) -> bool:
+    """Return True when current PostgreSQL server version supports ON CONFLICT."""
+    ver_info = getattr(bind.dialect, "server_version_info", None)
+    if isinstance(ver_info, tuple) and len(ver_info) >= 2:
+        return (int(ver_info[0]), int(ver_info[1])) >= (9, 5)
+
+    try:
+        ver_num = bind.execute(sa.text("SHOW server_version_num")).scalar()
+        return int(ver_num) >= 90500
+    except Exception:
+        return False
