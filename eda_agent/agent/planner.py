@@ -661,7 +661,7 @@ class Planner:
             reduces_context = has_similar_cases or (
                 self._input_max_tokens > 0 and retry_budget < self._input_max_tokens
             )
-            if retry_budget <= 0 or not reduces_context:
+            if not reduces_context:
                 raise TimeoutError("LLM request timed out") from exc
             retry_payload = self._build_payload(
                 mem,
@@ -732,7 +732,7 @@ class Planner:
             return ""
         if len(text) <= limit:
             return text
-        return text[: max(limit - 1, 0)] + "…"
+        return text[: limit - 1] + "…"
 
     def _call_llm_stream(
         self,
