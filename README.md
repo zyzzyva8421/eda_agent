@@ -139,14 +139,14 @@ Copy `.env.example` to `.env` and fill in:
 | `POSTGRES_*`                 | PostgreSQL connection details (user / password / host / port / db).|
 | `ORFS_ROOT`                  | Absolute path to OpenROAD-flow-scripts.                           |
 | `ORFS_MAKE_JOBS`             | `-j` value passed to ORFS make invocations.                       |
-| `INNOVUS_EXECUTION_MODE`       | Innovus execution mode: `ssh` (default), `local`, `pbs`, `slurm`.   |
+| `INNOVUS_EXECUTION_MODE`       | Innovus execution mode: `ssh` (default), `local`, `bsub`.   |
 | `INNOVUS_SSH_HOST`             | SSH hostname for remote Innovus host.                              |
 | `INNOVUS_SSH_USER`             | SSH username.                                                      |
 | `INNOVUS_SSH_PORT`            | SSH port (default 22).                                             |
 | `INNOVUS_SSH_PASSWORD`        | SSH password (used with sshpass).                                  |
 | `INNOVUS_BIN`                 | Path to Innovus binary on target host.                              |
 | `INNOVUS_REMOTE_WORKDIR`      | Base working directory on remote host.                             |
-| `INNOVUS_LOCAL_WORKDIR`       | Local working directory for `local`/`pbs`/`slurm` modes.          |
+| `INNOVUS_LOCAL_WORKDIR`       | Local working directory for `local`/`bsub` modes.          |
 | `INNOVUS_SCHEDULER_QUEUE`     | PBS queue or Slurm partition name.                                 |
 | `INNOVUS_SCHEDULER_ACCOUNT`   | Scheduler account/ project string.                                 |
 | `INNOVUS_SCHEDULER_EXTRA`     | Extra raw args appended to `qsub`/`sbatch` (e.g. `--nodes=2`).     |
