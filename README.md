@@ -194,7 +194,7 @@ Replace `/path/to/gemma-4-model` with your local model directory and replace
 `<gemma-4-chat-template>` with the full Gemma 4 chat-template string you pass
 to vLLM.
 
-set the agent to prompt-mode tool calling:
+Set the agent to prompt-mode tool calling:
 
 ```bash
 # These MINIMAX_* settings are also used for compatible OpenAI-style local endpoints.
