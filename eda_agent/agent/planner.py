@@ -646,16 +646,19 @@ class Planner:
                 transport,
                 timeout=self._request_timeout,
             )
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
             logger.warning(
                 "LLM request timed out; retrying with reduced context",
                 exc_info=True,
             )
-            retry_budget = (
-                self._timeout_retry_input_max_tokens
-                if self._timeout_retry_input_max_tokens > 0
-                else self._input_max_tokens
-            )
+            retry_budget = self._timeout_retry_input_max_tokens
+            if retry_budget <= 0:
+                retry_budget = min(self._input_max_tokens, settings.minimax_max_tokens)
+            has_similar_cases = bool(mem.get("_similar_cases"))
+            if retry_budget <= 0 or (
+                retry_budget >= self._input_max_tokens and not has_similar_cases
+            ):
+                raise TimeoutError("LLM request timed out") from exc
             retry_payload = self._build_payload(
                 mem,
                 prompt_mode=prompt_mode,
@@ -698,7 +701,7 @@ class Planner:
         for i, case in enumerate(similar_cases, 1):
             actions = case.get("actions") or []
             action_text = "; ".join(
-                cls._truncate_text(str(action), cls._CASE_TEXT_MAX_CHARS)
+                cls._truncate_text(action, cls._CASE_TEXT_MAX_CHARS)
                 for action in actions[: cls._CASE_ACTIONS_MAX_ITEMS]
             )
             cases_prompt += (
@@ -721,9 +724,13 @@ class Planner:
     @staticmethod
     def _truncate_text(value: Any, limit: int) -> str:
         text = str(value or "")
-        if limit <= 0 or len(text) <= limit:
+        if limit <= 0:
+            return ""
+        if len(text) <= limit:
             return text
-        return text[: max(limit - 1, 0)] + "…"
+        if limit == 1:
+            return text[:1]
+        return text[: limit - 1] + "…"
 
     def _call_llm_stream(
         self,
