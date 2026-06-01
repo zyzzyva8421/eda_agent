@@ -653,11 +653,15 @@ class Planner:
             )
             retry_budget = self._timeout_retry_input_max_tokens
             if retry_budget <= 0:
-                retry_budget = min(self._input_max_tokens, settings.minimax_max_tokens)
+                if self._input_max_tokens > 0:
+                    retry_budget = max(1, self._input_max_tokens // 2)
+                else:
+                    retry_budget = max(1, settings.minimax_max_tokens // 2)
             has_similar_cases = bool(mem.get("_similar_cases"))
-            if retry_budget <= 0 or (
-                retry_budget >= self._input_max_tokens and not has_similar_cases
-            ):
+            reduces_context = has_similar_cases or (
+                self._input_max_tokens > 0 and retry_budget < self._input_max_tokens
+            )
+            if retry_budget <= 0 or not reduces_context:
                 raise TimeoutError("LLM request timed out") from exc
             retry_payload = self._build_payload(
                 mem,
@@ -728,9 +732,7 @@ class Planner:
             return ""
         if len(text) <= limit:
             return text
-        if limit == 1:
-            return text[:1]
-        return text[: limit - 1] + "…"
+        return text[: max(limit - 1, 0)] + "…"
 
     def _call_llm_stream(
         self,
