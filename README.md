@@ -172,12 +172,15 @@ If you point the agent at a local vLLM server started with a plain Gemma 4
 `--chat-template` such as:
 
 ```bash
+MODEL_DIR=/path/to/gemma-4-model
+CHAT_TEMPLATE='<gemma-4-chat-template>'
+
 docker run --runtime=nvidia \
     --gpus all \
     -p 7860:8000 \
     --ipc=host \
     -e VLLM_ENABLE_CUDA_COMPATIBILITY=1 \
-    -v /path/to/gemma-4-model:/model \
+    -v "${MODEL_DIR}:/model" \
     vllm/vllm-openai:gemma4-cu130 \
     --model /model \
     --gpu-memory-utilization 0.88 \
@@ -187,12 +190,13 @@ docker run --runtime=nvidia \
     --enable-log-requests \
     --enable-auto-tool-choice \
     --trust-remote-code \
-    --chat-template '<gemma-4-chat-template>'
+    --chat-template "${CHAT_TEMPLATE}"
 ```
 
 Replace `/path/to/gemma-4-model` with your local model directory and replace
 `<gemma-4-chat-template>` with the full Gemma 4 chat-template string you pass
-to vLLM.
+to vLLM. For multi-line templates, use shell quoting that preserves newlines or
+load the template text from a file before running `docker run`.
 
 Set the agent to prompt-mode tool calling:
 
