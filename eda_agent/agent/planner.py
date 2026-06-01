@@ -31,7 +31,7 @@ from typing import Any, Callable
 
 import httpx
 
-from eda_agent.agent.memory import AgentMemory, Message, search_similar_cases
+from eda_agent.agent.memory import AgentMemory, search_similar_cases
 from eda_agent.agent.subagents.contracts import (
     DecisionView,
     HitlGate,
@@ -101,6 +101,10 @@ When you have a final answer, summarise the PPA results clearly.
 class Planner:
     """ReAct agent that drives EDA tool calls through MiniMax."""
 
+    _CASE_TEXT_MAX_CHARS = 400
+    _CASE_ACTIONS_MAX_ITEMS = 4
+    _CASE_METRICS_MAX_CHARS = 300
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -111,6 +115,10 @@ class Planner:
         self._model = model or settings.minimax_model
         self._max_iterations = max_iterations or settings.agent_max_iterations
         self._base_url = settings.minimax_base_url.rstrip("/")
+        self._request_timeout = httpx.Timeout(settings.minimax_request_timeout_sec)
+        self._stream_timeout = httpx.Timeout(settings.minimax_stream_timeout_sec)
+        self._input_max_tokens = settings.minimax_input_max_tokens
+        self._timeout_retry_input_max_tokens = settings.minimax_timeout_retry_input_max_tokens
 
     # ------------------------------------------------------------------
     # Public interface
@@ -501,65 +509,12 @@ class Planner:
         so the rest of the ReAct loop is oblivious to the transport.
         Any error during streaming falls back to the non-streaming path.
         """
-
-        # Inject design context into system prompt if available
-        context = mem.extract_design_context()
-        context_prompt = ""
-        if context:
-            context_prompt = "\n\n## Current Design Context (USE THIS)\n"
-            for k, v in context.items():
-                context_prompt += f"- {k}: {v}\n"
-
-        # Inject similar historical cases if available
-        cases_prompt = ""
-        similar_cases: list[dict] = mem.get("_similar_cases") or []
-        if similar_cases:
-            cases_prompt = "\n\n## Similar Historical Cases (for reference)\n"
-            for i, case in enumerate(similar_cases, 1):
-                cases_prompt += (
-                    f"\n### Case {i} (design: {case.get('design_name', 'unknown')})\n"
-                    f"**Symptoms**: {case.get('symptoms', '')}\n"
-                    f"**Root cause**: {case.get('root_cause', '')}\n"
-                    f"**Actions taken**: {'; '.join(case.get('actions', []))}\n"
-                )
-                metrics = case.get("result_metrics") or {}
-                if metrics:
-                    cases_prompt += f"**Result metrics**: {metrics}\n"
-
-        # Build full system prompt
-        full_system_prompt = _SYSTEM_PROMPT + context_prompt + cases_prompt
-
-        # ── Prompt-mode tool calling ──────────────────────────────────────
-        # When llm_tool_calling_mode == "prompt" we do NOT send the OpenAI
-        # ``tools`` / ``tool_choice`` fields.  Instead we append a tool
-        # catalogue to the system prompt and instruct the model to respond
-        # with <tool_call> blocks.  We also rewrite the message list so
-        # assistant tool-call turns and tool-result turns are encoded as
-        # plain text, making them compatible with a simple chat template
-        # (e.g. the one used for local Gemma 4 deployments via vLLM).
         prompt_mode = settings.llm_tool_calling_mode == "prompt"
-        if prompt_mode:
-            full_system_prompt += self._tools_to_system_appendix(TOOL_SCHEMAS)
-
-        messages = mem.get_messages(system_prompt=full_system_prompt)
-        if prompt_mode:
-            messages = self._messages_for_prompt_mode(messages)
-
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": "Bearer " + self._api_key,
             "Content-Type": "application/json",
         }
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "messages": messages,
-            "max_tokens": settings.minimax_max_tokens,
-            "temperature": settings.minimax_temperature,
-        }
-        if not prompt_mode:
-            payload["tools"] = TOOL_SCHEMAS
-            payload["tool_choice"] = "auto"
 
-        # MiniMax requires group_id in the URL when using the v1 API
         group_id = settings.minimax_group_id
         url = (
             f"{self._base_url}/text/chatcompletion_v2"
@@ -569,8 +524,13 @@ class Planner:
         if group_id:
             url += f"?GroupId={group_id}"
 
-        # Create client without proxy settings
         transport = httpx.HTTPTransport()
+        payload = self._build_payload(
+            mem,
+            prompt_mode=prompt_mode,
+            include_similar_cases=True,
+            max_input_tokens=self._input_max_tokens,
+        )
         if stream:
             payload["stream"] = True
             try:
@@ -583,21 +543,27 @@ class Planner:
                     exc_info=True,
                 )
                 payload.pop("stream", None)
-                with httpx.Client(timeout=120, transport=transport) as client:
-                    resp = client.post(url, headers=headers, json=payload)
-                    resp.raise_for_status()
-                    raw_response = resp.json()
+                raw_response = self._post_chat_completion(
+                    url,
+                    headers,
+                    payload,
+                    transport,
+                    mem=mem,
+                    prompt_mode=prompt_mode,
+                )
         else:
-            with httpx.Client(timeout=120, transport=transport) as client:
-                resp = client.post(url, headers=headers, json=payload)
-                resp.raise_for_status()
-                raw_response = resp.json()
+            raw_response = self._post_chat_completion(
+                url,
+                headers,
+                payload,
+                transport,
+                mem=mem,
+                prompt_mode=prompt_mode,
+            )
 
-        # ── Prompt-mode: parse <tool_call> blocks from text response ────────────
         if prompt_mode:
             raw_response = self._normalize_prompt_mode_response(raw_response)
 
-        # Trace the LLM call if enabled
         if is_tracing_enabled():
             raw_response = trace_chat(
                 messages=payload["messages"],
@@ -606,6 +572,158 @@ class Planner:
             )
 
         return raw_response
+
+    def _build_payload(
+        self,
+        mem: AgentMemory,
+        *,
+        prompt_mode: bool,
+        include_similar_cases: bool,
+        max_input_tokens: int | None,
+    ) -> dict[str, Any]:
+        full_system_prompt = self._build_system_prompt(
+            mem, include_similar_cases=include_similar_cases
+        )
+        if prompt_mode:
+            full_system_prompt += self._tools_to_system_appendix(TOOL_SCHEMAS)
+
+        token_budget = (
+            max_input_tokens if max_input_tokens and max_input_tokens > 0 else None
+        )
+        messages = mem.get_messages(
+            system_prompt=full_system_prompt,
+            max_tokens=token_budget,
+        )
+        if prompt_mode:
+            messages = self._messages_for_prompt_mode(messages)
+
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": settings.minimax_max_tokens,
+            "temperature": settings.minimax_temperature,
+        }
+        if not prompt_mode:
+            payload["tools"] = TOOL_SCHEMAS
+            payload["tool_choice"] = "auto"
+        return payload
+
+    def _build_system_prompt(
+        self,
+        mem: AgentMemory,
+        *,
+        include_similar_cases: bool,
+    ) -> str:
+        context_prompt = ""
+        context = mem.extract_design_context()
+        if context:
+            context_prompt = "\n\n## Current Design Context (USE THIS)\n"
+            for k, v in context.items():
+                context_prompt += f"- {k}: {v}\n"
+
+        cases_prompt = ""
+        if include_similar_cases:
+            similar_cases: list[dict[str, Any]] = mem.get("_similar_cases") or []
+            cases_prompt = self._format_similar_cases_prompt(similar_cases)
+
+        return _SYSTEM_PROMPT + context_prompt + cases_prompt
+
+    def _post_chat_completion(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        transport: httpx.HTTPTransport,
+        *,
+        mem: AgentMemory,
+        prompt_mode: bool,
+    ) -> dict[str, Any]:
+        try:
+            return self._send_json_request(
+                url,
+                headers,
+                payload,
+                transport,
+                timeout=self._request_timeout,
+            )
+        except httpx.TimeoutException:
+            logger.warning(
+                "LLM request timed out; retrying with reduced context",
+                exc_info=True,
+            )
+            retry_budget = (
+                self._timeout_retry_input_max_tokens
+                if self._timeout_retry_input_max_tokens > 0
+                else self._input_max_tokens
+            )
+            retry_payload = self._build_payload(
+                mem,
+                prompt_mode=prompt_mode,
+                include_similar_cases=False,
+                max_input_tokens=retry_budget,
+            )
+            try:
+                return self._send_json_request(
+                    url,
+                    headers,
+                    retry_payload,
+                    transport,
+                    timeout=self._request_timeout,
+                )
+            except httpx.TimeoutException as retry_exc:
+                raise TimeoutError("LLM request timed out") from retry_exc
+
+    @staticmethod
+    def _send_json_request(
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        transport: httpx.HTTPTransport,
+        *,
+        timeout: httpx.Timeout,
+    ) -> dict[str, Any]:
+        with httpx.Client(timeout=timeout, transport=transport) as client:
+            resp = client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    @classmethod
+    def _format_similar_cases_prompt(
+        cls, similar_cases: list[dict[str, Any]]
+    ) -> str:
+        if not similar_cases:
+            return ""
+
+        cases_prompt = "\n\n## Similar Historical Cases (for reference)\n"
+        for i, case in enumerate(similar_cases, 1):
+            actions = case.get("actions") or []
+            action_text = "; ".join(
+                cls._truncate_text(str(action), cls._CASE_TEXT_MAX_CHARS)
+                for action in actions[: cls._CASE_ACTIONS_MAX_ITEMS]
+            )
+            cases_prompt += (
+                f"\n### Case {i} (design: {case.get('design_name', 'unknown')})\n"
+                f"**Symptoms**: "
+                f"{cls._truncate_text(case.get('symptoms', ''), cls._CASE_TEXT_MAX_CHARS)}\n"
+                f"**Root cause**: "
+                f"{cls._truncate_text(case.get('root_cause', ''), cls._CASE_TEXT_MAX_CHARS)}\n"
+                f"**Actions taken**: {action_text}\n"
+            )
+            metrics = case.get("result_metrics") or {}
+            if metrics:
+                metrics_text = cls._truncate_text(
+                    json.dumps(metrics, ensure_ascii=False),
+                    cls._CASE_METRICS_MAX_CHARS,
+                )
+                cases_prompt += f"**Result metrics**: {metrics_text}\n"
+        return cases_prompt
+
+    @staticmethod
+    def _truncate_text(value: Any, limit: int) -> str:
+        text = str(value or "")
+        if limit <= 0 or len(text) <= limit:
+            return text
+        return text[: max(limit - 1, 0)] + "…"
 
     def _call_llm_stream(
         self,
@@ -631,7 +749,7 @@ class Planner:
         finish_reason = "stop"
         model_name = self._model
 
-        with httpx.Client(timeout=300, transport=transport) as client:
+        with httpx.Client(timeout=self._stream_timeout, transport=transport) as client:
             with client.stream("POST", url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 for raw_line in resp.iter_lines():
