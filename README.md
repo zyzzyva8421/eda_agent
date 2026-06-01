@@ -139,14 +139,14 @@ Copy `.env.example` to `.env` and fill in:
 | `POSTGRES_*`                 | PostgreSQL connection details (user / password / host / port / db).|
 | `ORFS_ROOT`                  | Absolute path to OpenROAD-flow-scripts.                           |
 | `ORFS_MAKE_JOBS`             | `-j` value passed to ORFS make invocations.                       |
-| `INNOVUS_EXECUTION_MODE`       | Innovus execution mode: `ssh` (default), `local`, `pbs`, `slurm`.   |
+| `INNOVUS_EXECUTION_MODE`       | Innovus execution mode: `ssh` (default), `local`, `bsub`.   |
 | `INNOVUS_SSH_HOST`             | SSH hostname for remote Innovus host.                              |
 | `INNOVUS_SSH_USER`             | SSH username.                                                      |
 | `INNOVUS_SSH_PORT`            | SSH port (default 22).                                             |
 | `INNOVUS_SSH_PASSWORD`        | SSH password (used with sshpass).                                  |
 | `INNOVUS_BIN`                 | Path to Innovus binary on target host.                              |
 | `INNOVUS_REMOTE_WORKDIR`      | Base working directory on remote host.                             |
-| `INNOVUS_LOCAL_WORKDIR`       | Local working directory for `local`/`pbs`/`slurm` modes.          |
+| `INNOVUS_LOCAL_WORKDIR`       | Local working directory for `local`/`bsub` modes.          |
 | `INNOVUS_SCHEDULER_QUEUE`     | PBS queue or Slurm partition name.                                 |
 | `INNOVUS_SCHEDULER_ACCOUNT`   | Scheduler account/ project string.                                 |
 | `INNOVUS_SCHEDULER_EXTRA`     | Extra raw args appended to `qsub`/`sbatch` (e.g. `--nodes=2`).     |
@@ -159,11 +159,59 @@ Copy `.env.example` to `.env` and fill in:
 | `CUSTOM_TOOLS_DENYLIST`      | Optional comma-separated custom tool names to block.              |
 | `CUSTOM_TOOLS_ENABLE_ENTRYPOINTS` | Enable Python entry points custom tools (default true).     |
 | `CUSTOM_TOOLS_ENTRYPOINT_GROUP`   | Entry point group name (default `eda_agent.custom_tools`).   |
+| `LLM_TOOL_CALLING_MODE`           | `native` for OpenAI-style tool calling (default), `prompt` for chat templates that do not expand the `{{ tools }}` tool placeholder. |
 | `EDA_AGENT_LOG`              | Override CLI log level (`DEBUG` / `INFO` / …); takes precedence over `-v`. |
 | `NO_COLOR` / `EDA_AGENT_NO_COLOR` | Disable ANSI colours in the REPL output.                     |
 | `LANGSMITH_*`                | Optional LangSmith tracing.                                       |
 
 Run `eda-agent doctor` after editing `.env` to confirm everything is wired correctly.
+
+### Local Gemma 4 via vLLM
+
+If you point the agent at a local vLLM server started with a plain Gemma 4
+`--chat-template` such as:
+
+```bash
+MODEL_DIR=/path/to/gemma-4-model
+CHAT_TEMPLATE='paste your Gemma 4 chat template here'
+
+docker run --runtime=nvidia \
+    --gpus all \
+    -p 7860:8000 \
+    --ipc=host \
+    -e VLLM_ENABLE_CUDA_COMPATIBILITY=1 \
+    -v "${MODEL_DIR}:/model" \
+    vllm/vllm-openai:gemma4-cu130 \
+    --model /model \
+    --gpu-memory-utilization 0.88 \
+    --max-model-len 65535 \
+    --kv-cache-dtype fp8 \
+    --tool-call-parser gemma4 \
+    --enable-log-requests \
+    --enable-auto-tool-choice \
+    --trust-remote-code \
+    --chat-template "${CHAT_TEMPLATE}"
+```
+
+Replace `/path/to/gemma-4-model` with your local model directory and replace
+`paste your Gemma 4 chat template here` with the full Gemma 4 chat-template
+string you pass to vLLM. For multi-line templates, use shell quoting that
+preserves newlines or load the template text from a file before running
+`docker run`.
+
+Set the agent to prompt-mode tool calling:
+
+```bash
+# These MINIMAX_* settings are also used for compatible OpenAI-style local endpoints.
+MINIMAX_BASE_URL=http://127.0.0.1:7860/v1
+MINIMAX_API_KEY=dummy
+MINIMAX_MODEL=/model
+LLM_TOOL_CALLING_MODE=prompt
+```
+
+`prompt` mode is required for chat templates that only render plain
+`system`/`user`/`assistant` messages and do not expand the OpenAI `tools`
+payload directly.
 
 ## Custom tools (MVP)
 

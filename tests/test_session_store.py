@@ -220,6 +220,42 @@ def test_clear_session_noop_when_db_none():
 
 
 # ---------------------------------------------------------------------------
+# list_sessions
+# ---------------------------------------------------------------------------
+
+
+def test_list_sessions_counts_messages_from_python_list():
+    db = MagicMock()
+    result = MagicMock()
+    result.fetchall.return_value = [
+        ("s1", "alice", "2026-01-01T00:00:00Z", [{"role": "user"}, {"role": "assistant"}]),
+    ]
+    db.execute.return_value = result
+
+    rows = session_store.list_sessions("alice", db, limit=20)
+
+    assert len(rows) == 1
+    assert rows[0].session_id == "s1"
+    assert rows[0].username == "alice"
+    assert rows[0].message_count == 2
+
+
+def test_list_sessions_counts_messages_from_json_string():
+    db = MagicMock()
+    result = MagicMock()
+    result.fetchall.return_value = [
+        ("s2", "alice", "2026-01-01T00:00:00Z", '[{"role":"user"},{"role":"assistant"}]'),
+    ]
+    db.execute.return_value = result
+
+    rows = session_store.list_sessions("alice", db, limit=20)
+
+    assert len(rows) == 1
+    assert rows[0].session_id == "s2"
+    assert rows[0].message_count == 2
+
+
+# ---------------------------------------------------------------------------
 # default_cli_session_id
 # ---------------------------------------------------------------------------
 

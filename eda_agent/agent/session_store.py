@@ -18,6 +18,7 @@ A session row contains:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,7 +30,6 @@ from sqlalchemy.orm import Session
 
 from eda_agent.agent.memory import AgentMemory
 from eda_agent.db.session import (
-    supports_postgresql_jsonb,
     supports_postgresql_on_conflict,
 )
 
@@ -322,14 +322,13 @@ def list_sessions(
     """
     if db is None:
         return []
-    _json_len = "jsonb_array_length" if supports_postgresql_jsonb() else "json_array_length"
     try:
         if username is None:
             rows = db.execute(
                 text(
-                    f"""
+                    """
                     SELECT session_id, username, updated_at,
-                           {_json_len}(messages) AS msg_count
+                           messages
                     FROM agent_sessions
                     ORDER BY updated_at DESC
                     LIMIT :lim
@@ -340,9 +339,9 @@ def list_sessions(
         else:
             rows = db.execute(
                 text(
-                    f"""
+                    """
                     SELECT session_id, username, updated_at,
-                           {_json_len}(messages) AS msg_count
+                           messages
                     FROM agent_sessions
                     WHERE username = :uname
                     ORDER BY updated_at DESC
@@ -361,10 +360,28 @@ def list_sessions(
             session_id=r[0],
             username=r[1] or "",
             updated_at=r[2],
-            message_count=int(r[3] or 0),
+            message_count=_message_count_from_db_value(r[3]),
         )
         for r in rows
     ]
+
+
+def _message_count_from_db_value(messages: Any) -> int:
+    """Return message count from DB value (list / JSON string / legacy payload)."""
+    if messages is None:
+        return 0
+    if isinstance(messages, list):
+        return len(messages)
+    if isinstance(messages, tuple):
+        return len(messages)
+    if isinstance(messages, str):
+        try:
+            parsed = json.loads(messages)
+        except Exception:
+            return 0
+        if isinstance(parsed, list):
+            return len(parsed)
+    return 0
 
 
 # ---------------------------------------------------------------------------

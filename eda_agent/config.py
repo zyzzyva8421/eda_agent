@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, PostgresDsn, computed_field, model_validator
+from pydantic import Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     minimax_model: str = Field(default="MiniMax-Text-01")
     minimax_max_tokens: int = Field(default=4096)
     minimax_temperature: float = Field(default=0.2)
+    minimax_request_timeout_sec: float = Field(default=60.0)
+    minimax_stream_timeout_sec: float = Field(default=300.0)
+    minimax_input_max_tokens: int = Field(default=12000)
+    minimax_timeout_retry_input_max_tokens: int = Field(default=4000)
     # Maximum ReAct iterations per session
     agent_max_iterations: int = Field(default=10)
 
