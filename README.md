@@ -159,7 +159,7 @@ Copy `.env.example` to `.env` and fill in:
 | `CUSTOM_TOOLS_DENYLIST`      | Optional comma-separated custom tool names to block.              |
 | `CUSTOM_TOOLS_ENABLE_ENTRYPOINTS` | Enable Python entry points custom tools (default true).     |
 | `CUSTOM_TOOLS_ENTRYPOINT_GROUP`   | Entry point group name (default `eda_agent.custom_tools`).   |
-| `LLM_TOOL_CALLING_MODE`           | `native` for OpenAI-style tool calling, `prompt` for chat templates that do not expand the `{{ tools }}` tool placeholder. |
+| `LLM_TOOL_CALLING_MODE`           | `native` for OpenAI-style tool calling (default), `prompt` for chat templates that do not expand the `{{ tools }}` tool placeholder. |
 | `EDA_AGENT_LOG`              | Override CLI log level (`DEBUG` / `INFO` / …); takes precedence over `-v`. |
 | `NO_COLOR` / `EDA_AGENT_NO_COLOR` | Disable ANSI colours in the REPL output.                     |
 | `LANGSMITH_*`                | Optional LangSmith tracing.                                       |
@@ -173,7 +173,7 @@ If you point the agent at a local vLLM server started with a plain Gemma 4
 
 ```bash
 MODEL_DIR=/path/to/gemma-4-model
-CHAT_TEMPLATE='<gemma-4-chat-template>'
+CHAT_TEMPLATE='paste your Gemma 4 chat template here'
 
 docker run --runtime=nvidia \
     --gpus all \
@@ -194,9 +194,10 @@ docker run --runtime=nvidia \
 ```
 
 Replace `/path/to/gemma-4-model` with your local model directory and replace
-`<gemma-4-chat-template>` with the full Gemma 4 chat-template string you pass
-to vLLM. For multi-line templates, use shell quoting that preserves newlines or
-load the template text from a file before running `docker run`.
+`paste your Gemma 4 chat template here` with the full Gemma 4 chat-template
+string you pass to vLLM. For multi-line templates, use shell quoting that
+preserves newlines or load the template text from a file before running
+`docker run`.
 
 Set the agent to prompt-mode tool calling:
 
