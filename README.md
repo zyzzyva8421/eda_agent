@@ -159,11 +159,49 @@ Copy `.env.example` to `.env` and fill in:
 | `CUSTOM_TOOLS_DENYLIST`      | Optional comma-separated custom tool names to block.              |
 | `CUSTOM_TOOLS_ENABLE_ENTRYPOINTS` | Enable Python entry points custom tools (default true).     |
 | `CUSTOM_TOOLS_ENTRYPOINT_GROUP`   | Entry point group name (default `eda_agent.custom_tools`).   |
+| `LLM_TOOL_CALLING_MODE`           | `native` for OpenAI-style tool calling, `prompt` for chat templates that do not render `{{ tools }}`. |
 | `EDA_AGENT_LOG`              | Override CLI log level (`DEBUG` / `INFO` / …); takes precedence over `-v`. |
 | `NO_COLOR` / `EDA_AGENT_NO_COLOR` | Disable ANSI colours in the REPL output.                     |
 | `LANGSMITH_*`                | Optional LangSmith tracing.                                       |
 
 Run `eda-agent doctor` after editing `.env` to confirm everything is wired correctly.
+
+### Local Gemma 4 via vLLM
+
+If you point the agent at a local vLLM server started with a plain Gemma 4
+`--chat-template` such as:
+
+```bash
+docker run --runtime=nvidia \
+    --gpus all \
+    -p 7860:8000 \
+    --ipc=host \
+    -e VLLM_ENABLE_CUDA_COMPATIBILITY=1 \
+    -v /gui_team/model/google/gemma-4-31b:/model \
+    vllm/vllm-openai:gemma4-cu130 \
+    --model /model \
+    --gpu-memory-utilization 0.88 \
+    --max-model-len 65535 \
+    --kv-cache-dtype fp8 \
+    --tool-call-parser gemma4 \
+    --enable-log-requests \
+    --enable-auto-tool-choice \
+    --trust-remote-code \
+    --chat-template '...'
+```
+
+set the agent to prompt-mode tool calling:
+
+```bash
+MINIMAX_BASE_URL=http://127.0.0.1:7860/v1
+MINIMAX_API_KEY=dummy
+MINIMAX_MODEL=/model
+LLM_TOOL_CALLING_MODE=prompt
+```
+
+`prompt` mode is required for chat templates that only render plain
+`system`/`user`/`assistant` messages and do not expand the OpenAI `tools`
+payload directly.
 
 ## Custom tools (MVP)
 
