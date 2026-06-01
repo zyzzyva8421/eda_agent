@@ -159,7 +159,7 @@ Copy `.env.example` to `.env` and fill in:
 | `CUSTOM_TOOLS_DENYLIST`      | Optional comma-separated custom tool names to block.              |
 | `CUSTOM_TOOLS_ENABLE_ENTRYPOINTS` | Enable Python entry points custom tools (default true).     |
 | `CUSTOM_TOOLS_ENTRYPOINT_GROUP`   | Entry point group name (default `eda_agent.custom_tools`).   |
-| `LLM_TOOL_CALLING_MODE`           | `native` for OpenAI-style tool calling, `prompt` for chat templates that do not render `{{ tools }}`. |
+| `LLM_TOOL_CALLING_MODE`           | `native` for OpenAI-style tool calling, `prompt` for chat templates that do not expand the `{{ tools }}` tool placeholder. |
 | `EDA_AGENT_LOG`              | Override CLI log level (`DEBUG` / `INFO` / …); takes precedence over `-v`. |
 | `NO_COLOR` / `EDA_AGENT_NO_COLOR` | Disable ANSI colours in the REPL output.                     |
 | `LANGSMITH_*`                | Optional LangSmith tracing.                                       |
@@ -177,7 +177,7 @@ docker run --runtime=nvidia \
     -p 7860:8000 \
     --ipc=host \
     -e VLLM_ENABLE_CUDA_COMPATIBILITY=1 \
-    -v /path/to/gemma-4-31b:/model \
+    -v /path/to/gemma-4-model:/model \
     vllm/vllm-openai:gemma4-cu130 \
     --model /model \
     --gpu-memory-utilization 0.88 \
