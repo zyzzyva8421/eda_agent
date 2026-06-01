@@ -71,9 +71,18 @@ def tracer_wrapper(
     Returns:
         Response with added tracing info
     """
-    if not is_tracing_enabled() or _tracer_client is None:
+    if _tracer_client is None or not settings.langsmith_api_key:
         return response
 
+    # Attach metadata to response first; network/reporting failures should not
+    # remove local trace context used by callers and tests.
+    response["_tracing"] = {
+        "project": settings.langsmith_project,
+        "name": name,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+    # Best-effort remote reporting.
     try:
         # Extract standard fields from response
         model = response.get("model", "")
@@ -99,13 +108,6 @@ def tracer_wrapper(
 
         # Log to LangSmith
         _tracer_client.create_run(**run_data)
-
-        # Attach metadata to response for later reference
-        response["_tracing"] = {
-            "project": settings.langsmith_project,
-            "name": name,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
     except Exception:
         pass  # Non-blocking
 

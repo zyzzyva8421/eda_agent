@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from eda_agent.agent.memory import AgentMemory
 from eda_agent.db.session import (
+    supports_postgresql_jsonb,
     supports_postgresql_on_conflict,
 )
 
@@ -323,6 +324,50 @@ def list_sessions(
     if db is None:
         return []
     try:
+        if supports_postgresql_jsonb():
+            try:
+                if username is None:
+                    rows = db.execute(
+                        text(
+                            """
+                            SELECT session_id, username, updated_at,
+                                   jsonb_array_length(messages::jsonb) AS msg_count
+                            FROM agent_sessions
+                            ORDER BY updated_at DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": limit},
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        text(
+                            """
+                            SELECT session_id, username, updated_at,
+                                   jsonb_array_length(messages::jsonb) AS msg_count
+                            FROM agent_sessions
+                            WHERE username = :uname
+                            ORDER BY updated_at DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"uname": username, "lim": limit},
+                    ).fetchall()
+                return [
+                    SessionInfo(
+                        session_id=r[0],
+                        username=r[1] or "",
+                        updated_at=r[2],
+                        message_count=int(r[3] or 0),
+                    )
+                    for r in rows
+                ]
+            except Exception:
+                logger.debug(
+                    "list_sessions jsonb count path failed; falling back to Python counting",
+                    exc_info=True,
+                )
+
         if username is None:
             rows = db.execute(
                 text(

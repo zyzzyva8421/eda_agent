@@ -99,6 +99,14 @@ def test_parse_tool_calls_arguments_is_string():
     assert json.loads(calls[0]["function"]["arguments"]) == {"k": "v"}
 
 
+def test_parse_tool_calls_arguments_non_dict_are_json_encoded():
+    p = Planner()
+    text = '<tool_call>{"name": "foo", "arguments": "raw-string"}</tool_call>'
+    calls = p._parse_tool_calls_from_text(text)
+    assert calls[0]["function"]["arguments"] == '"raw-string"'
+    assert json.loads(calls[0]["function"]["arguments"]) == "raw-string"
+
+
 # ---------------------------------------------------------------------------
 # _messages_for_prompt_mode
 # ---------------------------------------------------------------------------
@@ -158,6 +166,31 @@ def test_messages_for_prompt_mode_final_assistant_unchanged():
     last = result[4]
     assert last["role"] == "assistant"
     assert last["content"] == "The WNS is -0.1 ns."
+
+
+def test_messages_for_prompt_mode_assistant_text_and_tool_calls_both_preserved():
+    p = Planner()
+    messages = [
+        {"role": "user", "content": "check"},
+        {
+            "role": "assistant",
+            "content": "I will call a tool first.",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "query_timing",
+                        "arguments": json.dumps({"design_name": "gcd"}),
+                    }
+                }
+            ],
+        },
+    ]
+
+    result = p._messages_for_prompt_mode(messages)
+    assert result[1]["role"] == "assistant"
+    assert "I will call a tool first." in result[1]["content"]
+    assert "<tool_call>" in result[1]["content"]
+    assert "query_timing" in result[1]["content"]
 
 
 def test_messages_for_prompt_mode_empty():

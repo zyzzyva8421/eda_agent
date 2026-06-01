@@ -255,6 +255,45 @@ def test_list_sessions_counts_messages_from_json_string():
     assert rows[0].message_count == 2
 
 
+def test_list_sessions_uses_sql_count_when_jsonb_supported():
+    db = MagicMock()
+    result = MagicMock()
+    result.fetchall.return_value = [
+        ("s3", "alice", "2026-01-01T00:00:00Z", 7),
+    ]
+    db.execute.return_value = result
+
+    with patch("eda_agent.agent.session_store.supports_postgresql_jsonb", return_value=True):
+        rows = session_store.list_sessions("alice", db, limit=20)
+
+    assert len(rows) == 1
+    assert rows[0].session_id == "s3"
+    assert rows[0].message_count == 7
+    sql = str(db.execute.call_args.args[0])
+    assert "jsonb_array_length" in sql
+
+
+def test_list_sessions_falls_back_to_python_count_when_jsonb_query_fails():
+    db = MagicMock()
+
+    class JsonbPathError(Exception):
+        pass
+
+    fallback_result = MagicMock()
+    fallback_result.fetchall.return_value = [
+        ("s4", "alice", "2026-01-01T00:00:00Z", '[{"role":"user"}]'),
+    ]
+    db.execute.side_effect = [JsonbPathError("bad cast"), fallback_result]
+
+    with patch("eda_agent.agent.session_store.supports_postgresql_jsonb", return_value=True):
+        rows = session_store.list_sessions("alice", db, limit=20)
+
+    assert len(rows) == 1
+    assert rows[0].session_id == "s4"
+    assert rows[0].message_count == 1
+    assert db.execute.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # default_cli_session_id
 # ---------------------------------------------------------------------------

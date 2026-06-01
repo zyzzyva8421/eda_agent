@@ -147,9 +147,9 @@ Copy `.env.example` to `.env` and fill in:
 | `INNOVUS_BIN`                 | Path to Innovus binary on target host.                              |
 | `INNOVUS_REMOTE_WORKDIR`      | Base working directory on remote host.                             |
 | `INNOVUS_LOCAL_WORKDIR`       | Local working directory for `local`/`bsub` modes.          |
-| `INNOVUS_SCHEDULER_QUEUE`     | PBS queue or Slurm partition name.                                 |
+| `INNOVUS_SCHEDULER_QUEUE`     | LSF queue name (used by `bsub -q`).                                |
 | `INNOVUS_SCHEDULER_ACCOUNT`   | Scheduler account/ project string.                                 |
-| `INNOVUS_SCHEDULER_EXTRA`     | Extra raw args appended to `qsub`/`sbatch` (e.g. `--nodes=2`).     |
+| `INNOVUS_SCHEDULER_EXTRA`     | Extra raw args appended to `bsub` (e.g. `-R "rusage[mem=8G]"`).   |
 | `PARQUET_ARCHIVE_DIR`        | Directory for Parquet archives.                                   |
 | `API_SECRET_KEY`             | 256-bit random secret for JWT signing.                            |
 | `API_ACCESS_TOKEN_EXPIRE_MINUTES` | JWT lifetime in minutes.                                     |

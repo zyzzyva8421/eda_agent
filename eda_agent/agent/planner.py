@@ -218,9 +218,16 @@ class Planner:
                 tc_id = tc.get("id", str(uuid.uuid4()))
                 fn_name = tc["function"]["name"]
                 try:
-                    arguments = json.loads(tc["function"].get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    arguments = {}
+                    raw_arguments = tc["function"].get("arguments", "{}")
+                    arguments = json.loads(raw_arguments)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid JSON arguments for tool '{fn_name}': {raw_arguments!r}"
+                    ) from exc
+                if not isinstance(arguments, dict):
+                    raise ValueError(
+                        f"Tool '{fn_name}' arguments must be a JSON object, got {type(arguments).__name__}"
+                    )
 
                 logger.info("Calling tool %s with %s", fn_name, arguments)
                 _emit("tool_call", {"name": fn_name, "arguments": arguments})
@@ -895,7 +902,7 @@ class Planner:
 
             elif role == "assistant":
                 tool_calls: list = msg.get("tool_calls") or []
-                if tool_calls and not content:
+                if tool_calls:
                     parts: list = []
                     for tc in tool_calls:
                         fn = tc.get("function") or {}
@@ -910,7 +917,10 @@ class Planner:
                         parts.append(
                             f'<tool_call>\n{{"name": "{name}", "arguments": {args_pretty}}}\n</tool_call>'
                         )
-                    content = "\n".join(parts)
+                    tool_call_text = "\n".join(parts)
+                    content = (
+                        f"{content}\n{tool_call_text}" if content else tool_call_text
+                    )
                 result.append({"role": "assistant", "content": content})
 
             elif role == "tool":
@@ -932,7 +942,7 @@ class Planner:
         prompt-mode path.
 
         Each ``<tool_call>`` block must contain a JSON object with at
-        least a ``"name"`` key and an optional ``"arguments"`` dict.
+        least a ``"name"`` key and an optional ``"arguments"`` value.
         Malformed blocks are skipped with a debug-level warning.
         """
         calls: list = []
@@ -957,11 +967,7 @@ class Planner:
                     "type": "function",
                     "function": {
                         "name": data["name"],
-                        "arguments": (
-                            json.dumps(args, ensure_ascii=False)
-                            if isinstance(args, dict)
-                            else str(args)
-                        ),
+                        "arguments": json.dumps(args, ensure_ascii=False),
                     },
                 }
             )
