@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from eda_agent.config import settings
 from sqlalchemy import text
 
 from eda_agent.config import settings
@@ -112,12 +114,17 @@ def archive_run(run_id: int, archive_dir: Path | None = None) -> dict[str, Path]
         # Congestion hotspots: export WKT text (geometry not directly parquet-able)
         written["congestion_hotspots"] = _write(
             "congestion_hotspots",
-            """
-            SELECT id, run_id, overflow, layer, created_at,
-                   ST_AsText(geom) AS geom_wkt
-            FROM congestion_hotspots
-            WHERE run_id = :run_id
-            """,
+            (
+                "SELECT id, run_id, overflow, layer, created_at,\n"
+                "       ST_AsText(geom) AS geom_wkt\n"
+                "FROM congestion_hotspots\n"
+                "WHERE run_id = :run_id"
+                if settings.enable_postgis else
+                "SELECT id, run_id, overflow, layer, created_at,\n"
+                "       geom AS geom_wkt\n"
+                "FROM congestion_hotspots\n"
+                "WHERE run_id = :run_id"
+            ),
             {"run_id": run_id},
         )
         written["utilization_summary"] = _write(

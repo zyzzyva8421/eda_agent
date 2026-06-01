@@ -11,13 +11,16 @@ No real PostgreSQL or LLM connection is required.
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from eda_agent.agent.memory import AgentMemory
 from eda_agent.api.main import app
 from eda_agent.api.auth import get_current_user
+from eda_agent.api.routers import agent_router
 from eda_agent.db.session import get_db_dependency
 
 
@@ -237,21 +240,168 @@ class TestRunsRouter:
 
     def test_trigger_run_blocked_by_guardrail(self, client):
         """clean=True in params must come back as blocked (guardrail fires)."""
-        resp = client.post("/runs/", json={
-            "backend": "orfs",
-            "stage": "synth",
-            "design_name": "gcd",
-            "design_config": "/tmp/x",
-            "pdk": "sky130hd",
-            "params": {"clean": True},
-        })
+        with patch("eda_agent.api.routers.runs_router._create_flow_session", return_value=1):
+            resp = client.post("/runs/", json={
+                "backend": "orfs",
+                "stage": "synth",
+                "design_name": "gcd",
+                "design_config": "/tmp/x",
+                "pdk": "sky130hd",
+                "params": {"clean": True},
+            })
         # run_eda_stage is a different tool from run_eda_flow; clean is a top-level arg
         # Result depends on tool signature; just verify it doesn't crash
         assert resp.status_code in (200, 202, 400, 422, 500)
 
+    def test_trigger_run_injects_session_context(self, client):
+        fake_result = {
+            "run_id": 101,
+            "status": "success",
+            "stage": "place",
+        }
+        with patch("eda_agent.api.routers.runs_router._create_flow_session", return_value=77), patch(
+            "eda_agent.api.routers.runs_router.execute_tool",
+            return_value=json.dumps(fake_result),
+        ) as mock_tool:
+            resp = client.post(
+                "/runs/",
+                json={
+                    "backend": "innovus",
+                    "stage": "place",
+                    "design_name": "InnovusBlk_18_1",
+                    "design_config": "/tmp/config",
+                    "pdk": "tsmc18",
+                    "params": {},
+                },
+            )
+
+        assert resp.status_code == 202
+        _, args = mock_tool.call_args[0]
+        assert args["run_context"]["session_id"] == 77
+        assert args["run_context"]["stage_seq"] == 1
+        assert args["run_context"]["variant_tag"] == "baseline"
+
+    def test_trigger_run_allows_blank_error_field(self, client):
+        fake_result = {
+            "run_id": 102,
+            "status": "success",
+            "stage": "place",
+            "error": "   ",
+        }
+        with patch("eda_agent.api.routers.runs_router._create_flow_session", return_value=88), patch(
+            "eda_agent.api.routers.runs_router.execute_tool",
+            return_value=json.dumps(fake_result),
+        ):
+            resp = client.post(
+                "/runs/",
+                json={
+                    "backend": "innovus",
+                    "stage": "place",
+                    "design_name": "InnovusBlk_18_1",
+                    "design_config": "/tmp/config",
+                    "pdk": "tsmc18",
+                    "params": {},
+                },
+            )
+
+        assert resp.status_code == 202
+        assert resp.json()["run_id"] == 102
+
+    def test_trigger_run_accepts_innovus_alias_fields(self, client):
+        fake_result = {
+            "run_id": 103,
+            "status": "success",
+            "stage": "place",
+        }
+        with patch("eda_agent.api.routers.runs_router._create_flow_session", return_value=99), patch(
+            "eda_agent.api.routers.runs_router.execute_tool",
+            return_value=json.dumps(fake_result),
+        ) as mock_tool:
+            resp = client.post(
+                "/runs/",
+                json={
+                    "backend": "innovus",
+                    "stage": "place",
+                    "design_name": "InnovusBlk_18_1",
+                    "innovus_workdir": "/remote/innovus/workdir",
+                    "tech_profile": "n5_profile",
+                    "params": {},
+                },
+            )
+
+        assert resp.status_code == 202
+        _, args = mock_tool.call_args[0]
+        assert args["design_config"] == "/remote/innovus/workdir"
+        assert args["pdk"] == "n5_profile"
+
+    def test_trigger_run_orfs_missing_design_config_returns_422(self, client):
+        resp = client.post(
+            "/runs/",
+            json={
+                "backend": "orfs",
+                "stage": "route",
+                "design_name": "aes",
+                "pdk": "sky130hd",
+                "params": {},
+            },
+        )
+
+        assert resp.status_code == 422
+
     def test_list_runs_requires_auth(self, unauthed_client):
         resp = unauthed_client.get("/runs/")
         assert resp.status_code == 401
+
+    def test_get_session_trace(self, client):
+        fake_trace = {
+            "session": {"id": 1, "status": "active"},
+            "runs": [],
+            "stage_outcomes": [],
+            "decision_trace": [],
+        }
+
+        with patch(
+            "eda_agent.api.routers.runs_router.EDAQueryRepository.get_session_trace",
+            return_value=fake_trace,
+        ) as mock_trace:
+            resp = client.get("/runs/sessions/1/trace")
+
+        assert resp.status_code == 200
+        assert resp.json()["session"]["id"] == 1
+        mock_trace.assert_called_once()
+
+    def test_get_session_trace_with_filters(self, client):
+        fake_trace = {
+            "session": {"id": 2, "status": "completed"},
+            "runs": [{"id": 10, "stage": "place", "stage_seq": 2}],
+            "stage_outcomes": [],
+            "decision_trace": [],
+        }
+
+        with patch(
+            "eda_agent.api.routers.runs_router.EDAQueryRepository.get_session_trace",
+            return_value=fake_trace,
+        ) as mock_trace:
+            resp = client.get(
+                "/runs/sessions/2/trace?stage=place&from_seq=2&to_seq=4&human_approved=true"
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["runs"][0]["stage"] == "place"
+        _, kwargs = mock_trace.call_args
+        assert kwargs["stage"] == "place"
+        assert kwargs["from_seq"] == 2
+        assert kwargs["to_seq"] == 4
+        assert kwargs["human_approved"] is True
+
+    def test_get_session_trace_not_found(self, client):
+        with patch(
+            "eda_agent.api.routers.runs_router.EDAQueryRepository.get_session_trace",
+            return_value={"error": "Session 999 not found"},
+        ):
+            resp = client.get("/runs/sessions/999/trace")
+
+        assert resp.status_code == 404
 
 
 # ── Agent chat router ─────────────────────────────────────────────────────────
@@ -302,6 +452,62 @@ class TestAgentChatRouter:
             resp = client.post("/agent/chat", json={"message": ""})
         assert resp.status_code == 200
 
+    def test_chat_scratchpad_survives_across_requests(self, client):
+        """Scratchpad set in one request is visible in the next (same session).
+
+        Regression guard: ``extract_design_context`` reads the durable
+        ``context`` namespace of the scratchpad, so it must survive the
+        ``save_session`` → DB → ``load_session`` round-trip handled by
+        :mod:`eda_agent.agent.session_store`.
+        """
+        storage: dict[str, Any] = {}
+
+        def mock_load(sid: str, db: Any) -> AgentMemory:
+            raw = storage.get(sid)
+            return AgentMemory.from_dict(raw) if raw else AgentMemory()
+
+        def mock_save(sid: str, uname: str, mem: AgentMemory, db: Any) -> None:
+            storage[sid] = mem.to_dict()
+
+        with (
+            patch.object(agent_router, "load_session", side_effect=mock_load),
+            patch.object(agent_router, "save_session", side_effect=mock_save),
+            patch("eda_agent.api.routers.agent_router.Planner") as MockPlanner,
+        ):
+            instance = MockPlanner.return_value
+
+            # ── Request 1: planner stores design context ──
+            def run1(msg: str, memory: AgentMemory | None = None) -> str:
+                if memory is not None:
+                    memory.set("design_name", "aes")
+                    memory.set("pdk", "sky130hd")
+                return f"running {msg}"
+            instance.run.side_effect = run1
+
+            resp1 = client.post(
+                "/agent/chat",
+                json={"message": "run place on aes", "session_id": "sess-x"},
+            )
+            assert resp1.status_code == 200
+
+            # ── Request 2: same session, scratchpad must be restored ──
+            def run2(msg: str, memory: AgentMemory | None = None) -> str:
+                ctx = memory.extract_design_context() if memory is not None else {}
+                if ctx.get("design_name") == "aes" and ctx.get("pdk") == "sky130hd":
+                    return f"context restored: {ctx}"
+                return "context lost"
+            instance.run.side_effect = run2
+
+            resp2 = client.post(
+                "/agent/chat",
+                json={"message": "what is WNS?", "session_id": "sess-x"},
+            )
+            assert resp2.status_code == 200
+            reply = resp2.json()["reply"]
+            assert "context restored" in reply, (
+                f"Expected 'context restored' in reply, got: {reply}"
+            )
+
 
 # ── OpenAPI schema ────────────────────────────────────────────────────────────
 
@@ -318,3 +524,18 @@ def test_openapi_schema_accessible(client):
     assert any(p.startswith("/metrics") for p in paths)
     assert any(p.startswith("/runs") for p in paths)
     assert any(p.startswith("/agent") for p in paths)
+
+
+def test_openapi_runs_request_exposes_innovus_alias_fields(client):
+    resp = client.get("/openapi.json")
+    assert resp.status_code == 200
+    schema = resp.json()
+
+    run_req = schema["components"]["schemas"].get("RunStageRequest")
+    assert run_req is not None
+    props = run_req.get("properties", {})
+
+    assert "innovus_workdir" in props
+    assert "tech_profile" in props
+    assert "description" in props["innovus_workdir"]
+    assert "description" in props["tech_profile"]

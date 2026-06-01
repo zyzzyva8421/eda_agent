@@ -358,9 +358,12 @@ class AgentMemory:
     def extract_design_context(self) -> dict[str, str]:
         """Return the durable context as a flat ``str → str`` dict.
 
-        Provided for backwards compatibility with the previous planner
-        code which expected a string-only dict.  Non-string values are
-        coerced via ``str()``.
+        Reads from the ``context`` namespace of the scratchpad which is
+        populated by :meth:`update_context_from_tool` and persisted
+        across process restarts via the session store.  Non-string
+        values are coerced via ``str()`` for backwards compatibility
+        with the previous planner code which expected a string-only
+        dict.
         """
         return {k: str(v) for k, v in self.context().items() if v not in (None, "")}
 
@@ -421,20 +424,21 @@ def save_case(
     """Persist a resolved debugging case and return its DB id."""
     from sqlalchemy import text as _text
 
-    from eda_agent.db.session import get_db
+    from eda_agent.db.session import get_db, supports_postgresql_jsonb
 
     actions_val = actions or []
     metrics_val = result_metrics or {}
 
+    _jc = "::jsonb" if supports_postgresql_jsonb() else ""
     with get_db() as db:
         row = db.execute(
             _text(
-                """
+                f"""
                 INSERT INTO case_memory
                     (design_name, pdk, symptoms, root_cause, actions, result_metrics)
                 VALUES
                     (:design_name, :pdk, :symptoms, :root_cause,
-                     :actions::jsonb, :metrics::jsonb)
+                     :actions{_jc}, :metrics{_jc})
                 RETURNING id
                 """
             ),

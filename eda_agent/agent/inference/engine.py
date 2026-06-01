@@ -18,10 +18,11 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
-from eda_agent.db.session import get_db
+from eda_agent.db.session import get_db, supports_postgresql_jsonb
 
 from .features import FeatureVector, extract_features
 from .rules import RULE_BY_ID, RULES
@@ -30,6 +31,9 @@ from .weights import get_multipliers, update_weights
 logger = logging.getLogger(__name__)
 
 _CONFIDENCE_THRESHOLDS = {"high": 0.65, "medium": 0.35}
+
+if TYPE_CHECKING:
+    from .rules import Rule
 
 
 def _score_to_confidence(score: float) -> str:
@@ -77,14 +81,15 @@ def _save_inference(
 ) -> int:
     """Insert a root_cause_inferences row and return its id."""
     try:
+        _jc = "::jsonb" if supports_postgresql_jsonb() else ""
         with get_db() as db:
             row = db.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO root_cause_inferences
                         (run_id, symptoms, features, hypotheses)
                     VALUES
-                        (:run_id, :symptoms, :features::jsonb, :hypotheses::jsonb)
+                        (:run_id, :symptoms, :features{_jc}, :hypotheses{_jc})
                     RETURNING id
                     """
                 ),
@@ -146,7 +151,8 @@ def infer(run_id: int, symptoms: str = "") -> dict:
     for rule in RULES:
         raw_score, evidence, anti_evidence = rule.score(fv)
         mult = multipliers.get(rule.id, 1.0)
-        adjusted = min(1.0, raw_score * mult)  # cap at 1.0 to keep confidence thresholds stable
+        # cap at 1.0 to keep confidence thresholds stable
+        adjusted = min(1.0, raw_score * mult)
         if adjusted >= rule.min_score:
             fired.append((adjusted, raw_score, evidence, anti_evidence, rule))
 
@@ -155,7 +161,9 @@ def infer(run_id: int, symptoms: str = "") -> dict:
 
     # Build hypothesis list (top 3)
     hypotheses: list[dict] = []
-    for rank, (adj_score, raw_score, evidence, anti_evidence, rule) in enumerate(fired[:3], start=1):
+    for rank, (adj_score, raw_score, evidence, anti_evidence, rule) in enumerate(
+        fired[:3], start=1
+    ):
         mult = multipliers.get(rule.id, 1.0)
         hypotheses.append(
             {

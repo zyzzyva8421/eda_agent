@@ -24,10 +24,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from psycopg2.extras import Json
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from eda_agent.agent.memory import AgentMemory
+from eda_agent.db.session import (
+    supports_postgresql_jsonb,
+    supports_postgresql_on_conflict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,101 @@ logger = logging.getLogger(__name__)
 # exceeded we drop the oldest message pairs until we fit – see
 # :meth:`AgentMemory.shrink_to_byte_budget`.
 MAX_SESSION_BYTES = 512 * 1024
+
+
+def _rollback_quietly(db: Session | None) -> None:
+    if db is None:
+        return
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
+
+def _is_missing_column_error(exc: Exception, column: str) -> bool:
+    text = str(exc).lower()
+    return column.lower() in text and ("does not exist" in text or "undefinedcolumn" in text)
+
+
+def _update_then_insert_session(
+    db: Session,
+    session_id: str,
+    username: str,
+    payload: dict[str, Any],
+) -> None:
+    scratchpad = Json(payload["scratchpad"])
+    messages = Json(payload["messages"])
+    updated = db.execute(
+        text(
+            """
+            UPDATE agent_sessions
+            SET messages = :msgs,
+                scratchpad = :scratch,
+                updated_at = now()
+            WHERE session_id = :sid
+            """
+        ),
+        {
+            "sid": session_id,
+            "uname": username,
+            "msgs": messages,
+            "scratch": scratchpad,
+        },
+    )
+    if updated.rowcount == 0:
+        db.execute(
+            text(
+                """
+                INSERT INTO agent_sessions
+                    (session_id, username, messages, scratchpad, updated_at)
+                VALUES (:sid, :uname, :msgs, :scratch, now())
+                """
+            ),
+            {
+                "sid": session_id,
+                "uname": username,
+                "msgs": messages,
+                "scratch": scratchpad,
+            },
+        )
+
+
+def _update_then_insert_session_legacy(
+    db: Session,
+    session_id: str,
+    username: str,
+    messages: Json,
+) -> None:
+    updated = db.execute(
+        text(
+            """
+            UPDATE agent_sessions
+            SET messages = :msgs,
+                updated_at = now()
+            WHERE session_id = :sid
+            """
+        ),
+        {
+            "sid": session_id,
+            "uname": username,
+            "msgs": messages,
+        },
+    )
+    if updated.rowcount == 0:
+        db.execute(
+            text(
+                """
+                INSERT INTO agent_sessions
+                    (session_id, username, messages, updated_at)
+                VALUES (:sid, :uname, :msgs, now())
+                """
+            ),
+            {
+                "sid": session_id,
+                "uname": username,
+                "msgs": messages,
+            },
+        )
 
 
 @dataclass
@@ -58,6 +158,7 @@ def load_session(session_id: str, db: Session | None) -> AgentMemory:
     """
     if db is None:
         return AgentMemory()
+    used_legacy_layout = False
     try:
         row = (
             db.execute(
@@ -70,16 +171,46 @@ def load_session(session_id: str, db: Session | None) -> AgentMemory:
             .mappings()
             .first()
         )
-    except Exception:  # pragma: no cover – DB unavailable
-        logger.debug("load_session(%s) failed", session_id, exc_info=True)
-        return AgentMemory()
+    except Exception as exc:  # pragma: no cover – DB unavailable
+        _rollback_quietly(db)
+        if not _is_missing_column_error(exc, "scratchpad"):
+            logger.debug("load_session(%s) failed", session_id, exc_info=True)
+            return AgentMemory()
+        # Backward compatibility: old schema has only `messages`.
+        used_legacy_layout = True
+        try:
+            row = (
+                db.execute(
+                    text(
+                        "SELECT messages FROM agent_sessions "
+                        "WHERE session_id = :sid"
+                    ),
+                    {"sid": session_id},
+                )
+                .mappings()
+                .first()
+            )
+        except Exception:  # pragma: no cover – DB unavailable
+            _rollback_quietly(db)
+            logger.debug("load_session(%s) legacy fallback failed", session_id, exc_info=True)
+            return AgentMemory()
 
     if not row:
         return AgentMemory()
 
     raw_messages = row.get("messages") or []
-    raw_scratchpad = row.get("scratchpad") or {}
+    raw_scratchpad = {} if used_legacy_layout else (row.get("scratchpad") or {})
+    if isinstance(raw_messages, str):
+        # Legacy / defensive path: tolerate accidentally stringified JSON.
+        import json
+
+        try:
+            raw_messages = json.loads(raw_messages)
+        except Exception:
+            raw_messages = []
     if isinstance(raw_scratchpad, str):
+        import json
+
         try:
             raw_scratchpad = json.loads(raw_scratchpad)
         except Exception:
@@ -98,33 +229,71 @@ def save_session(
     """Upsert ``memory`` into the DB.  No-op when ``db`` is ``None``."""
     if db is None:
         return
+    did_fallback = False
     try:
         # Enforce a per-session size cap by dropping oldest message pairs
         # until the serialised payload fits.
         memory.shrink_to_byte_budget(MAX_SESSION_BYTES)
         payload = memory.to_dict(persist_internal=False)
-        db.execute(
-            text(
-                """
-                INSERT INTO agent_sessions
-                    (session_id, username, messages, scratchpad, updated_at)
-                VALUES (:sid, :uname, :msgs, :scratch, now())
-                ON CONFLICT (session_id) DO UPDATE
-                  SET messages   = EXCLUDED.messages,
-                      scratchpad = EXCLUDED.scratchpad,
-                      updated_at = now()
-                """
-            ),
-            {
-                "sid": session_id,
-                "uname": username,
-                "msgs": json.dumps(payload["messages"]),
-                "scratch": json.dumps(payload["scratchpad"]),
-            },
-        )
+        if supports_postgresql_on_conflict():
+            db.execute(
+                text(
+                    """
+                    INSERT INTO agent_sessions
+                        (session_id, username, messages, scratchpad, updated_at)
+                    VALUES (:sid, :uname, :msgs, :scratch, now())
+                    ON CONFLICT (session_id) DO UPDATE
+                      SET messages   = EXCLUDED.messages,
+                          scratchpad = EXCLUDED.scratchpad,
+                          updated_at = now()
+                    """
+                ),
+                {
+                    "sid": session_id,
+                    "uname": username,
+                    "msgs": Json(payload["messages"]),
+                    "scratch": Json(payload["scratchpad"]),
+                },
+            )
+        else:
+            _update_then_insert_session(db, session_id, username, payload)
         db.commit()
-    except Exception:  # pragma: no cover – DB unavailable
+    except Exception as exc:  # pragma: no cover – DB unavailable
+        _rollback_quietly(db)
+        if _is_missing_column_error(exc, "scratchpad"):
+            did_fallback = True
+            try:
+                messages = Json(payload["messages"])
+                if supports_postgresql_on_conflict():
+                    db.execute(
+                        text(
+                            """
+                            INSERT INTO agent_sessions
+                                (session_id, username, messages, updated_at)
+                            VALUES (:sid, :uname, :msgs, now())
+                            ON CONFLICT (session_id) DO UPDATE
+                              SET messages   = EXCLUDED.messages,
+                                  updated_at = now()
+                            """
+                        ),
+                        {
+                            "sid": session_id,
+                            "uname": username,
+                            "msgs": messages,
+                        },
+                    )
+                else:
+                    _update_then_insert_session_legacy(db, session_id, username, messages)
+                db.commit()
+                return
+            except Exception:  # pragma: no cover – DB unavailable
+                _rollback_quietly(db)
+                logger.debug("save_session(%s) legacy fallback failed", session_id, exc_info=True)
+                return
         logger.debug("save_session(%s) failed", session_id, exc_info=True)
+    finally:
+        if did_fallback:
+            logger.debug("save_session(%s) used legacy layout fallback", session_id)
 
 
 def clear_session(session_id: str, db: Session | None) -> None:
@@ -138,6 +307,7 @@ def clear_session(session_id: str, db: Session | None) -> None:
         )
         db.commit()
     except Exception:  # pragma: no cover
+        _rollback_quietly(db)
         logger.debug("clear_session(%s) failed", session_id, exc_info=True)
 
 
@@ -154,12 +324,56 @@ def list_sessions(
     if db is None:
         return []
     try:
+        if supports_postgresql_jsonb():
+            try:
+                if username is None:
+                    rows = db.execute(
+                        text(
+                            """
+                            SELECT session_id, username, updated_at,
+                                   jsonb_array_length(messages::jsonb) AS msg_count
+                            FROM agent_sessions
+                            ORDER BY updated_at DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": limit},
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        text(
+                            """
+                            SELECT session_id, username, updated_at,
+                                   jsonb_array_length(messages::jsonb) AS msg_count
+                            FROM agent_sessions
+                            WHERE username = :uname
+                            ORDER BY updated_at DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"uname": username, "lim": limit},
+                    ).fetchall()
+                return [
+                    SessionInfo(
+                        session_id=r[0],
+                        username=r[1] or "",
+                        updated_at=r[2],
+                        message_count=int(r[3] or 0),
+                    )
+                    for r in rows
+                ]
+            except Exception:
+                logger.debug(
+                    "list_sessions jsonb count path failed; falling back to Python counting",
+                    exc_info=True,
+                )
+
         if username is None:
             rows = db.execute(
                 text(
                     """
                     SELECT session_id, username, updated_at,
-                           jsonb_array_length(messages) AS msg_count
+                           messages
                     FROM agent_sessions
                     ORDER BY updated_at DESC
                     LIMIT :lim
@@ -172,7 +386,7 @@ def list_sessions(
                 text(
                     """
                     SELECT session_id, username, updated_at,
-                           jsonb_array_length(messages) AS msg_count
+                           messages
                     FROM agent_sessions
                     WHERE username = :uname
                     ORDER BY updated_at DESC
@@ -182,6 +396,7 @@ def list_sessions(
                 {"uname": username, "lim": limit},
             ).fetchall()
     except Exception:  # pragma: no cover
+        _rollback_quietly(db)
         logger.debug("list_sessions failed", exc_info=True)
         return []
 
@@ -190,10 +405,28 @@ def list_sessions(
             session_id=r[0],
             username=r[1] or "",
             updated_at=r[2],
-            message_count=int(r[3] or 0),
+            message_count=_message_count_from_db_value(r[3]),
         )
         for r in rows
     ]
+
+
+def _message_count_from_db_value(messages: Any) -> int:
+    """Return message count from DB value (list / JSON string / legacy payload)."""
+    if messages is None:
+        return 0
+    if isinstance(messages, list):
+        return len(messages)
+    if isinstance(messages, tuple):
+        return len(messages)
+    if isinstance(messages, str):
+        try:
+            parsed = json.loads(messages)
+        except Exception:
+            return 0
+        if isinstance(parsed, list):
+            return len(parsed)
+    return 0
 
 
 # ---------------------------------------------------------------------------

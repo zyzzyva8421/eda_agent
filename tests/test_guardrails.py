@@ -20,6 +20,7 @@ from eda_agent.agent.guardrails import (
     _check_long_running,
     _check_utilization,
     check,
+    register_custom_tool_policies,
 )
 from eda_agent.agent.tools import execute_tool
 
@@ -234,6 +235,37 @@ def test_check_confirmed_false_does_not_bypass():
     """_guardrail_confirmed=False must NOT bypass checks."""
     r = check("run_eda_flow", {"clean": True, "_guardrail_confirmed": False})
     assert r.is_blocked
+
+
+def test_custom_tool_policy_warn():
+    register_custom_tool_policies(
+        {"my_custom": {"risk_level": "warn", "requires_confirmation": False}}
+    )
+    r = check("my_custom", {})
+    assert r.level == RiskLevel.WARN
+    assert r.warnings
+    register_custom_tool_policies({})
+
+
+def test_custom_tool_policy_block():
+    register_custom_tool_policies(
+        {"my_custom": {"risk_level": "block", "requires_confirmation": False}}
+    )
+    r = check("my_custom", {})
+    assert r.is_blocked
+    register_custom_tool_policies({})
+
+
+def test_custom_tool_policy_requires_confirmation():
+    register_custom_tool_policies(
+        {"my_custom": {"risk_level": "safe", "requires_confirmation": True}}
+    )
+    blocked = check("my_custom", {})
+    assert blocked.is_blocked
+
+    allowed = check("my_custom", {"_guardrail_confirmed": True})
+    assert allowed.level == RiskLevel.SAFE
+    register_custom_tool_policies({})
 
 
 # ── execute_tool integration ──────────────────────────────────────────────────

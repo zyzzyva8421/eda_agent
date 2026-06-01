@@ -310,6 +310,8 @@ def _run_cli_cmd(argv: list[str]) -> tuple[str, str, int]:
 
 class TestCLIJobCommands:
     def test_submit_creates_job(self, tmp_path):
+        cfg = tmp_path / "config.mk"
+        cfg.write_text("DESIGN_NAME=aes\n")
         with patch("eda_agent.queue.store._DEFAULT_DB_PATH", tmp_path / "j.db"), patch(
             "eda_agent.cli._ensure_worker"
         ):
@@ -318,7 +320,7 @@ class TestCLIJobCommands:
                     "submit",
                     "--stage", "synth",
                     "--design", "aes",
-                    "--config", "/path/config.mk",
+                    "--config", str(cfg),
                     "--pdk", "sky130hd",
                     "--no-worker",
                 ]
@@ -388,6 +390,8 @@ class TestCLIJobCommands:
 
     def test_submit_with_params(self, tmp_path):
         db_path = tmp_path / "j.db"
+        cfg = tmp_path / "cfg.mk"
+        cfg.write_text("DESIGN_NAME=aes\n")
         with patch("eda_agent.queue.store._DEFAULT_DB_PATH", db_path), patch(
             "eda_agent.cli._ensure_worker"
         ):
@@ -396,7 +400,7 @@ class TestCLIJobCommands:
                     "submit",
                     "--stage", "route",
                     "--design", "aes",
-                    "--config", "/cfg.mk",
+                    "--config", str(cfg),
                     "--param", "CORE_UTILIZATION=40",
                     "--param", "CLOCK_PERIOD=1.5",
                     "--no-worker",

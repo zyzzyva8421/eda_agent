@@ -4,8 +4,8 @@ Stores L2 session facts (design_name / pdk / config_path / last_run_id …)
 so they survive process restarts alongside the OpenAI-format ``messages``
 history.
 
-Revision ID: 0007
-Revises: 0006
+Revision ID: 0012
+Revises: 0011
 Create Date: 2026-05-27
 """
 
@@ -15,9 +15,10 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from eda_agent.db.json_type import JSON_OR_JSONB
 
-revision: str = "0007"
-down_revision: Union[str, None] = "0006"
+revision: str = "0012"
+down_revision: Union[str, None] = "0011"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -27,7 +28,7 @@ def upgrade() -> None:
         "agent_sessions",
         sa.Column(
             "scratchpad",
-            sa.dialects.postgresql.JSONB,
+            JSON_OR_JSONB,
             nullable=False,
             server_default="{}",
         ),

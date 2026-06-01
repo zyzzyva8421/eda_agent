@@ -27,18 +27,20 @@ to an in-memory session (same behaviour as before).
 
 Commands inside the REPL
 ------------------------
-    clear              -- drop message history (keep design context)
-    forget             -- drop EVERYTHING and delete the row from the DB
-    history [--full]   -- print message history (default: 200-char preview)
-    sessions           -- list recent sessions for the current user
-    session <id>       -- switch to / create another session
-    cd <dir>           -- change the working directory
+    /clear             -- drop message history (keep design context)
+    /forget            -- drop EVERYTHING and delete the row from the DB
+    /history [--full]  -- print message history (default: 200-char preview)
+    /sessions          -- list recent sessions for the current user
+    /session <id>      -- switch to / create another session
+    /cd <dir>          -- change the working directory
+    /help              -- show command help
+    '\"\"\"'          -- start / end a multi-line input block
     !<shell_cmd>       -- run a shell command (e.g. ``!ls -la``, ``!pwd``)
-    exit / quit / Ctrl-D / Ctrl-C  -- exit
+    exit / quit / Ctrl-D  -- exit
 
 Tab Completion:
 ------------------------
-    Press Tab to autocomplete built-in commands (clear, history, help, exit, cd).
+    Press Tab to autocomplete built-in commands (/clear, /history, /help, /cd).
     Tab also completes file/directory paths for any argument.
     When using the ``!`` prefix, Tab completes executables from PATH and paths.
     Use up/down arrow keys to navigate command history.
@@ -51,6 +53,7 @@ import argparse
 import atexit
 import getpass
 import glob as _glob
+import logging
 import os
 import subprocess
 import sys
@@ -73,22 +76,26 @@ from eda_agent.agent.session_store import (
     open_db,
     save_session,
 )
+from eda_agent.console import Console, Spinner
 
 # Built-in commands for tab completion
 _BUILTIN_COMMANDS = [
-    "cd",
-    "clear",
+    "/cd",
+    "/clear",
+    "/exit",
+    "/forget",
+    "/help",
+    "/history",
+    "/quit",
+    "/session",
+    "/sessions",
     "exit",
-    "forget",
-    "help",
-    "history",
     "quit",
-    "session",
-    "sessions",
 ]
 
 # History file path for persistent readline history
 _HISTORY_FILE = os.path.expanduser("~/.eda_agent_history")
+_MULTILINE_SENTINEL = '"""'
 
 
 def _complete_cmd_name(prefix: str) -> list[str]:
@@ -128,6 +135,8 @@ def _path_completions(text: str) -> list[str]:
 def _setup_readline():
     """Configure readline with tab completion and load persistent history."""
     if not _HAS_READLINE:
+        return
+    if not sys.stdin.isatty():
         return
 
     def completer(text, state):
@@ -187,20 +196,23 @@ def _save_history():
 _BANNER = """\
 \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
 \u2551          EDA Agent  \u2013  Interactive CLI               \u2551
-\u2551  Type 'help' for commands, 'exit' to quit.           \u2551
+\u2551  Type '/help' for commands, 'exit' to quit.          \u2551
 \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
 """
 
 _HELP = """\
 Built-in commands:
-  clear              -- drop message history (keep design context)
-  forget             -- drop EVERYTHING and delete this session from the DB
-  history [--full]   -- show message history (default: 200-char preview)
-  sessions           -- list recent sessions for your user
-  session <id>       -- switch to / create another session
-  cd <dir>           -- change working directory
-  help               -- show this help
-  exit               -- quit (also: quit, Ctrl-D, Ctrl-C)
+    /clear             -- drop message history (keep design context)
+    /forget            -- drop EVERYTHING and delete this session from the DB
+    /history [--full]  -- show message history (default: 200-char preview)
+    /sessions          -- list recent sessions for your user
+    /session <id>      -- switch to / create another session
+    /cd <dir>          -- change working directory
+    /help              -- show this help
+    exit               -- quit (also: quit, Ctrl-D)
+
+Multi-line input:
+    '\"\"\"'          -- start a multi-line block; enter '\"\"\"' again to send it
 
 Shell commands:
   !<cmd> [args]  -- run a shell command (e.g. !ls -la, !pwd, !cat file.txt)
@@ -221,8 +233,9 @@ def _print_history(memory: AgentMemory, full: bool = False) -> None:
     for i, m in enumerate(msgs, 1):
         role = m.get("role", "?").upper()
         content = m.get("content") or ""
-        if not full:
-            content = content[:200]
+        if not full and len(content) > 200:
+            hidden = len(content) - 200
+            content = content[:200] + f"... [truncated {hidden} chars]"
         print(f"[{i}] {role}: {content}")
 
 
@@ -243,7 +256,81 @@ def _print_banner(memory: AgentMemory, session_id: str, persistent: bool) -> Non
         design = ctx.get("design_name") or "?"
         pdk = ctx.get("pdk") or "?"
         print(f"  context: design={design}, pdk={pdk}")
+    print(f"  cwd: {os.getcwd()}")
     print()
+
+
+def _build_prompt(memory: AgentMemory, session_id: str) -> str:
+    ctx = memory.extract_design_context()
+    parts = [session_id]
+    design = ctx.get("design_name") if ctx else None
+    pdk = ctx.get("pdk") if ctx else None
+    if design or pdk:
+        parts.append(f"{design or '?'}@{pdk or '?'}")
+    cwd = os.path.basename(os.getcwd()) or os.getcwd()
+    parts.append(cwd)
+    return f"eda-agent [{' | '.join(parts)}]> "
+
+
+def _parse_slash_command(user_input: str) -> tuple[str, str] | None:
+    stripped = user_input.strip()
+    if not stripped.startswith("/"):
+        return None
+    body = stripped[1:].strip()
+    if not body:
+        return ("help", "")
+    name, _, arg_text = body.partition(" ")
+    return (name.lower(), arg_text.strip())
+
+
+def _read_repl_input(prompt: str) -> str | None:
+    first = input(prompt)
+    if first.strip() != _MULTILINE_SENTINEL:
+        return first.strip()
+
+    print("(multi-line mode; finish with \"\"\")")
+    lines: list[str] = []
+    while True:
+        try:
+            line = input("... ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n(multi-line input cancelled)")
+            return None
+        if line.strip() == _MULTILINE_SENTINEL:
+            return "\n".join(lines).strip()
+        lines.append(line)
+
+
+def _format_repl_error(exc: Exception, *, verbose: int) -> str:
+    message = f"{type(exc).__name__}: {exc}".strip()
+    lowered = str(exc).lower()
+    suggestion = "Retry with a narrower request."
+
+    if isinstance(exc, TimeoutError):
+        suggestion = "Operation timed out. Retry, or narrow the scope before rerunning."
+    elif isinstance(exc, (ConnectionError, OSError)) or any(
+        token in lowered
+        for token in ("connection refused", "temporary failure", "name or service not known", "network")
+    ):
+        suggestion = "Connection failed. Check the configured LLM/API/backend service and network reachability."
+    elif any(
+        token in lowered
+        for token in ("api key", "authentication", "unauthorized", "forbidden", "401", "403")
+    ):
+        suggestion = "Authentication failed. Check the model/API credentials in your environment."
+    elif any(
+        token in lowered
+        for token in ("quota", "rate limit", "429", "insufficient_quota")
+    ):
+        suggestion = "Quota or rate limit reached. Check provider limits or retry later."
+    elif isinstance(exc, ValueError):
+        suggestion = "Input validation failed. Check the request arguments or current design context."
+    elif isinstance(exc, KeyError):
+        suggestion = "Agent state was incomplete. Retry once; if it repeats, rerun with -vv to inspect the traceback."
+
+    if verbose < 2 and "-vv" not in suggestion:
+        suggestion = f"{suggestion} Rerun with -vv for traceback."
+    return f"{message}. {suggestion}"
 
 
 def _pick_resume_session(username: str, db) -> str | None:
@@ -271,11 +358,54 @@ def _pick_resume_session(username: str, db) -> str | None:
     return None
 
 
+def _configure_logging(verbose: int, quiet: bool) -> None:
+    """Initialise root logging based on CLI flags / ``EDA_AGENT_LOG``.
+
+    Resolution order (highest priority first):
+
+    1. Explicit log level in ``EDA_AGENT_LOG`` (e.g. ``DEBUG``, ``INFO``).
+    2. ``--quiet`` → ``ERROR``.
+    3. ``--verbose`` count (``-v`` → ``INFO``, ``-vv`` and up → ``DEBUG``).
+    4. Default → ``WARNING``.
+    """
+    env_level = os.environ.get("EDA_AGENT_LOG")
+    if env_level:
+        level = getattr(logging, env_level.upper(), None)
+        if not isinstance(level, int):
+            level = logging.INFO
+    elif quiet:
+        level = logging.ERROR
+    elif verbose >= 2:
+        level = logging.DEBUG
+    elif verbose >= 1:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+
+    # Re-configure even if called more than once so the user can flip
+    # verbosity by relaunching the REPL.  ``force=True`` was added in 3.8
+    # and is safe to use unconditionally.
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+    # Quiet noisy third-party libraries unless the user explicitly opted
+    # in to DEBUG.
+    if level > logging.DEBUG:
+        for noisy in ("httpx", "httpcore", "urllib3"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def cli_repl(
     session_id: str | None = None,
     new: bool = False,
     resume: bool = False,
     no_persist: bool = False,
+    verbose: int = 0,
+    quiet: bool = False,
+    stream: bool = False,
 ) -> None:
     """Entry point for the interactive ``eda-agent`` REPL.
 
@@ -292,7 +422,19 @@ def cli_repl(
     no_persist:
         Do not read or write the ``agent_sessions`` table; useful for
         throwaway debugging sessions.
+    verbose:
+        Verbosity counter from ``-v`` / ``-vv``.  Controls logging level
+        and step-by-step ReAct event output.
+    quiet:
+        Suppress progress lines (and lower the log level to ``ERROR``)
+        so only final replies and errors are written.
+    stream:
+        Stream the final assistant message via SSE when supported.  When
+        the LLM still wants to call tools the planner falls back to the
+        non-streaming path for that turn automatically.
     """
+    _configure_logging(verbose=verbose, quiet=quiet)
+    console = Console(quiet=quiet, show_events=(verbose >= 1 and not quiet))
     _setup_readline()
     planner = Planner()
 
@@ -323,77 +465,95 @@ def cli_repl(
 
     while True:
         try:
-            user_input = input("eda-agent> ").strip()
+            user_input = _read_repl_input(_build_prompt(memory, session_id))
         except EOFError:
             print("\nGoodbye!")
             break
         except KeyboardInterrupt:
-            print("\n(Interrupted -- type 'exit' to quit)")
+            print("\n(Cancelled input; use Ctrl-D or 'exit' to quit)")
             continue
 
         if not user_input:
             continue
 
-        cmd = user_input.lower()
-        if cmd in ("exit", "quit"):
+        cmd = user_input.strip().lower()
+        slash_cmd = _parse_slash_command(user_input)
+
+        if cmd in ("exit", "quit") or slash_cmd in {("exit", ""), ("quit", "")}:
             print("Goodbye!")
             break
-        if cmd == "clear":
-            memory.clear()
-            _persist()
-            print("Message history cleared. (Design context preserved -- use 'forget' to wipe everything.)")
-            continue
-        if cmd == "forget":
-            memory.forget()
-            clear_session(session_id, db)
-            print(f"Session '{session_id}' wiped.")
-            continue
-        if cmd == "history" or user_input.lower().startswith("history "):
-            parts = user_input.split()
-            full = len(parts) > 1 and parts[1] in ("--full", "-f", "full")
-            _print_history(memory, full=full)
-            continue
-        if cmd == "sessions":
-            entries = list_sessions(username, db, limit=20)
-            if not entries:
-                print("(no sessions)" if db is not None else "(persistence disabled)")
-            else:
-                for s in entries:
-                    ts = s.updated_at.strftime("%Y-%m-%d %H:%M") if s.updated_at else "?"
-                    marker = "*" if s.session_id == session_id else " "
-                    print(f" {marker} {s.session_id:40s}  {s.message_count:>4d} msg  {ts}")
-            continue
-        if user_input.lower().startswith("session "):
-            new_sid = user_input.split(None, 1)[1].strip()
-            if not new_sid:
-                print("Usage: session <id>", file=sys.stderr)
+
+        if slash_cmd is not None:
+            name, arg_text = slash_cmd
+            if name == "clear":
+                memory.clear()
+                _persist()
+                print("Message history cleared. (Design context preserved -- use '/forget' to wipe everything.)")
                 continue
-            _persist()
-            session_id = new_sid
-            memory = load_session(session_id, db) if db is not None else AgentMemory()
-            print(f"Switched to session '{session_id}' ({len(memory)} msg).")
-            continue
-        if cmd == "help":
-            print(_HELP)
+            if name == "forget":
+                try:
+                    confirm = input(
+                        f"This will permanently delete session '{session_id}' "
+                        f"and all its history.  Type 'yes' to confirm: "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n/forget: cancelled.")
+                    continue
+                if confirm != "yes":
+                    print("/forget: cancelled.")
+                    continue
+                memory.forget()
+                clear_session(session_id, db)
+                print(f"Session '{session_id}' wiped.")
+                continue
+            if name == "history":
+                parts = arg_text.split()
+                full = bool(parts) and parts[0] in ("--full", "-f", "full")
+                _print_history(memory, full=full)
+                continue
+            if name == "sessions":
+                entries = list_sessions(username, db, limit=20)
+                if not entries:
+                    print("(no sessions)" if db is not None else "(persistence disabled)")
+                else:
+                    for s in entries:
+                        ts = s.updated_at.strftime("%Y-%m-%d %H:%M") if s.updated_at else "?"
+                        marker = "*" if s.session_id == session_id else " "
+                        print(f" {marker} {s.session_id:40s}  {s.message_count:>4d} msg  {ts}")
+                continue
+            if name == "session":
+                new_sid = arg_text.strip()
+                if not new_sid:
+                    print("Usage: /session <id>", file=sys.stderr)
+                    continue
+                _persist()
+                session_id = new_sid
+                memory = load_session(session_id, db) if db is not None else AgentMemory()
+                print(f"Switched to session '{session_id}' ({len(memory)} msg).")
+                continue
+            if name == "help":
+                print(_HELP)
+                continue
+            if name == "cd":
+                target = arg_text or os.path.expanduser("~")
+                target = os.path.expanduser(target.strip())
+                try:
+                    os.chdir(target)
+                    print(os.getcwd())
+                except OSError as exc:
+                    print(f"cd: {exc}", file=sys.stderr)
+                continue
+            print(f"Unknown command '/{name}'. Type '/help' for available commands.", file=sys.stderr)
             continue
 
-        # cd: must be handled inside the process to affect the current CWD.
-        if cmd == "cd" or user_input.lower().startswith("cd "):
-            parts = user_input.split(None, 1)
-            target = parts[1] if len(parts) > 1 else os.path.expanduser("~")
-            target = os.path.expanduser(target.strip())
-            try:
-                os.chdir(target)
-                print(os.getcwd())
-            except OSError as exc:
-                print(f"cd: {exc}", file=sys.stderr)
-            continue
-
-        # !<shell_cmd>: execute directly in the shell.
         if user_input.startswith("!"):
             shell_cmd = user_input[1:].strip()
             if not shell_cmd:
                 print("Usage: !<command>  (e.g. !ls -la)", file=sys.stderr)
+                continue
+            first_token = shell_cmd.split(None, 1)[0] if shell_cmd else ""
+            if first_token == "cd":
+                print("Use the built-in '/cd' command to change the REPL working directory.", file=sys.stderr)
                 continue
             try:
                 subprocess.run(shell_cmd, shell=True)  # noqa: S602
@@ -402,11 +562,24 @@ def cli_repl(
             continue
 
         try:
-            reply = planner.run(user_input, memory=memory)
-            print(f"\nAgent: {reply}\n")
+            def _emit(kind: str, payload: dict) -> None:
+                console.event(kind, payload)
+
+            with Spinner(console, text="thinking"):
+                reply = planner.run(
+                    user_input,
+                    memory=memory,
+                    on_event=_emit,
+                    stream=stream,
+                )
+            console.agent(reply)
             _persist()
-        except (RuntimeError, ValueError, OSError, TimeoutError) as exc:
-            print(f"Error: {exc}\n", file=sys.stderr)
+        except KeyboardInterrupt:
+            console.info("(cancelled current turn)")
+            _persist()
+        except Exception as exc:  # noqa: BLE001 -- REPL must stay alive across any planner error
+            console.error(_format_repl_error(exc, verbose=verbose))
+            logging.getLogger(__name__).debug("planner.run raised", exc_info=True)
             # Persist whatever we have so far so transient failures don't
             # cost the user their conversation context.
             _persist()
@@ -415,6 +588,18 @@ def cli_repl(
 # ---------------------------------------------------------------------------
 # Job sub-commands (eda-agent submit / list / status / logs / cancel)
 # ---------------------------------------------------------------------------
+
+
+def _get_version() -> str:
+    """Return the installed package version, falling back to 'unknown'."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("eda_agent")
+    except PackageNotFoundError:
+        return "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
 
 def _build_parser():
@@ -426,6 +611,12 @@ def _build_parser():
             "Use a subcommand to manage async EDA jobs."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {_get_version()}",
     )
     # REPL-mode flags (only used when no subcommand is given).
     parser.add_argument(
@@ -448,6 +639,24 @@ def _build_parser():
         "--no-persist",
         action="store_true",
         help="Do not read or write the agent_sessions DB table.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v: INFO + ReAct steps, -vv: DEBUG).",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Only print final replies / errors (sets log level to ERROR).",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream the final assistant reply token-by-token (best-effort SSE).",
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -509,6 +718,38 @@ def _build_parser():
         "-f",
         action="store_true",
         help="Keep following the log file (like tail -f).",
+    )
+
+    # -- doctor ----------------------------------------------------------------
+    sub.add_parser(
+        "doctor",
+        help="Run environment checks (API key, PostgreSQL, ORFS, …) and report issues.",
+    )
+
+    # -- wait ------------------------------------------------------------------
+    wp = sub.add_parser(
+        "wait",
+        help="Block until a job reaches a terminal state. Exit 0 on success, "
+        "non-zero on failure / cancellation / timeout.",
+    )
+    wp.add_argument("job_id", help="Job UUID returned by 'submit'.")
+    wp.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Maximum seconds to wait (default: no timeout).",
+    )
+    wp.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Poll interval in seconds (default: 2).",
+    )
+    wp.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress progress output; only set exit code.",
     )
 
     # -- cancel ----------------------------------------------------------------
@@ -581,7 +822,38 @@ def _ensure_worker(no_worker: bool = False) -> None:
 
 
 def _cmd_submit(args) -> None:
+    import os.path
+
     from eda_agent.queue.store import JobStore
+
+    # -- Pre-flight validation ------------------------------------------------
+    # Catch obvious mistakes (missing config, unknown stage) here instead of
+    # letting them surface as a stack trace from the worker minutes later.
+    if not os.path.isfile(args.design_config):
+        print(
+            f"Error: config file not found: {args.design_config}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not os.path.isabs(args.design_config):
+        print(
+            f"Warning: --config '{args.design_config}' is not absolute; "
+            "the worker may run from a different cwd than the CLI.",
+            file=sys.stderr,
+        )
+
+    if args.backend == "orfs":
+        try:
+            from eda_agent.backends.orfs import ORFS_STAGES
+        except Exception:  # noqa: BLE001 -- backend optional
+            ORFS_STAGES = None
+        if ORFS_STAGES and args.stage not in ORFS_STAGES:
+            valid = ", ".join(ORFS_STAGES)
+            print(
+                f"Error: unknown ORFS stage '{args.stage}'. Valid stages: {valid}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     params = _parse_params(args.param)
     if args.clean:
@@ -728,7 +1000,66 @@ def _cmd_logs(args) -> None:
                     else:
                         break
     except KeyboardInterrupt:
-        pass
+        current = store.get_job(args.job_id)
+        status = current.status.value if current is not None else "unknown"
+        print(
+            f"\nStopped following logs; job is still {status}. Use 'eda-agent status {args.job_id}' to check.",
+            file=sys.stderr,
+        )
+
+
+def _cmd_wait(args) -> None:
+    """Block until a job reaches a terminal state.
+
+    Exit code:
+        0 — job succeeded
+        1 — job not found, failed, or cancelled
+        2 — timeout reached before terminal state
+    """
+    import time
+
+    from eda_agent.queue.store import JobStatus, JobStore
+
+    store = JobStore()
+    job = store.get_job(args.job_id)
+    if job is None:
+        print(f"Error: job '{args.job_id}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    terminal = {JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.CANCELLED}
+    deadline = (time.monotonic() + args.timeout) if args.timeout else None
+    last_status = None
+
+    try:
+        while True:
+            job = store.get_job(args.job_id)
+            if job is None:
+                print(f"Error: job '{args.job_id}' disappeared.", file=sys.stderr)
+                sys.exit(1)
+            if job.status != last_status and not args.quiet:
+                print(f"[{job.job_id}] status: {job.status.value}")
+                last_status = job.status
+            if job.status in terminal:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                if not args.quiet:
+                    print(
+                        f"Timeout after {args.timeout:g}s; job still {job.status.value}.",
+                        file=sys.stderr,
+                    )
+                sys.exit(2)
+            time.sleep(max(0.1, args.interval))
+    except KeyboardInterrupt:
+        if not args.quiet:
+            print("\nInterrupted; job continues running in background.", file=sys.stderr)
+        sys.exit(130)
+
+    if job.status == JobStatus.SUCCESS:
+        sys.exit(0)
+    # failed / cancelled
+    if job.error_message and not args.quiet:
+        print(f"Error: {job.error_message}", file=sys.stderr)
+    sys.exit(1)
 
 
 def _cmd_cancel(args) -> None:
@@ -778,6 +1109,16 @@ def _cmd_cancel(args) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _cmd_doctor(_args) -> None:
+    """Run diagnostic checks and exit with a non-zero status on failure."""
+    from eda_agent import diagnostics
+
+    results = diagnostics.run_checks()
+    print(diagnostics.render_report(results, stream=sys.stdout))
+    if diagnostics.worst_status(results) == diagnostics.FAIL:
+        sys.exit(1)
+
+
 def main() -> None:
     """Primary entry point -- dispatches to subcommand or interactive REPL."""
     parser = _build_parser()
@@ -790,6 +1131,9 @@ def main() -> None:
             new=args.new,
             resume=args.resume,
             no_persist=args.no_persist,
+            verbose=args.verbose,
+            quiet=args.quiet,
+            stream=args.stream,
         )
         return
 
@@ -799,6 +1143,8 @@ def main() -> None:
         "status": _cmd_status,
         "logs": _cmd_logs,
         "cancel": _cmd_cancel,
+        "doctor": _cmd_doctor,
+        "wait": _cmd_wait,
     }
 
     handler = dispatch.get(args.command)

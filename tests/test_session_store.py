@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+from psycopg2.extras import Json
 
 from eda_agent.agent import session_store
 from eda_agent.agent.memory import AgentMemory
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -82,6 +83,106 @@ def test_save_session_writes_to_db():
     assert db.commit.called
 
 
+def test_save_session_passes_native_json_objects_to_db():
+    db = MagicMock()
+    mem = AgentMemory()
+    mem.add_user("hi")
+    mem.add_assistant("hello")
+    mem.set("design_name", "aes")
+
+    session_store.save_session("s1", "alice", mem, db)
+
+    _sql, params = db.execute.call_args.args
+    assert isinstance(params["msgs"], Json)
+    assert isinstance(params["scratch"], Json)
+
+
+def test_save_session_falls_back_without_on_conflict_support():
+    db = MagicMock()
+    update_result = MagicMock()
+    update_result.rowcount = 0
+    db.execute.side_effect = [update_result, None]
+    mem = AgentMemory()
+    mem.add_user("hi")
+    mem.set("design_name", "aes")
+
+    with patch("eda_agent.agent.session_store.supports_postgresql_on_conflict", return_value=False):
+        session_store.save_session("s1", "alice", mem, db)
+
+    assert db.execute.call_count == 2
+    first_sql = str(db.execute.call_args_list[0].args[0])
+    second_sql = str(db.execute.call_args_list[1].args[0])
+    assert "UPDATE agent_sessions" in first_sql
+    assert "INSERT INTO agent_sessions" in second_sql
+    assert db.commit.called
+
+
+def test_load_session_falls_back_when_scratchpad_column_missing():
+    db = MagicMock()
+
+    class MissingScratchpad(Exception):
+        pass
+
+    first_exc = MissingScratchpad('column "scratchpad" does not exist')
+    fallback_result = MagicMock()
+    fallback_mapping = MagicMock()
+    fallback_mapping.first.return_value = {
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    fallback_result.mappings.return_value = fallback_mapping
+
+    db.execute.side_effect = [first_exc, fallback_result]
+
+    mem = session_store.load_session("legacy", db)
+    assert len(mem) == 1
+    assert mem.get_messages()[0]["content"] == "hi"
+    assert mem.context() == {}
+    assert db.rollback.called
+
+
+def test_save_session_falls_back_when_scratchpad_column_missing():
+    db = MagicMock()
+
+    class MissingScratchpad(Exception):
+        pass
+
+    first_exc = MissingScratchpad('column "scratchpad" does not exist')
+    db.execute.side_effect = [first_exc, None]
+
+    mem = AgentMemory()
+    mem.add_user("hi")
+
+    with patch("eda_agent.agent.session_store.supports_postgresql_on_conflict", return_value=True):
+        session_store.save_session("legacy", "alice", mem, db)
+    assert db.execute.call_count == 2
+    assert db.rollback.called
+    assert db.commit.called
+
+
+def test_save_session_legacy_fallback_without_on_conflict_support():
+    db = MagicMock()
+
+    class MissingScratchpad(Exception):
+        pass
+
+    first_exc = MissingScratchpad('column "scratchpad" does not exist')
+    update_result = MagicMock()
+    update_result.rowcount = 0
+    db.execute.side_effect = [first_exc, update_result, None]
+
+    mem = AgentMemory()
+    mem.add_user("hi")
+
+    with patch("eda_agent.agent.session_store.supports_postgresql_on_conflict", return_value=False):
+        session_store.save_session("legacy", "alice", mem, db)
+
+    assert db.execute.call_count == 3
+    assert "UPDATE agent_sessions" in str(db.execute.call_args_list[1].args[0])
+    assert "INSERT INTO agent_sessions" in str(db.execute.call_args_list[2].args[0])
+    assert db.rollback.called
+    assert db.commit.called
+
+
 def test_save_session_noop_when_db_none():
     mem = AgentMemory()
     mem.add_user("x")
@@ -116,6 +217,81 @@ def test_clear_session_deletes_row():
 
 def test_clear_session_noop_when_db_none():
     session_store.clear_session("s1", None)  # Must not raise.
+
+
+# ---------------------------------------------------------------------------
+# list_sessions
+# ---------------------------------------------------------------------------
+
+
+def test_list_sessions_counts_messages_from_python_list():
+    db = MagicMock()
+    result = MagicMock()
+    result.fetchall.return_value = [
+        ("s1", "alice", "2026-01-01T00:00:00Z", [{"role": "user"}, {"role": "assistant"}]),
+    ]
+    db.execute.return_value = result
+
+    rows = session_store.list_sessions("alice", db, limit=20)
+
+    assert len(rows) == 1
+    assert rows[0].session_id == "s1"
+    assert rows[0].username == "alice"
+    assert rows[0].message_count == 2
+
+
+def test_list_sessions_counts_messages_from_json_string():
+    db = MagicMock()
+    result = MagicMock()
+    result.fetchall.return_value = [
+        ("s2", "alice", "2026-01-01T00:00:00Z", '[{"role":"user"},{"role":"assistant"}]'),
+    ]
+    db.execute.return_value = result
+
+    rows = session_store.list_sessions("alice", db, limit=20)
+
+    assert len(rows) == 1
+    assert rows[0].session_id == "s2"
+    assert rows[0].message_count == 2
+
+
+def test_list_sessions_uses_sql_count_when_jsonb_supported():
+    db = MagicMock()
+    result = MagicMock()
+    result.fetchall.return_value = [
+        ("s3", "alice", "2026-01-01T00:00:00Z", 7),
+    ]
+    db.execute.return_value = result
+
+    with patch("eda_agent.agent.session_store.supports_postgresql_jsonb", return_value=True):
+        rows = session_store.list_sessions("alice", db, limit=20)
+
+    assert len(rows) == 1
+    assert rows[0].session_id == "s3"
+    assert rows[0].message_count == 7
+    sql = str(db.execute.call_args.args[0])
+    assert "jsonb_array_length" in sql
+
+
+def test_list_sessions_falls_back_to_python_count_when_jsonb_query_fails():
+    db = MagicMock()
+
+    class JsonbPathError(Exception):
+        pass
+
+    fallback_result = MagicMock()
+    fallback_result.fetchall.return_value = [
+        ("s4", "alice", "2026-01-01T00:00:00Z", '[{"role":"user"}]'),
+    ]
+    db.execute.side_effect = [JsonbPathError("bad cast"), fallback_result]
+
+    with patch("eda_agent.agent.session_store.supports_postgresql_jsonb", return_value=True):
+        rows = session_store.list_sessions("alice", db, limit=20)
+
+    assert len(rows) == 1
+    assert rows[0].session_id == "s4"
+    assert rows[0].message_count == 1
+    assert db.execute.call_count == 2
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, PostgresDsn, computed_field, model_validator
+from pydantic import Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,6 +45,10 @@ class Settings(BaseSettings):
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
 
+    # ── PostGIS ────────────────────────────────────────────────────────────────
+    # Set to false if your PostgreSQL has no PostGIS extension installed.
+    enable_postgis: bool = Field(default=True)
+
     # ── MiniMax LLM ───────────────────────────────────────────────────────────
     minimax_api_key: str = Field(default="")
     minimax_group_id: str = Field(default="")
@@ -52,6 +56,10 @@ class Settings(BaseSettings):
     minimax_model: str = Field(default="MiniMax-Text-01")
     minimax_max_tokens: int = Field(default=4096)
     minimax_temperature: float = Field(default=0.2)
+    minimax_request_timeout_sec: float = Field(default=60.0)
+    minimax_stream_timeout_sec: float = Field(default=300.0)
+    minimax_input_max_tokens: int = Field(default=12000)
+    minimax_timeout_retry_input_max_tokens: int = Field(default=4000)
     # Maximum ReAct iterations per session
     agent_max_iterations: int = Field(default=10)
 
@@ -73,6 +81,18 @@ class Settings(BaseSettings):
     innovus_connect_max_backoff_sec: float = Field(default=20.0)
     innovus_ssh_probe_timeout_sec: int = Field(default=8)
 
+    # ── Innovus execution mode ────────────────────────────────────────────────
+    # "ssh"   – execute Innovus on a remote host via SSH (default)
+    # "local" – execute Innovus directly on the local machine
+    # "bsub"  – submit to LSF queue via bsub -Is -XF (blocks until done)
+    innovus_execution_mode: str = Field(default="ssh")
+    # Local work directory (used when execution_mode == "local" or "bsub")
+    innovus_local_workdir: Path = Field(default_factory=lambda: Path("/tmp/eda_agent/innovus"))
+    # Scheduler settings (used when execution_mode == "bsub")
+    innovus_scheduler_queue: str = Field(default="")
+    innovus_scheduler_account: str = Field(default="")
+    innovus_scheduler_extra: str = Field(default="")  # extra bsub args raw string
+
     # ── Parquet archive ───────────────────────────────────────────────────────
     parquet_archive_dir: Path = Field(default=Path("/data/archive"))
 
@@ -84,6 +104,23 @@ class Settings(BaseSettings):
 
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO")
+
+    # ── Custom tools ─────────────────────────────────────────────────────────
+    custom_tools_file: str = Field(default="")
+    custom_tools_allowlist: str = Field(default="")
+    custom_tools_denylist: str = Field(default="")
+    custom_tools_enable_entrypoints: bool = Field(default=True)
+    custom_tools_entrypoint_group: str = Field(default="eda_agent.custom_tools")
+
+    # ── LLM tool calling mode ─────────────────────────────────────────────────
+    # "native"  – send tools/tool_choice in the API payload (standard OpenAI
+    #             format; works with MiniMax and vLLM models that support the
+    #             OpenAI tool-calling extension out of the box).
+    # "prompt"  – inject tool definitions into the system prompt and parse
+    #             <tool_call> JSON blocks from the model's text response.
+    #             Use this when the vLLM server uses a custom --chat-template
+    #             that does not render {{ tools }}, e.g. a plain Gemma 4 setup.
+    llm_tool_calling_mode: str = Field(default="native")
 
     # ── LangSmith ────────────────────────────────────────────────────────────
     langsmith_api_key: str = Field(default="")
