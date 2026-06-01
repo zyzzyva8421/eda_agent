@@ -177,7 +177,7 @@ docker run --runtime=nvidia \
     -p 7860:8000 \
     --ipc=host \
     -e VLLM_ENABLE_CUDA_COMPATIBILITY=1 \
-    -v /gui_team/model/google/gemma-4-31b:/model \
+    -v /path/to/gemma-4-31b:/model \
     vllm/vllm-openai:gemma4-cu130 \
     --model /model \
     --gpu-memory-utilization 0.88 \
@@ -193,6 +193,7 @@ docker run --runtime=nvidia \
 set the agent to prompt-mode tool calling:
 
 ```bash
+# These MINIMAX_* settings are also used for compatible OpenAI-style local endpoints.
 MINIMAX_BASE_URL=http://127.0.0.1:7860/v1
 MINIMAX_API_KEY=dummy
 MINIMAX_MODEL=/model
