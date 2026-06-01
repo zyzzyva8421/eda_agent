@@ -108,6 +108,16 @@ class Settings(BaseSettings):
     custom_tools_enable_entrypoints: bool = Field(default=True)
     custom_tools_entrypoint_group: str = Field(default="eda_agent.custom_tools")
 
+    # ── LLM tool calling mode ─────────────────────────────────────────────────
+    # "native"  – send tools/tool_choice in the API payload (standard OpenAI
+    #             format; works with MiniMax and vLLM models that support the
+    #             OpenAI tool-calling extension out of the box).
+    # "prompt"  – inject tool definitions into the system prompt and parse
+    #             <tool_call> JSON blocks from the model's text response.
+    #             Use this when the vLLM server uses a custom --chat-template
+    #             that does not render {{ tools }}, e.g. a plain Gemma 4 setup.
+    llm_tool_calling_mode: str = Field(default="native")
+
     # ── LangSmith ────────────────────────────────────────────────────────────
     langsmith_api_key: str = Field(default="")
     langsmith_endpoint: str = Field(default="https://api.smith.langchain.com")
