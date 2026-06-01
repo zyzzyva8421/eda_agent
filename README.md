@@ -177,7 +177,7 @@ docker run --runtime=nvidia \
     -p 7860:8000 \
     --ipc=host \
     -e VLLM_ENABLE_CUDA_COMPATIBILITY=1 \
-    -v /path/to/gemma-4-model:/model \
+    -v <path/to/gemma-4-model>:/model \
     vllm/vllm-openai:gemma4-cu130 \
     --model /model \
     --gpu-memory-utilization 0.88 \
@@ -187,7 +187,7 @@ docker run --runtime=nvidia \
     --enable-log-requests \
     --enable-auto-tool-choice \
     --trust-remote-code \
-    --chat-template '...'
+    --chat-template '<gemma-4-chat-template>'
 ```
 
 set the agent to prompt-mode tool calling:
