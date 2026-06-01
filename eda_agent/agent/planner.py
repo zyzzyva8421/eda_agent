@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any, Callable
@@ -41,6 +42,13 @@ from eda_agent.config import settings
 from eda_agent.tracing import is_tracing_enabled, trace_chat
 
 logger = logging.getLogger(__name__)
+
+# Matches a single <tool_call>...</tool_call> block in model text output.
+# Used by the prompt-mode tool calling path.
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>",
+    re.DOTALL,
+)
 
 _SYSTEM_PROMPT = """\
 You are EDA Agent, an expert physical design assistant specialised in
@@ -521,18 +529,35 @@ class Planner:
         # Build full system prompt
         full_system_prompt = _SYSTEM_PROMPT + context_prompt + cases_prompt
 
+        # ── Prompt-mode tool calling ──────────────────────────────────────
+        # When llm_tool_calling_mode == "prompt" we do NOT send the OpenAI
+        # ``tools`` / ``tool_choice`` fields.  Instead we append a tool
+        # catalogue to the system prompt and instruct the model to respond
+        # with <tool_call> blocks.  We also rewrite the message list so
+        # assistant tool-call turns and tool-result turns are encoded as
+        # plain text, making them compatible with a simple chat template
+        # (e.g. the one used for local Gemma 4 deployments via vLLM).
+        prompt_mode = settings.llm_tool_calling_mode == "prompt"
+        if prompt_mode:
+            full_system_prompt += self._tools_to_system_appendix(TOOL_SCHEMAS)
+
+        messages = mem.get_messages(system_prompt=full_system_prompt)
+        if prompt_mode:
+            messages = self._messages_for_prompt_mode(messages)
+
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": mem.get_messages(system_prompt=full_system_prompt),
-            "tools": TOOL_SCHEMAS,
-            "tool_choice": "auto",
+            "messages": messages,
             "max_tokens": settings.minimax_max_tokens,
             "temperature": settings.minimax_temperature,
         }
+        if not prompt_mode:
+            payload["tools"] = TOOL_SCHEMAS
+            payload["tool_choice"] = "auto"
 
         # MiniMax requires group_id in the URL when using the v1 API
         group_id = settings.minimax_group_id
@@ -567,6 +592,10 @@ class Planner:
                 resp = client.post(url, headers=headers, json=payload)
                 resp.raise_for_status()
                 raw_response = resp.json()
+
+        # ── Prompt-mode: parse <tool_call> blocks from text response ────────────
+        if prompt_mode:
+            raw_response = self._normalize_prompt_mode_response(raw_response)
 
         # Trace the LLM call if enabled
         if is_tracing_enabled():
@@ -673,6 +702,180 @@ class Planner:
             "model": model_name,
             "choices": [{"finish_reason": finish_reason, "message": message}],
         }
+
+    # ------------------------------------------------------------------
+    # Prompt-mode tool calling helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tools_to_system_appendix(tools: list) -> str:
+        """Return a system-prompt appendix describing available tools.
+
+        Used by the ``prompt`` tool-calling mode to inject tool schemas as
+        plain text instead of relying on the OpenAI ``tools`` API field.
+        The model is instructed to respond with ``<tool_call>`` blocks so
+        that :meth:`_normalize_prompt_mode_response` can extract them.
+        """
+        compact: list = []
+        for entry in tools:
+            fn = entry.get("function") or entry
+            compact.append(
+                {
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }
+            )
+        tools_json = json.dumps(compact, ensure_ascii=False)
+        return (
+            "\n\n## Available Tools\n\n"
+            "You can call the following tools to help the user.  "
+            "When you need to invoke a tool, include a `<tool_call>` block in "
+            "your response (you may also include brief explanatory text):\n\n"
+            "<tool_call>\n"
+            '{"name": "TOOL_NAME", "arguments": {"arg": "value"}}\n'
+            "</tool_call>\n\n"
+            "After receiving a tool result you may call another tool or give "
+            "your final answer.\n\n"
+            f"### Tool schemas (JSON)\n```json\n{tools_json}\n```"
+        )
+
+    @staticmethod
+    def _messages_for_prompt_mode(messages: list) -> list:
+        """Rewrite the message list to be compatible with a plain chat template.
+
+        A basic ``--chat-template`` (e.g. the one used for local Gemma 4
+        deployments) only understands ``system`` / ``user`` / ``assistant``
+        roles and accesses ``message['content']`` directly.  It cannot
+        render ``role=tool`` messages or ``assistant`` messages whose
+        ``content`` is empty (tool-call turns).
+
+        This method converts:
+
+        * ``assistant`` turns that carry ``tool_calls`` (and often empty
+          ``content``) → serialised ``<tool_call>`` text so the model sees
+          what it previously decided to call.
+        * ``tool`` result turns → ``user`` turns prefixed with
+          ``[Tool result for <name>]``.
+        """
+        result: list = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content") or ""
+
+            if role in ("system", "user"):
+                result.append({"role": role, "content": content})
+
+            elif role == "assistant":
+                tool_calls: list = msg.get("tool_calls") or []
+                if tool_calls and not content:
+                    parts: list = []
+                    for tc in tool_calls:
+                        fn = tc.get("function") or {}
+                        name = fn.get("name", "unknown")
+                        args_raw = fn.get("arguments", "{}")
+                        try:
+                            args_pretty = json.dumps(
+                                json.loads(args_raw), ensure_ascii=False
+                            )
+                        except Exception:
+                            args_pretty = args_raw
+                        parts.append(
+                            f'<tool_call>\n{{"name": "{name}", "arguments": {args_pretty}}}\n</tool_call>'
+                        )
+                    content = "\n".join(parts)
+                result.append({"role": "assistant", "content": content})
+
+            elif role == "tool":
+                tool_name = msg.get("name", "unknown_tool")
+                result.append(
+                    {
+                        "role": "user",
+                        "content": f"[Tool result for {tool_name}]\n{content}",
+                    }
+                )
+        return result
+
+    @staticmethod
+    def _parse_tool_calls_from_text(text: str) -> list:
+        """Extract ``<tool_call>`` blocks from a model text response.
+
+        Returns a list of OpenAI-compatible ``tool_calls`` dicts so the
+        main ReAct loop can process them without special-casing the
+        prompt-mode path.
+
+        Each ``<tool_call>`` block must contain a JSON object with at
+        least a ``"name"`` key and an optional ``"arguments"`` dict.
+        Malformed blocks are skipped with a debug-level warning.
+        """
+        calls: list = []
+        for match in _TOOL_CALL_RE.finditer(text):
+            raw = match.group(1).strip()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.debug(
+                    "prompt-mode: ignoring malformed tool_call block: %r", raw
+                )
+                continue
+            if not isinstance(data, dict) or not data.get("name"):
+                logger.debug(
+                    "prompt-mode: tool_call block missing name: %r", data
+                )
+                continue
+            args = data.get("arguments", {})
+            calls.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "type": "function",
+                    "function": {
+                        "name": data["name"],
+                        "arguments": (
+                            json.dumps(args, ensure_ascii=False)
+                            if isinstance(args, dict)
+                            else str(args)
+                        ),
+                    },
+                }
+            )
+        return calls
+
+    def _normalize_prompt_mode_response(self, raw_response: dict) -> dict:
+        """Inject parsed tool calls into a prompt-mode LLM response.
+
+        When the model returns a text response that contains one or more
+        ``<tool_call>`` blocks, this method:
+
+        1. Strips the blocks from the visible ``content``.
+        2. Injects the parsed tool calls into ``message["tool_calls"]``.
+        3. Sets ``finish_reason`` to ``"tool_calls"`` so the ReAct loop
+           proceeds to tool execution unchanged.
+        """
+        choices = raw_response.get("choices") or []
+        if not choices:
+            return raw_response
+        choice = choices[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+
+        parsed = self._parse_tool_calls_from_text(content)
+        if not parsed:
+            return raw_response  # no tool calls; return as-is
+
+        # Strip the <tool_call> blocks from the displayed content.
+        clean_content = _TOOL_CALL_RE.sub("", content).strip()
+
+        new_message = dict(message)
+        new_message["content"] = clean_content
+        new_message["tool_calls"] = parsed
+
+        new_choice = dict(choice)
+        new_choice["message"] = new_message
+        new_choice["finish_reason"] = "tool_calls"
+
+        new_response = dict(raw_response)
+        new_response["choices"] = [new_choice] + choices[1:]
+        return new_response
 
     def _extract_and_store_context(
         self,
