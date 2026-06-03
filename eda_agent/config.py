@@ -131,10 +131,15 @@ class Settings(BaseSettings):
     # ── LLM backend selection ─────────────────────────────────────────────────
     # "minimax" – use MiniMax API (default)
     # "ollama"  – use a local Ollama server (OpenAI-compatible /v1 endpoint)
+    # "vllm"    – use a local vLLM server (OpenAI-compatible /v1 endpoint)
     llm_backend: str = Field(default="minimax")
     # Used when llm_backend == "ollama"
     ollama_base_url: str = Field(default="http://localhost:11434/v1")
     ollama_model: str = Field(default="qwen2.5-coder:7b")
+    # Used when llm_backend == "vllm"
+    vllm_base_url: str = Field(default="http://localhost:8000/v1")
+    vllm_model: str = Field(default="Qwen2.5-Coder-3B-Instruct-AWQ")
+    vllm_max_output_tokens: int = Field(default=100)
 
     @model_validator(mode="after")
     def _warn_insecure_defaults(self) -> "Settings":

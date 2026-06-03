@@ -43,6 +43,20 @@ from eda_agent.tracing import is_tracing_enabled, trace_chat
 
 logger = logging.getLogger(__name__)
 
+# Reduced tool set for vLLM (RTX 3060 2048-token context can't fit all 25 tools
+# in prompt_mode; the full system prompt ~1600 tokens + 25-tool appendix ~2100
+# tokens exceeds the limit even with max_output_tokens=200)
+_VLLM_TOOL_SCHEMAS = [
+    TOOL_SCHEMAS[0],   # run_eda_stage
+    TOOL_SCHEMAS[3],   # query_timing
+    TOOL_SCHEMAS[4],   # query_congestion
+    TOOL_SCHEMAS[7],   # submit_job
+    TOOL_SCHEMAS[8],   # job_status
+    TOOL_SCHEMAS[15],  # get_run_log
+    TOOL_SCHEMAS[13],  # query_utilization
+    TOOL_SCHEMAS[14],  # query_power
+]
+
 # Matches a single <tool_call>...</tool_call> block in model text output.
 # Used by the prompt-mode tool calling path.
 _TOOL_CALL_RE = re.compile(
@@ -116,6 +130,13 @@ class Planner:
             self._api_key = api_key or "ollama"
             self._model = model or settings.ollama_model
             self._base_url = settings.ollama_base_url.rstrip("/")
+        elif backend == "vllm":
+            self._api_key = api_key or "vllm"
+            self._model = model or settings.vllm_model
+            self._base_url = settings.vllm_base_url.rstrip("/")
+            # Small VRAM + 2048 context → keep output tokens small
+            # to leave room for the large system prompt (~1500 tokens)
+            self._max_output_tokens = min(500, settings.vllm_max_output_tokens)
         else:
             self._api_key = api_key or settings.minimax_api_key
             self._model = model or settings.minimax_model
@@ -602,8 +623,9 @@ class Planner:
         full_system_prompt = self._build_system_prompt(
             mem, include_similar_cases=include_similar_cases
         )
+        backend = settings.llm_backend
         if prompt_mode:
-            full_system_prompt += self._tools_to_system_appendix(TOOL_SCHEMAS)
+            full_system_prompt += self._tools_to_system_appendix(TOOL_SCHEMAS if backend != "vllm" else _VLLM_TOOL_SCHEMAS)
 
         token_budget = (
             max_input_tokens if max_input_tokens and max_input_tokens > 0 else None
@@ -615,15 +637,25 @@ class Planner:
         if prompt_mode:
             messages = self._messages_for_prompt_mode(messages)
 
+        backend = settings.llm_backend
+        max_tokens = settings.minimax_max_tokens
+        temperature = settings.minimax_temperature
+        if backend == "vllm":
+            max_tokens = min(max_tokens, self._max_output_tokens)
+
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
-            "max_tokens": settings.minimax_max_tokens,
-            "temperature": settings.minimax_temperature,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
         }
         if not prompt_mode:
             payload["tools"] = TOOL_SCHEMAS
-            payload["tool_choice"] = "auto"
+            if settings.llm_backend == "vllm":
+                # vLLM requires explicit tool parser settings; disable auto tool choice
+                payload["tool_choice"] = "none"
+            else:
+                payload["tool_choice"] = "auto"
         return payload
 
     def _build_system_prompt(
