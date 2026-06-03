@@ -111,10 +111,16 @@ class Planner:
         model: str | None = None,
         max_iterations: int | None = None,
     ) -> None:
-        self._api_key = api_key or settings.minimax_api_key
-        self._model = model or settings.minimax_model
+        backend = settings.llm_backend
+        if backend == "ollama":
+            self._api_key = api_key or "ollama"
+            self._model = model or settings.ollama_model
+            self._base_url = settings.ollama_base_url.rstrip("/")
+        else:
+            self._api_key = api_key or settings.minimax_api_key
+            self._model = model or settings.minimax_model
+            self._base_url = settings.minimax_base_url.rstrip("/")
         self._max_iterations = max_iterations or settings.agent_max_iterations
-        self._base_url = settings.minimax_base_url.rstrip("/")
         self._request_timeout = httpx.Timeout(settings.minimax_request_timeout_sec)
         self._stream_timeout = httpx.Timeout(settings.minimax_stream_timeout_sec)
         self._input_max_tokens = settings.minimax_input_max_tokens
@@ -521,15 +527,14 @@ class Planner:
             "Authorization": "Bearer " + self._api_key,
             "Content-Type": "application/json",
         }
+        backend = settings.llm_backend
 
-        group_id = settings.minimax_group_id
-        url = (
-            f"{self._base_url}/text/chatcompletion_v2"
-            if group_id
-            else f"{self._base_url}/chat/completions"
-        )
-        if group_id:
-            url += f"?GroupId={group_id}"
+        if backend == "ollama":
+            url = f"{self._base_url}/chat/completions"
+        elif settings.minimax_group_id:
+            url = f"{self._base_url}/text/chatcompletion_v2?GroupId={settings.minimax_group_id}"
+        else:
+            url = f"{self._base_url}/chat/completions"
 
         transport = httpx.HTTPTransport()
         payload = self._build_payload(
@@ -570,6 +575,12 @@ class Planner:
 
         if prompt_mode:
             raw_response = self._normalize_prompt_mode_response(raw_response)
+
+        # Ollama (and compatible) models return tool calls as plain-text JSON
+        # in content when not in prompt-mode. Parse them if the content looks
+        # like a JSON object that could be a tool call.
+        if settings.llm_backend == "ollama":
+            raw_response = self._normalize_ollama_tool_response(raw_response)
 
         if is_tracing_enabled():
             raw_response = trace_chat(
@@ -1001,6 +1012,68 @@ class Planner:
         new_message = dict(message)
         new_message["content"] = clean_content
         new_message["tool_calls"] = parsed
+
+        new_choice = dict(choice)
+        new_choice["message"] = new_message
+        new_choice["finish_reason"] = "tool_calls"
+
+        new_response = dict(raw_response)
+        new_response["choices"] = [new_choice] + choices[1:]
+        return new_response
+
+    @staticmethod
+    def _normalize_ollama_tool_response(raw_response: dict) -> dict:
+        """Parse Ollama tool-call responses that come as plain-text JSON.
+
+        When ``LLM_BACKEND=ollama``, the model may return a tool call as a
+        raw JSON string inside ``content`` (e.g. ``{"name":"infer_root_cause",
+        "arguments":{"run_id":999}}``).  This method detects that pattern,
+        extracts the JSON, and injects ``tool_calls`` so the ReAct loop can
+        execute the tool without special-casing the Ollama path.
+
+        If the content does not look like a JSON tool call the response is
+        returned unchanged.
+        """
+        choices = raw_response.get("choices") or []
+        if not choices:
+            return raw_response
+        choice = choices[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+
+        # Try to parse the entire content as JSON first
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return raw_response
+
+        if not isinstance(data, dict) or "name" not in data:
+            return raw_response
+
+        raw_fn_name = data.get("name", "")
+        raw_args = data.get("arguments", {})
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        else:
+            args = raw_args if isinstance(raw_args, dict) else {}
+
+        arguments_str = json.dumps(args, ensure_ascii=False)
+
+        new_message = dict(message)
+        new_message["content"] = ""
+        new_message["tool_calls"] = [
+            {
+                "id": str(uuid.uuid4()),
+                "type": "function",
+                "function": {
+                    "name": raw_fn_name,
+                    "arguments": arguments_str,
+                },
+            }
+        ]
 
         new_choice = dict(choice)
         new_choice["message"] = new_message
